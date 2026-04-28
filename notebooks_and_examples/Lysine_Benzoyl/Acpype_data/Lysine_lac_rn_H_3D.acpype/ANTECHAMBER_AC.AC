@@ -1,0 +1,65 @@
+CHARGE      0.00 ( 0 )
+Formula: H18 C9 N2 O3 
+ATOM      1  N   KLA     2      -4.419   0.670  -0.611 -0.321500        NT
+ATOM      2  CA  KLA     2      -3.814   1.156   0.633  0.060900        CT
+ATOM      3  C   KLA     2      -4.722   0.845   1.795  0.136900         C
+ATOM      4  O   KLA     2      -5.034  -0.307   2.052 -0.299400         O
+ATOM      5  CB  KLA     2      -2.433   0.508   0.862 -0.031100        CT
+ATOM      6  CG  KLA     2      -1.389   0.966  -0.170 -0.049900        CT
+ATOM      7  CD  KLA     2       0.040   0.544   0.207 -0.037300        CT
+ATOM      8  CE  KLA     2       0.259  -0.970   0.084  0.011700        CT
+ATOM      9  NZ  KLA     2       1.660  -1.303   0.336 -0.313200         N
+ATOM     10  CH  KLA     2       2.690  -1.091  -0.641  0.241400         C
+ATOM     11  OT1 KLA     2       2.404  -0.599  -1.766 -0.273000         O
+ATOM     12  CT2 KLA     2       4.125  -1.413  -0.309  0.128100        CT
+ATOM     13  OI1 KLA     2       4.748  -2.080  -1.378 -0.382800        OH
+ATOM     14  CI2 KLA     2       4.893  -0.142   0.066 -0.030300        CT
+ATOM     15  H   KLA     2      -5.387   1.060  -0.684  0.118800         H
+ATOM     16  HA  KLA     2      -3.695   2.262   0.579  0.053400        H1
+ATOM     17  HB1 KLA     2      -2.538  -0.598   0.819  0.028400        HC
+ATOM     18  HB2 KLA     2      -2.075   0.782   1.878  0.028400        HC
+ATOM     19  HG1 KLA     2      -1.637   0.556  -1.172  0.026600        HC
+ATOM     20  HG2 KLA     2      -1.410   2.075  -0.243  0.026600        HC
+ATOM     21  HD1 KLA     2       0.273   0.872   1.244  0.028000        HC
+ATOM     22  HD2 KLA     2       0.744   1.070  -0.472  0.028000        HC
+ATOM     23  HE1 KLA     2      -0.035  -1.327  -0.927  0.046200        H1
+ATOM     24  HE2 KLA     2      -0.372  -1.498   0.830  0.046200        H1
+ATOM     25  HZ  KLA     2       1.906  -1.749   1.248  0.148800         H
+ATOM     26  HT2 KLA     2       4.147  -2.096   0.567  0.068700        H1
+ATOM     27  HI1 KLA     2       4.815  -1.445  -2.139  0.210400        HO
+ATOM     28  HI21KLA     2       4.426   0.338   0.953  0.025900        HC
+ATOM     29  HI22KLA     2       5.944  -0.399   0.316  0.025900        HC
+ATOM     30  HI23KLA     2       4.891   0.579  -0.779  0.025900        HC
+ATOM     31  HW1 KLA     2      -3.896   1.082  -1.416  0.118800         H
+ATOM     32  HW2 KLA     2      -5.108   1.652   2.409  0.104300        HA
+BOND    1    1    2    1      N   CA
+BOND    2    1   15    1      N    H
+BOND    3    1   31    1      N  HW1
+BOND    4    2    3    1     CA    C
+BOND    5    2    5    1     CA   CB
+BOND    6    2   16    1     CA   HA
+BOND    7    3    4    2      C    O
+BOND    8    3   32    1      C  HW2
+BOND    9    5    6    1     CB   CG
+BOND   10    5   17    1     CB  HB1
+BOND   11    5   18    1     CB  HB2
+BOND   12    6    7    1     CG   CD
+BOND   13    6   19    1     CG  HG1
+BOND   14    6   20    1     CG  HG2
+BOND   15    7    8    1     CD   CE
+BOND   16    7   21    1     CD  HD1
+BOND   17    7   22    1     CD  HD2
+BOND   18    8    9    1     CE   NZ
+BOND   19    8   23    1     CE  HE1
+BOND   20    8   24    1     CE  HE2
+BOND   21    9   10    1     NZ   CH
+BOND   22    9   25    1     NZ   HZ
+BOND   23   10   11    2     CH  OT1
+BOND   24   10   12    1     CH  CT2
+BOND   25   12   13    1    CT2  OI1
+BOND   26   12   14    1    CT2  CI2
+BOND   27   12   26    1    CT2  HT2
+BOND   28   13   27    1    OI1  HI1
+BOND   29   14   28    1    CI2 HI21
+BOND   30   14   29    1    CI2 HI22
+BOND   31   14   30    1    CI2 HI23

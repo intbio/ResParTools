@@ -1,0 +1,24 @@
+Remark line goes here
+MASS
+
+BOND
+C -HA  325.10   1.101       same as  c-ha, penalty score=  0.0
+
+ANGLE
+C -CT-NT   66.300     111.140   same as c -c3-n3, penalty score=  0.0
+CT-C -HA   45.600     115.220   same as c3-c -ha, penalty score=  0.0
+HA-C -O    54.100     121.940   same as ha-c -o , penalty score=  0.0
+C -CT-OH   68.300     108.790   same as c -c3-oh, penalty score=  0.0
+
+DIHE
+CT-C -N -CT   1    0.000         0.000          -2.000      same as c3-c -n -c3
+CT-C -N -CT   1    1.500       180.000           1.000      same as c3-c -n -c3, penalty score=  0.0
+
+IMPROPER
+CT-HA-C -O          1.1          180.0         2.0          Using the default value
+CT-N -C -O          1.1          180.0         2.0          Using the default value
+
+NONBON
+
+
+

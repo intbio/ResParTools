@@ -1,0 +1,10 @@
+
+verbosity 1
+source leaprc.protein.ff14SB
+source leaprc.gaff
+mods = loadamberparams Lysine_lac_rn_H_3D_AC.frcmod
+KLA = loadmol2 Lysine_lac_rn_H_3D_user_amber.mol2
+check KLA
+saveamberparm KLA Lysine_lac_rn_H_3D_AC.prmtop Lysine_lac_rn_H_3D_AC.inpcrd
+saveoff KLA Lysine_lac_rn_H_3D_AC.lib
+quit
