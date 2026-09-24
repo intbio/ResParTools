@@ -68,7 +68,7 @@ def charge(
     if torch.cuda.is_available():
         graph = graph.to("cuda:0")
         model = model.cuda()
-    
+        # print(model)
     
     graph = model(graph)
     if constraints:

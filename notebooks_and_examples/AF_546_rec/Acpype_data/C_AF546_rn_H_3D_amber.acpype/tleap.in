@@ -1,0 +1,10 @@
+
+verbosity 1
+source leaprc.protein.ff14SB
+source leaprc.gaff
+mods = loadamberparams C_AF546_rn_H_3D_amber_AC.frcmod
+R546 = loadmol2 C_AF546_rn_H_3D_amber_user_amber.mol2
+check R546
+saveamberparm R546 C_AF546_rn_H_3D_amber_AC.prmtop C_AF546_rn_H_3D_amber_AC.inpcrd
+saveoff R546 C_AF546_rn_H_3D_amber_AC.lib
+quit

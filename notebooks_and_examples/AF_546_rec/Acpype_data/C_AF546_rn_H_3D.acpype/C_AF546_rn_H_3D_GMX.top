@@ -1,0 +1,20 @@
+; C_AF546_rn_H_3D_GMX.top created by acpype (v: 2023.10.27) on Fri Apr 17 15:20:02 2026
+
+[ defaults ]
+; nbfunc        comb-rule       gen-pairs       fudgeLJ fudgeQQ
+1               2               yes             0.5     0.8333333333
+
+; Include C_AF546_rn_H_3D_GMX.itp topology
+#include "C_AF546_rn_H_3D_GMX.itp"
+
+; Ligand position restraints
+#ifdef POSRES_LIG
+#include "posre_C_AF546_rn_H_3D.itp"
+#endif
+
+[ system ]
+ C_AF546_rn_H_3D
+
+[ molecules ]
+; Compound        nmols
+ C_AF546_rn_H_3D  1     

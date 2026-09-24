@@ -1,0 +1,19 @@
+; C_AF546_rn_H_3D_gaff2_GMX_OPLS.top created by acpype (v: 2023.10.27) on Fri Apr 17 15:20:02 2026
+
+; Include forcefield parameters
+#include "ffoplsaa.itp"
+
+; Include C_AF546_rn_H_3D_gaff2_GMX.itp topology
+#include "C_AF546_rn_H_3D_gaff2_GMX.itp"
+
+; Ligand position restraints
+#ifdef POSRES_LIG
+#include "posre_C_AF546_rn_H_3D_gaff2.itp"
+#endif
+
+[ system ]
+ C_AF546_rn_H_3D_gaff2
+
+[ molecules ]
+; Compound        nmols
+ C_AF546_rn_H_3D_gaff2 1     

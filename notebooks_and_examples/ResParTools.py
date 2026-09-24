@@ -5,7 +5,7 @@ import re
 import glob
 import json
 from collections import Counter
-from collections import defaultdict
+from collections import defaultdict, deque
 import numpy as np
 
 import itertools
@@ -193,6 +193,41 @@ def pdb_to_chem(path_to_pdb, removeHs=False, make_N_root=False):
     # rdDepictor.SetPreferCoordGen(True)
     return rdkit_mol
 
+def file_opener(path, **kwargs):
+    """
+    Открывает файл с молекулой, автоматически определяя формат.
+    
+    Parameters:
+    -----------
+    path : str
+        Путь к файлу
+    **kwargs : dict
+        Дополнительные параметры для функций загрузки
+    """
+    path_obj = Path(path)
+    name = path_obj.stem
+    extension = path_obj.suffix.lower()
+    
+    print(f"Загрузка файла: {name} (формат: {extension})")
+    
+    match extension:
+        case ".smi" | ".smiles":
+            smi_str = read_file(path)
+            rdkit_mol = smi_to_chem(smi_str, **kwargs)
+        case ".mol2":
+            rdkit_mol = mol2_to_chem(path, **kwargs)
+        case ".pdb":
+            # Используем kwargs для переопределения параметров по умолчанию
+            removeHs = kwargs.get('removeHs', False)
+            format_coord = kwargs.get('format_coord', '3D')
+            rdkit_mol = pdb_to_chem(path, removeHs=removeHs, format_coord=format_coord)
+        case _:
+            raise ValueError(f"Неподдерживаемый формат файла: {extension}. "
+                           f"Поддерживаемые: .smi, .smiles, .mol2, .pdb")
+    
+    return rdkit_mol
+
+
 def draw_mol_with_atom_index(mol, charge_list = None, size=(600,400), prefer_coord_gfen = False):
     """
     Добавляет номера атомов в атрибуты атомов молекулы.
@@ -333,8 +368,330 @@ def match_chem(mol_chem_1, mol_chem_2, compare_any_bond=False, match_residue_num
 
     return substructure, dict_matches
 
+def remove_hydrogens_preserve_indices(mol):
+    """
+    Убирает все протоны из молекулы, сохраняя индексы тяжёлых атомов.
+    
+    Параметры:
+        mol (Chem.Mol): исходная молекула с H.
+    
+    Возвращает:
+        mol_noH (Chem.Mol): молекула без H.
+        heavy_idx_map (dict): словарь {новый индекс тяжелого атома: исходный индекс в mol}
+    """
+    mol_rw = Chem.RWMol(mol)  # Создаём RWMol для редактирования
+    heavy_idx_map = {}        # Словарь соответствия новых индексов → оригинальные
+
+    # Проходим по атомам и собираем индексы протонов
+    H_indices = [atom.GetIdx() for atom in mol_rw.GetAtoms() if atom.GetAtomicNum() == 1]
+
+    # Удаляем протонные атомы (любые индексы)
+    for idx in sorted(H_indices, reverse=True):
+        mol_rw.RemoveAtom(idx)
+
+    # После удаления H формируем mapping для тяжёлых атомов
+    new_idx = 0
+    for atom in mol_rw.GetAtoms():
+        heavy_idx_map[new_idx] = atom.GetIdx()
+        new_idx += 1
+
+    # Возвращаем молекулу и mapping
+    return mol_rw.GetMol(), heavy_idx_map
+
+
+def match_chem_v3(mol_chem_1, mol_chem_2,
+                  compare_any_bond=False,
+                  match_residue_number=None,
+                  match_type='heavy',  # 'heavy' или 'all'
+                  timeout=3):
+    """
+    Находит максимальную общую подструктуру между мономером и полимером.
+    
+    Args:
+        mol_chem_1 (Chem.Mol) - мономер
+        mol_chem_2 (Chem.Mol) - полимер
+        compare_any_bond (bool) - сравнивать любые связи
+        match_residue_number (int) - номер остатка для фильтрации
+        match_type (str) - 'heavy' (только тяжелые атомы) или 'all' (все атомы)
+        timeout (int) - таймаут поиска MCS
+    
+    Returns:
+        substructure (Chem.Mol) - подструктура с протонами
+        dict_matches (dict) - соответствие индексов и имен атомов
+    """
+    # --- 1. Предупреждение для match_type='all' ---
+    if match_type == 'all':
+        print("ВНИМАНИЕ: Сопоставление по всем атомам (включая водороды)")
+        print("Это может занять очень много времени для больших молекул!")
+    
+    # --- 2. Фильтрация по номеру остатка ---
+    def filter_atoms_by_residue_number(mol, residue_number):
+        """Возвращает новую молекулу, содержащую только атомы с заданным номером остатка"""
+        indices_to_keep = []
+        for atom in mol.GetAtoms():
+            monomer_info = atom.GetMonomerInfo()
+            if monomer_info and monomer_info.GetResidueNumber() == residue_number:
+                indices_to_keep.append(atom.GetIdx())
+        
+        if not indices_to_keep:
+            print(f"Предупреждение: Остаток с номером {residue_number} не найден")
+            return mol
+        
+        print(f"Фильтрация по остатку {residue_number}: оставлено {len(indices_to_keep)} атомов")
+        return Chem.PathToSubmol(mol, indices_to_keep)
+    
+    if match_residue_number is not None:
+        print(f'Поиск MCS только для остатка с номером {match_residue_number}')
+        filtered_mol_chem_2 = filter_atoms_by_residue_number(mol_chem_2, match_residue_number)
+    else:
+        filtered_mol_chem_2 = mol_chem_2
+    
+    # --- 3. Подготовка молекул в зависимости от match_type ---
+    if match_type == 'heavy':
+        print("Сопоставление по тяжелым атомам (водороды исключены)")
+        mol_1_processed = Chem.RemoveHs(mol_chem_1)
+        mol_2_processed = Chem.RemoveHs(filtered_mol_chem_2)
+    else:  # 'all'
+        print("Сопоставление по всем атомам (включая водороды)")
+        mol_1_processed = mol_chem_1
+        mol_2_processed = filtered_mol_chem_2
+    
+    # --- 4. Настройка параметров MCS ---
+    mcs_params = rdFMCS.MCSParameters()
+    mcs_params.Timeout = timeout
+    mcs_params.Maximize = True
+    mcs_params.CompareAnyBond = compare_any_bond
+    
+    if match_type == 'heavy':
+        mcs_params.AtomCompare = rdFMCS.AtomCompare.CompareElementsAndCharge
+        mcs_params.MatchValences = False
+    else:
+        mcs_params.AtomCompare = rdFMCS.AtomCompare.CompareElements
+        mcs_params.MatchValences = True
+    
+    mcs_params.BondCompare = rdFMCS.BondCompare.CompareOrder
+    mcs_params.RingMatchesRingOnly = False
+    mcs_params.CompleteRingsOnly = False
+    
+    # --- 5. Поиск MCS ---
+    print("Поиск максимальной общей подструктуры...")
+    mcs_result = rdFMCS.FindMCS([mol_1_processed, mol_2_processed], mcs_params)
+    
+    if not mcs_result or mcs_result.numAtoms == 0:
+        raise ValueError("Общая подструктура не найдена!")
+    
+    print(f"Найдена общая подструктура из {mcs_result.numAtoms} атомов")
+    
+    # --- 6. Получение сопоставлений ---
+    query = Chem.MolFromSmarts(mcs_result.smartsString)
+    matches_1 = mol_1_processed.GetSubstructMatches(query, uniquify=False)
+    matches_2 = mol_2_processed.GetSubstructMatches(query, uniquify=False)
+    
+    # --- 7. Выбор лучшего сопоставления (максимум атомов) ---
+    # best_match_1 = None
+    # best_match_2 = None
+    max_size = 0
+    
+    for match_1 in matches_1:
+        for match_2 in matches_2:
+            size = len(match_1)  # количество сопоставленных атомов
+            if size > max_size:
+                max_size = size
+                best_match_1 = match_1
+                best_match_2 = match_2
+    
+    if best_match_1 is None:
+        best_match_1 = matches_1[0]
+        best_match_2 = matches_2[0]
+    
+    print(f"Выбрано сопоставление с {max_size} атомами")
+    
+    # --- 8. Создание словаря соответствий ---
+    dict_matches = {}
+    
+    # Сохраняем индексы (без сортировки!)
+    dict_matches['Indexes'] = dict(zip(best_match_1, best_match_2))
+    
+    # Добавляем имена атомов, если они есть
+    if mol_chem_1.HasProp('AtomNames') and mol_chem_2.HasProp('AtomNames'):
+        try:
+            mol1_atoms_name = [mol_chem_1.GetAtomWithIdx(idx).GetProp('AtomName') 
+                               for idx in best_match_1]
+            mol2_atoms_name = [mol_chem_2.GetAtomWithIdx(idx).GetProp('AtomName') 
+                               for idx in best_match_2]
+            dict_matches['Names'] = dict(zip(mol1_atoms_name, mol2_atoms_name))
+        except Exception as e:
+            print(f"Предупреждение: Не удалось получить имена атомов - {e}")
+    
+    # --- 9. Построение подструктуры с протонами ---
+    # Берем атомы из исходной молекулы-полимера (с водородами)
+    # Используем best_match_2 как есть, без сортировки
+    
+    # Добавляем водороды, связанные с сопоставленными атомами
+    all_indices = list(best_match_2)  # копируем список
+    
+    for idx in best_match_2:
+        atom = mol_chem_2.GetAtomWithIdx(idx)
+        for neighbor in atom.GetNeighbors():
+            if neighbor.GetAtomicNum() == 1:  # Водород
+                if neighbor.GetIdx() not in all_indices:
+                    all_indices.append(neighbor.GetIdx())
+    
+    # Не сортируем индексы, сохраняем порядок
+    substructure = Chem.PathToSubmol(mol_chem_2, all_indices)
+    
+    # Заряды копируются автоматически через PathToSubmol
+    # Дополнительно проверяем и восстанавливаем если нужно
+    for i, old_idx in enumerate(all_indices):
+        old_atom = mol_chem_2.GetAtomWithIdx(old_idx)
+        new_atom = substructure.GetAtomWithIdx(i)
+        if old_atom.GetFormalCharge() != 0:
+            new_atom.SetFormalCharge(old_atom.GetFormalCharge())
+    
+    return substructure, dict_matches
+
+def match_chem_v6(
+    mol_chem_1, mol_chem_2,
+    only_heavy_mapping=True,
+    compare_any_bond=False,
+    match_residue_number=None,
+    timeout=30
+):
+    """
+    Сопоставление двух молекул с использованием RDKit MCS.
+    Возвращает подструктуры с H и без H, а также словарь индексов и имен.
+    """
+    import threading
+    import warnings
+    from rdkit import Chem
+    from rdkit.Chem import rdFMCS
+
+    # === 1. Фильтрация по остаткам ===
+    residue_index_map = None
+    mol2_for_mcs = mol_chem_2
+
+    if match_residue_number is not None:
+        residue_atom_indices = [
+            atom.GetIdx()
+            for atom in mol_chem_2.GetAtoms()
+            if atom.GetMonomerInfo() is not None
+            and atom.GetMonomerInfo().GetResidueNumber() == match_residue_number
+        ]
+
+        if not residue_atom_indices:
+            warnings.warn("⚠ Указанный residue не найден в молекуле.")
+            return None, None
+
+        bond_indices = []
+        for bond in mol_chem_2.GetBonds():
+            if bond.GetBeginAtomIdx() in residue_atom_indices and bond.GetEndAtomIdx() in residue_atom_indices:
+                bond_indices.append(bond.GetIdx())
+
+        residue_submol = Chem.PathToSubmol(mol_chem_2, bond_indices, useQuery=False)
+
+        # mapping submol_idx -> polymer_idx
+        # residue_index_map = {new_idx: old_idx for new_idx, old_idx in enumerate(sorted(residue_atom_indices))}
+        mol2_for_mcs = residue_submol
+
+    # === 2. Heavy mapping: удаляем H для поиска MCS ===
+    if only_heavy_mapping:
+        mol1_work, mol1_map = remove_hydrogens_preserve_indices(mol_chem_1)
+        mol2_work, mol2_map = remove_hydrogens_preserve_indices(mol2_for_mcs)
+    else:
+        warnings.warn("⚠ MCS с явными протонами может быть очень медленным.")
+        mol1_work = mol_chem_1
+        mol2_work = mol2_for_mcs
+
+    # === 3. Настройки MCS ===
+    params = rdFMCS.MCSParameters()
+    params.Timeout = timeout
+    params.AtomCompare = rdFMCS.AtomCompare.CompareElements
+    params.MatchValences = True
+    params.MatchFormalCharge = True
+    # params.MatchHydrogens = False
+    params.BondCompare = rdFMCS.BondCompare.CompareAny if compare_any_bond else rdFMCS.BondCompare.CompareOrder
+    params.RingMatchesRingOnly = True
+    params.CompleteRingsOnly = False
+
+    # === 4. Анимация поиска MCS ===
+    done = False
+    t = threading.Thread(target=animate, args=(lambda: done, "Поиск подструктуры между молекулами"))
+    t.start()
+
+    res = rdFMCS.FindMCS([mol1_work, mol2_work], parameters=params)
+
+    done = True
+    t.join()
+
+    if res.canceled:
+        print_red("⚠ MCS остановлен по timeout")
+
+    if res.numAtoms == 0:
+        warnings.warn("⚠ Общая подструктура не найдена.")
+        return None, None
+
+    queryMol = res.queryMol
+
+    # === 5. Получаем ВСЕ сопоставления ===
+    matches1 = mol1_work.GetSubstructMatches(queryMol)
+    matches2 = mol2_work.GetSubstructMatches(queryMol)
+
+    if not matches1 or not matches2:
+        warnings.warn("⚠ Сопоставление подструктур не найдено.")
+        return None, None
+
+    # Для V6 убираем скоринг, просто берем первую пару
+    match1 = matches1[0]
+    match2 = matches2[0]
+
+    full_mapping = {mol1_map[i1]: mol2_map[i2] for i1, i2 in zip(match1, match2)}
+    # if residue_index_map is not None:
+    #     match2 = tuple(residue_index_map[i] for i in match2)
+
+    # mapping = dict(zip(match1, match2))
+
+    # === 6. Восстанавливаем H ===
+    if only_heavy_mapping:
+        full_mapping = mapping.copy()
+        for idx1, idx2 in mapping.items():
+            atom1 = mol_chem_1.GetAtomWithIdx(idx1)
+            atom2 = mol_chem_2.GetAtomWithIdx(idx2)
+
+            H1 = sorted([n.GetIdx() for n in atom1.GetNeighbors() if n.GetAtomicNum() == 1])
+            H2 = sorted([n.GetIdx() for n in atom2.GetNeighbors() if n.GetAtomicNum() == 1])
+
+            for h1, h2 in zip(H1, H2):
+                full_mapping[h1] = h2
+    else:
+        full_mapping = mapping
+
+    # === 7. Строим подструктуры ===
+    atom_indices_H = sorted(full_mapping.keys())
+    bond_indices_H = [
+        b.GetIdx() for b in mol_chem_1.GetBonds()
+        if b.GetBeginAtomIdx() in atom_indices_H and b.GetEndAtomIdx() in atom_indices_H
+    ]
+
+    substructure_H = Chem.PathToSubmol(mol_chem_1, bond_indices_H, useQuery=False)
+    substructure_noH = remove_hydrogens_preserve_indices(substructure_H)
+
+    substructure_dict = {"H": substructure_H, "noH": substructure_noH}
+
+    # === 8. Словарь соответствий ===
+    dict_matches = {"Indexes": full_mapping}
+
+    if mol_chem_1.HasProp('AtomNames') and mol_chem_2.HasProp('AtomNames'):
+        name_mapping = {}
+        for i1, i2 in full_mapping.items():
+            name1 = mol_chem_1.GetAtomWithIdx(i1).GetProp('AtomName')
+            name2 = mol_chem_2.GetAtomWithIdx(i2).GetProp('AtomName')
+            name_mapping[name1] = name2
+        dict_matches['Names'] = name_mapping
+
+    return substructure_dict, dict_matches
+    
 def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False, 
-                     match_residue_number = None, monomer_key = True, ):
+                     match_residue_number = None, monomer_key = True, timeout = 3):
     """
     Аргументы:
         monomer_dict - словарь мономера (состоит из одной пары имя: rdkit.Chem)
@@ -356,8 +713,10 @@ def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False,
             pol_key, pol_val = next(iter(polymer_dict.items()))
 
             for mon_key, mon_val in monomer_dict.items():
-                sub, dict_mon_pol_matches = match_chem(mon_val, pol_val, compare_any_bond = compare_any_bond,
-                                                       match_residue_number = match_residue_number)
+                sub, dict_mon_pol_matches = match_chem_v6(mon_val, pol_val, compare_any_bond = compare_any_bond,
+                                                       match_residue_number = match_residue_number,
+                                                        timeout=timeout
+                                                        )
 
                 match_data_dict['substructure'][mon_key] = sub
                 match_data_dict['N_match_atoms'][mon_key] = sub.GetNumAtoms()
@@ -368,8 +727,10 @@ def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False,
             mon_key, mon_val = next(iter(monomer_dict.items()))
 
             for pol_key, pol_val in polymer_dict.items():
-                sub, dict_mon_pol_matches = match_chem(mon_val, pol_val, compare_any_bond = compare_any_bond,
-                                                       match_residue_number = match_residue_number)
+                sub, dict_mon_pol_matches = match_chem_v6(mon_val, pol_val, compare_any_bond = compare_any_bond,
+                                                       match_residue_number = match_residue_number,
+                                                        timeout=timeout
+                                                        )
 
                 match_data_dict['substructure'][pol_key] = sub
                 match_data_dict['N_match_atoms'][pol_key] = sub.GetNumAtoms()
@@ -415,7 +776,7 @@ def find_ref_aa(mod_mol_dict, path_to_ref_mol=None, match_residue_number = None,
     return chem_ref_mol, exit_data_dict if main_match_data else match_data_dict , max_name
 
 
-def draw_mon_pol_match(monomer_chem_dict, polymer_chem_dict, 
+def draw_mon_pol_match(monomer_chem_dict, polymer_chem_dict={}, 
                        match_data = False, prefer_coord_gfen = False, 
                        add_atom_index = False, add_small_atom_index = False, show_any_monomer_matches = False, 
                        n_row = 1, useSVG = True, img_size = (500,300)):
@@ -606,7 +967,7 @@ def save_chem_to_pdb(rdkit_mol, path, rootedAtAtom=-1):
                                          allHsExplicit=True, rootedAtAtom=rootedAtAtom)
         rdkit_mol = Chem.MolFromSmiles(smiles_string, sanitize=False)
     try:
-        Chem.SanitizeMol(rdkit_mol, sanitizeOps=Chem.SANITIZE_ALL ^ Chem.SANITIZE_KEKULIZE, catchErrors=True)
+        Chem.SanitizeMol(rdkit_mol, sanitizeOps=Chem.SANITIZE_ALL, catchErrors=True)
     except ValueError as e:
         print("Ошибка санации:", e)
     path_dir = path.rsplit('/', 1)
@@ -678,7 +1039,7 @@ def generate_atom_names_by_ref_aa(mod_aa_mol, ref_aa_mol, dict_match, output_pat
     return all_mod_atom_names        
 
 
-def rdkit_pdb_modification(rdkit_mol, resname='MOD', resid=1, segid='A'):
+def rdkit_pdb_modification_old(rdkit_mol, resname='MOD', resid=1, segid='A'):
     """
     Модифицирует имена атомов в молекуле по правилам аминокислот:
     - N, H, CA, C, O имеют стандартные имена
@@ -775,6 +1136,285 @@ def rdkit_pdb_modification(rdkit_mol, resname='MOD', resid=1, segid='A'):
 
     return rdkit_mol  
 
+def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
+                           force_numeric=False, C_terminal=False):
+    """
+    Назначает PDB имена атомов с поуровневым сбором и глобальными индексами на уровне.
+    """
+    from collections import deque, defaultdict
+    
+    greek_levels = {1: "B", 2: "G", 3: "D", 4: "E", 5: "Z", 6: "H",
+                    7: "T", 8: "I", 9: "K", 10: "L", 11: "M", 12: "N"}
+
+    atom_names = {}
+    used_names = set()
+    visited = set()
+    numeric_mode = force_numeric
+    heavy_counter = 0
+    processed_hydrogens = set()
+    hydrogen_counts = {}
+
+    # ---------------------------------------------------------
+    # 1. Поиск backbone
+    # ---------------------------------------------------------
+    CA_idx, backbone = find_backbone_match(rdkit_mol, C_terminal)
+
+    backbone_names = ["N", "CA", "C", "O"]
+    if len(backbone) == 5:
+        backbone_names = ["N", "CA", "C", "OC1", "OC2"]
+
+    for idx, name in zip(backbone, backbone_names):
+        atom_names[idx] = name
+        used_names.add(name)
+        if rdkit_mol.GetAtomWithIdx(idx).GetSymbol() != "H":
+            heavy_counter += 1
+        visited.add(idx)
+
+    N_idx = backbone[0]
+
+    # ---------------------------------------------------------
+    # 2. Назначение HA
+    # ---------------------------------------------------------
+    for nbr in rdkit_mol.GetAtomWithIdx(CA_idx).GetNeighbors():
+        if nbr.GetSymbol() == "H" and nbr.GetIdx() not in atom_names:
+            atom_names[nbr.GetIdx()] = "HA"
+            used_names.add("HA")
+            processed_hydrogens.add(nbr.GetIdx())
+
+    # ---------------------------------------------------------
+    # 3. Протоны аминогруппы
+    # ---------------------------------------------------------
+    amine_counter = 1
+    for nbr in rdkit_mol.GetAtomWithIdx(N_idx).GetNeighbors():
+        if nbr.GetSymbol() == "H" and nbr.GetIdx() not in atom_names:
+            name = f"H{amine_counter}"
+            atom_names[nbr.GetIdx()] = name
+            used_names.add(name)
+            processed_hydrogens.add(nbr.GetIdx())
+            amine_counter += 1
+
+    # ---------------------------------------------------------
+    # 4. Поуровневый сбор атомов
+    # ---------------------------------------------------------
+    current_level = [(CA_idx, 0)]  # (atom_idx, depth)
+    next_level = []
+    
+    # Словарь для сбора атомов по уровням
+    # {depth: [(atom_idx, element, parent_idx)]}
+    level_atoms = defaultdict(list)
+    
+    # BFS для сбора всех атомов по уровням
+    level = 0
+    while current_level:
+        next_level = []
+        for current_idx, depth in current_level:
+            current_atom = rdkit_mol.GetAtomWithIdx(current_idx)
+            
+            for nbr in current_atom.GetNeighbors():
+                nbr_idx = nbr.GetIdx()
+                
+                if nbr_idx in visited or nbr_idx in backbone:
+                    continue
+                    
+                if nbr.GetSymbol() != "H":  # Тяжелый атом
+                    element = nbr.GetSymbol()
+                    
+                    # Сохраняем атом для этого уровня
+                    level_atoms[depth + 1].append((nbr_idx, element, current_idx))
+                    visited.add(nbr_idx)
+                    next_level.append((nbr_idx, depth + 1))
+        
+        current_level = next_level
+    
+    # ---------------------------------------------------------
+    # 5. Назначение имен по уровням
+    # ---------------------------------------------------------
+    for depth in sorted(level_atoms.keys()):
+        atoms_on_level = level_atoms[depth]
+        
+        print(f"\nУровень {depth}: {len(atoms_on_level)} атомов")
+        
+        # Определяем букву для этого уровня
+        if not numeric_mode and depth in greek_levels:
+            level_letter = greek_levels[depth]
+            print(f"  Буква уровня: {level_letter}")
+        else:
+            level_letter = None
+            if not numeric_mode:
+                numeric_mode = True
+                print(f"  Переход в numeric режим на глубине {depth}")
+        
+        # Глобальный счетчик для этого уровня
+        level_counter = 1
+        
+        # Назначаем имена ВСЕМ атомам на этом уровне
+        for atom_idx, element, parent_idx in atoms_on_level:
+            name = None
+            
+            # Greek режим
+            if not numeric_mode and level_letter:
+                # Базовая часть имени: элемент + буква уровня
+                base = f"{element}{level_letter}"
+                
+                # ВСЕГДА добавляем глобальный индекс уровня
+                # Даже если в имени уже есть индекс (OZ1, NZ2), мы его заменяем!
+                candidate = f"{base}{level_counter}"
+                
+                if len(candidate) <= 4 and candidate not in used_names:
+                    name = candidate
+                    print(f"    {element}{level_letter} (бывший) -> {name} (индекс {level_counter})")
+            
+            # Numeric режим
+            if name is None:
+                if not numeric_mode:
+                    numeric_mode = True
+                    print(f"    Переход в numeric режим для {element} на глубине {depth}")
+                
+                heavy_counter += 1
+                base_name = f"{element}{heavy_counter}"
+                name = base_name[:4]
+                
+                # Проверка уникальности
+                counter = 1
+                while name in used_names:
+                    name = f"{base_name}_{counter}"[:4]
+                    counter += 1
+                
+                print(f"    {element} -> {name} (numeric)")
+            
+            atom_names[atom_idx] = name
+            used_names.add(name)
+            
+            # Сохраняем информацию о том, какой глобальный индекс получил атом
+            atom_global_index = level_counter
+            level_counter += 1
+            
+            # -------------------------------------------------
+            # Водороды этого атома
+            # -------------------------------------------------
+            atom = rdkit_mol.GetAtomWithIdx(atom_idx)
+            h_neighbors = []
+            
+            for h in atom.GetNeighbors():
+                h_idx = h.GetIdx()
+                if (h.GetSymbol() == "H" and 
+                    h_idx not in processed_hydrogens and 
+                    h_idx not in backbone):
+                    h_neighbors.append(h)
+            
+            if h_neighbors:
+                if name not in hydrogen_counts:
+                    hydrogen_counts[name] = 1
+                
+                # Для водородов используем родительский индекс
+                parent_index = "".join(c for c in name if c.isdigit())
+                
+                if numeric_mode:
+                    for h in h_neighbors:
+                        hname = f"H{parent_index}{hydrogen_counts[name]}"
+                        hydrogen_counts[name] += 1
+                        
+                        if len(hname) > 4:
+                            hname = f"H{parent_index}"[:4]
+                        
+                        # Проверка уникальности
+                        counter = 1
+                        base_hname = hname
+                        while hname in used_names:
+                            hname = f"{base_hname}_{counter}"[:4]
+                            counter += 1
+                        
+                        atom_names[h.GetIdx()] = hname
+                        used_names.add(hname)
+                        processed_hydrogens.add(h.GetIdx())
+                        print(f"      водород {hname}")
+                else:
+                    # В Greek режиме водороды наследуют родительский суффикс
+                    parent_suffix = name[1:]  # все кроме первого символа
+                    
+                    for h in h_neighbors:
+                        if len(h_neighbors) == 1:
+                            hname = f"H{parent_suffix}"
+                        else:
+                            hname = f"H{parent_suffix}{hydrogen_counts[name]}"
+                            hydrogen_counts[name] += 1
+                        
+                        if len(hname) > 4:
+                            hname = f"H{parent_suffix}"[:4]
+                        
+                        # Проверка уникальности
+                        counter = 1
+                        base_hname = hname
+                        while hname in used_names:
+                            hname = f"{base_hname}_{counter}"[:4]
+                            counter += 1
+                        
+                        atom_names[h.GetIdx()] = hname
+                        used_names.add(hname)
+                        processed_hydrogens.add(h.GetIdx())
+                        print(f"      водород {hname}")
+
+    # ---------------------------------------------------------
+    # 6. Проверка пропущенных атомов
+    # ---------------------------------------------------------
+    for atom in rdkit_mol.GetAtoms():
+        idx = atom.GetIdx()
+        if idx not in atom_names:
+            print(f"Предупреждение: атом {idx} ({atom.GetSymbol()}) не получил имя")
+            element = atom.GetSymbol()
+            heavy_counter += 1
+            base_name = f"{element}{heavy_counter}"
+            name = base_name[:4]
+            
+            counter = 1
+            while name in used_names:
+                name = f"{base_name}_{counter}"[:4]
+                counter += 1
+            
+            atom_names[idx] = name
+            used_names.add(name)
+
+    # ---------------------------------------------------------
+    # 7. Запись PDB
+    # ---------------------------------------------------------
+    for atom in rdkit_mol.GetAtoms():
+        idx = atom.GetIdx()
+        name = atom_names.get(idx, "UNK")
+        
+        info = Chem.AtomPDBResidueInfo()
+        info.SetName(name.ljust(4))
+        info.SetResidueName(resname)
+        info.SetResidueNumber(resid)
+        info.SetChainId(segid)
+        atom.SetProp("AtomName", name.strip())
+        atom.SetMonomerInfo(info)
+
+    check_duplicate_atom_names(rdkit_mol)
+    return rdkit_mol
+
+
+def check_duplicate_atom_names(mol):
+    """Проверяет уникальность имен атомов"""
+    name_to_indices = {}
+    for atom in mol.GetAtoms():
+        if atom.HasProp("AtomName"):
+            name = atom.GetProp("AtomName")
+            idx = atom.GetIdx()
+            if name not in name_to_indices:
+                name_to_indices[name] = []
+            name_to_indices[name].append(idx)
+    
+    duplicates = {name: indices for name, indices in name_to_indices.items() if len(indices) > 1}
+    
+    if duplicates:
+        print("⚠️ Обнаружены дубликаты имен:")
+        for name, indices in duplicates.items():
+            print(f"  {name}: индексы {indices}")
+        return False
+    
+    print("✅ Все имена атомов уникальны")
+    return True
+    
 def remove_extra_H(top, extra_pattern_H = 'HW'):
     atom_to_remove = [atom for atom in top.atoms if extra_pattern_H in atom.name]
     print(f"Найденные атомы для удаления: {atom_to_remove}")
@@ -807,7 +1447,103 @@ def remove_extra_H(top, extra_pattern_H = 'HW'):
 
 # Сохранение измененного файла топологии
 # top.write(f"Acpype_data/{acpype_name}.acpype/{acpype_name}_GMX_cleaned.itp")
+def hdb_generator(mol_chem, resname='MOD', resid=1, segid='A'):
+    """
+    Принимает на вход:
+     - mol путь к файлу или rdkit.Chem объект
+    Модифицирует имена атомов в молекуле по правилам аминокислот:
+    - N, H, CA, C, O имеют стандартные имена
+    - Боковые атомы получают буквенные метки по греческому алфавиту
+    - Протоны наследуют имя родительского атома и получают числовой суффикс
+    """
+    def find_common_prefix(strings):
+        if not strings:
+            return ""
 
+        first = strings[0]
+        for i in range(len(first), 0, -1):
+            prefix = first[:i]
+            if all(s.startswith(prefix) for s in strings[1:]):
+                return prefix
+        return ""
+
+    hdb = ['1	1	H	N	-C	CA	\n',
+           '1	5	HA	CA	N	CB	C\n']
+    
+    for atom in mol_chem.GetAtoms():
+        if atom.GetSymbol() == 'H':
+            continue
+        current_idx = atom.GetIdx()
+        current_atom_name = atom.GetProp('AtomName')
+        protons = []
+        visited_atoms = {current_atom_name: current_idx}
+        for n_atom in atom.GetNeighbors():
+            atom_name = n_atom.GetProp('AtomName')
+            atom_idx = n_atom.GetIdx()
+            if n_atom.GetSymbol() != "H":
+                visited_atoms[atom_name] = atom_idx
+            elif n_atom.GetProp('AtomName') not in ['H','HA', 'HN']:
+                protons.append(atom_name)
+        if not protons:  # У атома нет протонов идем к слежующему атому
+            continue
+        # Если H на атоме с валентностью 2
+        if len(visited_atoms) == 2:  # Будет только 1 тяжелый сосед
+            atom_2 = mol_chem.GetAtomWithIdx(min(visited_atoms.values()))
+            # # Берем индекс соседа и находим его соседа с наименьшим индексом
+            atom_3 = min(filter(lambda n: n.GetSymbol() != "H" and
+                                n.GetIdx() not in visited_atoms.values(), atom_2.GetNeighbors()),
+                         key=lambda n: n.GetIdx(), default=None)
+            if atom_3:
+                atom_3_name = atom_3.GetProp('AtomName')
+                atom_3_idx = atom_3.GetIdx()
+                visited_atoms[atom_3_name] = atom_3_idx
+
+        hyb = atom.GetHybridization()
+        n_hydrogens = len(protons)
+        n_heavy_neighbors = int(atom.GetDegree()) - n_hydrogens
+        if hyb == Chem.HybridizationType.SP3:
+            if n_hydrogens == 1 and n_heavy_neighbors == 3:
+                geom_n = 5  # sp3 углерод с 1 протоном
+            elif n_hydrogens == 2 and n_heavy_neighbors == 2:
+                geom_n = 6  # sp3 углерод с 2 протоном
+            elif n_hydrogens == 3 and n_heavy_neighbors == 1:
+                geom_n = 4  # sp3 углерод с 3 протоном
+            elif n_hydrogens == 1 and n_heavy_neighbors == 1:
+                geom_n = 2  # sp3 углерод с 1 протоном
+            else:
+                print(f"Не учтенный вариант {atom.GetProp('AtomName')}:",
+                     f"{name}, {hyb}, {n_hydrogens}, {n_heavy_neighbors}", sep='\n')
+                geom_n = '-'
+        elif hyb == Chem.HybridizationType.SP2:
+            if n_hydrogens == 1 and n_heavy_neighbors == 2:
+                geom_n = 1
+            elif n_hydrogens == 2 and n_heavy_neighbors == 1:
+                geom_n = 3
+            elif n_hydrogens == 1 and n_heavy_neighbors == 1:
+                geom_n = 2
+            else:
+                print(f"Не учтенный вариант {atom.GetProp('AtomName')}:",
+                     f"{name}, {hyb}, {n_hydrogens}, {n_heavy_neighbors}", sep='\n')
+                geom_n = '-'
+        else:
+            if protons:
+                print("Существуют не описанные протоны:")
+                print(atom.GetProp("AtomName"), hyb)
+                print(protons)
+                geom_n = '-'
+            
+        if protons: # ['H'] ['HB1', 'HB2'] ['HC1', 'HC2', 'HC3']
+            # print(protons)
+            n_H = str(len(protons))
+            H_name = find_common_prefix(protons)
+            if H_name not in ['H', 'HA', 'HN']:
+                hdb.append("{}\t{}\t{}\t{}\n".format(n_H, geom_n, H_name, "\t".join(visited_atoms)))
+                # ['CB', 'CA', 'CG'] ['CK', 'CI'] ['CA', 'N', 'C', 'CB']
+    # print(heavy_atoms)
+    hdb = [f'{resname}\t{len(hdb)}\n'] + hdb
+    return hdb
+    #     print(neighbors, sep = '\n')
+    # print(heavy_atoms)
 
 def check_atomtypes(top, path_to_atp = '', param_folder = ''):
     exist_types = []

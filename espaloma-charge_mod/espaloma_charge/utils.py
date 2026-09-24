@@ -1,4 +1,6 @@
 import torch
+import dgl
+import numpy as np
 
 SUPPORTED_ELEMENTS = [
     "H",
@@ -76,6 +78,63 @@ def fp_rdkit(atom):
     )
 
 
+# def from_rdkit_mol(mol, use_fp=False):
+#     """Convert an RDKit molecule to a DGLGraph.
+    
+#     Parameters
+#     ----------
+#     mol : rdkit.Chem.Mol
+#         Input molecule.
+#     use_fp : bool, optional, default=False
+#         Whether to use fingerprint features.
+    
+#     Returns
+#     -------
+#     dgl.DGLGraph
+#         DGL graph with node features.
+#     """
+    
+#     # Получаем количество атомов
+#     n_atoms = mol.GetNumAtoms()
+    
+#     # Создаем граф с помощью dgl.graph (рекомендуемый способ)
+#     # Сначала создаем список ребер
+#     src = []
+#     dst = []
+    
+#     for bond in mol.GetBonds():
+#         u = bond.GetBeginAtomIdx()
+#         v = bond.GetEndAtomIdx()
+#         src.append(u)
+#         dst.append(v)
+#         src.append(v)
+#         dst.append(u)
+    
+#     if src:  # если есть связи
+#         # Создаем граф из ребер
+#         g = dgl.graph((src, dst), num_nodes=n_atoms)
+#     else:
+#         # Если нет связей, создаем граф только с узлами
+#         g = dgl.graph(([], []), num_nodes=n_atoms)
+    
+#     # Добавляем признаки узлов
+#     atomic_numbers = [float(atom.GetAtomicNum()) for atom in mol.GetAtoms()]
+#     g.ndata["type"] = torch.tensor(atomic_numbers, dtype=torch.float32).view(-1, 1)
+    
+#     formal_charges = [float(atom.GetFormalCharge()) for atom in mol.GetAtoms()]
+#     g.ndata["q_ref"] = torch.tensor(formal_charges, dtype=torch.float32).view(-1, 1)
+    
+#     # Добавляем признаки ребер
+#     if src:  # если есть связи
+#         bond_types = []
+#         for bond in mol.GetBonds():
+#             bond_type = float(bond.GetBondTypeAsDouble())
+#             bond_types.extend([bond_type, bond_type])
+#         g.edata["type"] = torch.tensor(bond_types, dtype=torch.float32).view(-1, 1)
+    
+#     return g
+
+
 def from_rdkit_mol(mol, use_fp=True):
     import dgl
     from rdkit import Chem
@@ -84,14 +143,22 @@ def from_rdkit_mol(mol, use_fp=True):
     g = dgl.DGLGraph()
 
     # enter nodes
-    n_atoms = mol.GetNumAtoms()
+    n_atoms = int(mol.GetNumAtoms())
     g.add_nodes(n_atoms)
-    g.ndata["type"] = torch.Tensor(
-        [[atom.GetAtomicNum()] for atom in mol.GetAtoms()]
+    g.ndata["type"] = torch.tensor(
+    [[float(atom.GetAtomicNum())] for atom in mol.GetAtoms()], 
+    dtype=torch.float32
     )
-    g.ndata["q_ref"] = torch.Tensor(
-        [[atom.GetFormalCharge()] for atom in mol.GetAtoms()]
+    g.ndata["q_ref"] = torch.tensor(
+    [[float(atom.GetFormalCharge())] for atom in mol.GetAtoms()],
+    dtype=torch.float32
     )
+    # g.ndata["type"] = torch.Tensor(
+    #     [[atom.GetAtomicNum()] for atom in mol.GetAtoms()]
+    # )
+    # g.ndata["q_ref"] = torch.Tensor(
+    #     [[atom.GetFormalCharge()] for atom in mol.GetAtoms()]
+    # )
     h_v = torch.zeros(g.ndata["type"].shape[0], 100, dtype=torch.float32)
 
     h_v[
