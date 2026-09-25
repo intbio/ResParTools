@@ -4,6 +4,7 @@ import time
 import re
 import glob
 import json
+from pathlib import Path
 from collections import Counter
 from collections import defaultdict, deque
 import numpy as np
@@ -210,20 +211,19 @@ def file_opener(path, **kwargs):
     
     print(f"Загрузка файла: {name} (формат: {extension})")
     
-    match extension:
-        case ".smi" | ".smiles":
-            smi_str = read_file(path)
-            rdkit_mol = smi_to_chem(smi_str, **kwargs)
-        case ".mol2":
-            rdkit_mol = mol2_to_chem(path, **kwargs)
-        case ".pdb":
-            # Используем kwargs для переопределения параметров по умолчанию
-            removeHs = kwargs.get('removeHs', False)
-            format_coord = kwargs.get('format_coord', '3D')
-            rdkit_mol = pdb_to_chem(path, removeHs=removeHs, format_coord=format_coord)
-        case _:
-            raise ValueError(f"Неподдерживаемый формат файла: {extension}. "
-                           f"Поддерживаемые: .smi, .smiles, .mol2, .pdb")
+    if extension in (".smi", ".smiles"):
+        smi_str = read_file(path)
+        rdkit_mol = smi_to_chem(smi_str, **kwargs)
+    elif extension == ".mol2":
+        rdkit_mol = mol2_to_chem(path, **kwargs)
+    elif extension == ".pdb":
+        # Используем kwargs для переопределения параметров по умолчанию
+        removeHs = kwargs.get('removeHs', False)
+        format_coord = kwargs.get('format_coord', '3D')
+        rdkit_mol = pdb_to_chem(path, removeHs=removeHs, format_coord=format_coord)
+    else:
+        raise ValueError(f"Неподдерживаемый формат файла: {extension}. "
+                       f"Поддерживаемые: .smi, .smiles, .mol2, .pdb")
     
     return rdkit_mol
 
@@ -380,23 +380,37 @@ def remove_hydrogens_preserve_indices(mol):
         heavy_idx_map (dict): словарь {новый индекс тяжелого атома: исходный индекс в mol}
     """
     mol_rw = Chem.RWMol(mol)  # Создаём RWMol для редактирования
-    heavy_idx_map = {}        # Словарь соответствия новых индексов → оригинальные
+
+    # Запоминаем исходный индекс каждого атома до удаления H
+    for atom in mol_rw.GetAtoms():
+        atom.SetIntProp('_orig_idx', atom.GetIdx())
 
     # Проходим по атомам и собираем индексы протонов
     H_indices = [atom.GetIdx() for atom in mol_rw.GetAtoms() if atom.GetAtomicNum() == 1]
+
+    # Переносим удаляемые H в счётчик явных H соседа, чтобы сохранить валентность
+    # (иначе NH2 мономера и NH полимера получат разную валентность при MatchValences)
+    for idx in H_indices:
+        for neighbor in mol_rw.GetAtomWithIdx(idx).GetNeighbors():
+            if neighbor.GetAtomicNum() != 1:
+                neighbor.SetNumExplicitHs(neighbor.GetNumExplicitHs() + 1)
 
     # Удаляем протонные атомы (любые индексы)
     for idx in sorted(H_indices, reverse=True):
         mol_rw.RemoveAtom(idx)
 
-    # После удаления H формируем mapping для тяжёлых атомов
-    new_idx = 0
-    for atom in mol_rw.GetAtoms():
-        heavy_idx_map[new_idx] = atom.GetIdx()
-        new_idx += 1
+    mol_noH = mol_rw.GetMol()
+    mol_noH.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(mol_noH)  # RemoveAtom сбрасывает информацию о кольцах
+
+    # Словарь соответствия новых индексов → оригинальные
+    heavy_idx_map = {}
+    for atom in mol_noH.GetAtoms():
+        heavy_idx_map[atom.GetIdx()] = atom.GetIntProp('_orig_idx')
+        atom.ClearProp('_orig_idx')
 
     # Возвращаем молекулу и mapping
-    return mol_rw.GetMol(), heavy_idx_map
+    return mol_noH, heavy_idx_map
 
 
 def match_chem_v3(mol_chem_1, mol_chem_2,
@@ -560,6 +574,21 @@ def match_chem_v6(
     """
     Сопоставление двух молекул с использованием RDKit MCS.
     Возвращает подструктуры с H и без H, а также словарь индексов и имен.
+
+    Args:
+        mol_chem_1 (Chem.Mol) - мономер (из его атомов строится подструктура)
+        mol_chem_2 (Chem.Mol) - полимер
+        only_heavy_mapping (bool) - MCS только по тяжелым атомам, H сопоставляются потом
+        compare_any_bond (bool) - игнорировать порядок связей
+        match_residue_number (int) - искать только среди атомов этого остатка полимера
+        timeout (int) - таймаут поиска MCS, с
+
+    Returns:
+        substructure_dict (dict) - {"H": подструктура с H, "noH": подструктура без H}
+        dict_matches (dict) - {"Indexes": {индекс в mol_chem_1: индекс в mol_chem_2},
+                               "Names": {имя в mol_chem_1: имя в mol_chem_2}} (если есть имена)
+        Атом i подструктуры "H" соответствует i-й паре в "Indexes".
+        Если сопоставление не найдено, возвращает (None, None).
     """
     import threading
     import warnings
@@ -567,7 +596,7 @@ def match_chem_v6(
     from rdkit.Chem import rdFMCS
 
     # === 1. Фильтрация по остаткам ===
-    residue_index_map = None
+    residue_index_map = None  # индекс в подмолекуле остатка -> индекс в mol_chem_2
     mol2_for_mcs = mol_chem_2
 
     if match_residue_number is not None:
@@ -587,10 +616,13 @@ def match_chem_v6(
             if bond.GetBeginAtomIdx() in residue_atom_indices and bond.GetEndAtomIdx() in residue_atom_indices:
                 bond_indices.append(bond.GetIdx())
 
-        residue_submol = Chem.PathToSubmol(mol_chem_2, bond_indices, useQuery=False)
+        atom_map = {}  # заполняется RDKit: индекс в mol_chem_2 -> индекс в подмолекуле
+        residue_submol = Chem.PathToSubmol(mol_chem_2, bond_indices, useQuery=False, atomMap=atom_map)
+        residue_submol.UpdatePropertyCache(strict=False)
+        Chem.FastFindRings(residue_submol)
 
         # mapping submol_idx -> polymer_idx
-        # residue_index_map = {new_idx: old_idx for new_idx, old_idx in enumerate(sorted(residue_atom_indices))}
+        residue_index_map = {new_idx: old_idx for old_idx, new_idx in atom_map.items()}
         mol2_for_mcs = residue_submol
 
     # === 2. Heavy mapping: удаляем H для поиска MCS ===
@@ -601,30 +633,36 @@ def match_chem_v6(
         warnings.warn("⚠ MCS с явными протонами может быть очень медленным.")
         mol1_work = mol_chem_1
         mol2_work = mol2_for_mcs
+        mol1_map = {atom.GetIdx(): atom.GetIdx() for atom in mol1_work.GetAtoms()}
+        mol2_map = {atom.GetIdx(): atom.GetIdx() for atom in mol2_work.GetAtoms()}
+
+    # индекс в mol2_work -> индекс в исходном mol_chem_2 (с учетом фильтрации по остатку)
+    if residue_index_map is not None:
+        mol2_map = {i: residue_index_map[j] for i, j in mol2_map.items()}
 
     # === 3. Настройки MCS ===
     params = rdFMCS.MCSParameters()
     params.Timeout = timeout
-    params.AtomCompare = rdFMCS.AtomCompare.CompareElements
-    params.MatchValences = True
-    params.MatchFormalCharge = True
-    # params.MatchHydrogens = False
-    params.BondCompare = rdFMCS.BondCompare.CompareAny if compare_any_bond else rdFMCS.BondCompare.CompareOrder
-    params.RingMatchesRingOnly = True
-    params.CompleteRingsOnly = False
+    params.AtomTyper = rdFMCS.AtomCompare.CompareElements
+    params.AtomCompareParameters.MatchValences = True
+    params.AtomCompareParameters.MatchFormalCharge = True
+    params.AtomCompareParameters.RingMatchesRingOnly = True
+    params.BondTyper = rdFMCS.BondCompare.CompareAny if compare_any_bond else rdFMCS.BondCompare.CompareOrder
+    params.BondCompareParameters.RingMatchesRingOnly = True
+    params.BondCompareParameters.CompleteRingsOnly = False
 
     # === 4. Анимация поиска MCS ===
     done = False
     t = threading.Thread(target=animate, args=(lambda: done, "Поиск подструктуры между молекулами"))
     t.start()
-
-    res = rdFMCS.FindMCS([mol1_work, mol2_work], parameters=params)
-
-    done = True
-    t.join()
+    try:
+        res = rdFMCS.FindMCS([mol1_work, mol2_work], params)
+    finally:
+        done = True
+        t.join()
 
     if res.canceled:
-        print_red("⚠ MCS остановлен по timeout")
+        print_red("⚠ MCS остановлен по timeout, подструктура может быть неполной")
 
     if res.numAtoms == 0:
         warnings.warn("⚠ Общая подструктура не найдена.")
@@ -632,23 +670,30 @@ def match_chem_v6(
 
     queryMol = res.queryMol
 
-    # === 5. Получаем ВСЕ сопоставления ===
-    matches1 = mol1_work.GetSubstructMatches(queryMol)
-    matches2 = mol2_work.GetSubstructMatches(queryMol)
+    # === 5. Получаем сопоставления ===
+    # queryMol не хранит валентность и заряд, поэтому проверяем их сами
+    def atoms_compatible(a1, a2):
+        return (a1.GetTotalValence() == a2.GetTotalValence()
+                and a1.GetFormalCharge() == a2.GetFormalCharge())
+
+    matches1 = mol1_work.GetSubstructMatches(queryMol, uniquify=False, maxMatches=1000)
+    matches2 = mol2_work.GetSubstructMatches(queryMol, uniquify=False, maxMatches=1000)
 
     if not matches1 or not matches2:
         warnings.warn("⚠ Сопоставление подструктур не найдено.")
         return None, None
 
-    # Для V6 убираем скоринг, просто берем первую пару
+    # Для V6 убираем скоринг, берем первую пару, совместимую по валентности и заряду
     match1 = matches1[0]
-    match2 = matches2[0]
+    match2 = next(
+        (m2 for m2 in matches2
+         if all(atoms_compatible(mol1_work.GetAtomWithIdx(i1), mol2_work.GetAtomWithIdx(i2))
+                for i1, i2 in zip(match1, m2))),
+        matches2[0]
+    )
 
-    full_mapping = {mol1_map[i1]: mol2_map[i2] for i1, i2 in zip(match1, match2)}
-    # if residue_index_map is not None:
-    #     match2 = tuple(residue_index_map[i] for i in match2)
-
-    # mapping = dict(zip(match1, match2))
+    # индексы переводим в исходные mol_chem_1 / mol_chem_2
+    mapping = {mol1_map[i1]: mol2_map[i2] for i1, i2 in zip(match1, match2)}
 
     # === 6. Восстанавливаем H ===
     if only_heavy_mapping:
@@ -665,15 +710,21 @@ def match_chem_v6(
     else:
         full_mapping = mapping
 
-    # === 7. Строим подструктуры ===
-    atom_indices_H = sorted(full_mapping.keys())
-    bond_indices_H = [
-        b.GetIdx() for b in mol_chem_1.GetBonds()
-        if b.GetBeginAtomIdx() in atom_indices_H and b.GetEndAtomIdx() in atom_indices_H
-    ]
+    # Порядок: по возрастанию индекса в mol_chem_1 — такой же, как у атомов подструктуры
+    full_mapping = dict(sorted(full_mapping.items()))
 
-    substructure_H = Chem.PathToSubmol(mol_chem_1, bond_indices_H, useQuery=False)
-    substructure_noH = remove_hydrogens_preserve_indices(substructure_H)
+    # === 7. Строим подструктуры ===
+    # Удаляем из копии мономера несопоставленные атомы: оставшиеся атомы
+    # сохраняют исходный порядок, свойства (AtomName, PDB info), заряды и координаты
+    keep = set(full_mapping.keys())
+    substructure_rw = Chem.RWMol(mol_chem_1)
+    for idx in sorted((a.GetIdx() for a in mol_chem_1.GetAtoms() if a.GetIdx() not in keep), reverse=True):
+        substructure_rw.RemoveAtom(idx)
+    substructure_H = substructure_rw.GetMol()
+    substructure_H.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(substructure_H)
+
+    substructure_noH, _ = remove_hydrogens_preserve_indices(substructure_H)
 
     substructure_dict = {"H": substructure_H, "noH": substructure_noH}
 
@@ -690,52 +741,58 @@ def match_chem_v6(
 
     return substructure_dict, dict_matches
     
-def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False, 
-                     match_residue_number = None, monomer_key = True, timeout = 3):
+def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False,
+                     match_residue_number = None, monomer_key = True, timeout = 3,
+                     only_heavy_mapping = True):
     """
     Аргументы:
         monomer_dict - словарь мономера (состоит из одной пары имя: rdkit.Chem)
         polymer_dict - словарь полимера (состоит из одной пар имя: rdkit.Chem)
+        only_heavy_mapping - MCS только по тяжелым атомам (H сопоставляются после)
     Возвращает:
         Словарь match_data_dict со следующими подсловарями:
-        - substructure - сожердит общие подструктуры мономера и полимера, для каждого из полимеров
-        - mon_pol_matches - содержит словари соответствия номеров атомов в общей подструктуре 
-        с номерами атомов в полимере 
+        - substructure - сожердит общие подструктуры мономера и полимера (с H), для каждого из полимеров
+        - substructure_noH - те же подструктуры без H
+        - mon_pol_matches - содержит словари соответствия номеров атомов в общей подструктуре
+        с номерами атомов в полимере
+        Пары, для которых сопоставление не найдено, пропускаются.
     """
+    def add_match(key, mon_val, pol_val):
+        sub, dict_mon_pol_matches = match_chem_v6(mon_val, pol_val,
+                                                  only_heavy_mapping = only_heavy_mapping,
+                                                  compare_any_bond = compare_any_bond,
+                                                  match_residue_number = match_residue_number,
+                                                  timeout=timeout
+                                                  )
+        if sub is None:
+            print_red(f'Сопоставление для {key} не найдено, пропускаем.')
+            return
+
+        match_data_dict['substructure'][key] = sub['H']
+        match_data_dict['substructure_noH'][key] = sub['noH']
+        match_data_dict['N_match_atoms'][key] = sub['H'].GetNumAtoms()
+        match_data_dict['mon_pol_matches'][key] = dict_mon_pol_matches['Indexes']
+        match_data_dict['mon_pol_atom_names'][key] = dict_mon_pol_matches.get('Names')
+
     try:
-        match_data_dict = {'substructure': {}, 
+        match_data_dict = {'substructure': {},
+                           'substructure_noH': {},
                            'mon_pol_matches': {},
                            'N_match_atoms': {},
                            'mon_pol_atom_names':{}}
-        
+
         if (len(monomer_dict) >= 1 and len(polymer_dict) == 1) and monomer_key is True:
 
             pol_key, pol_val = next(iter(polymer_dict.items()))
 
             for mon_key, mon_val in monomer_dict.items():
-                sub, dict_mon_pol_matches = match_chem_v6(mon_val, pol_val, compare_any_bond = compare_any_bond,
-                                                       match_residue_number = match_residue_number,
-                                                        timeout=timeout
-                                                        )
-
-                match_data_dict['substructure'][mon_key] = sub
-                match_data_dict['N_match_atoms'][mon_key] = sub.GetNumAtoms()
-                match_data_dict['mon_pol_matches'][mon_key] = dict_mon_pol_matches['Indexes']
-                match_data_dict['mon_pol_atom_names'][mon_key] = dict_mon_pol_matches.get('Names')
+                add_match(mon_key, mon_val, pol_val)
 
         elif len(monomer_dict) == 1 and len(polymer_dict) > 1 or monomer_key is False:
             mon_key, mon_val = next(iter(monomer_dict.items()))
 
             for pol_key, pol_val in polymer_dict.items():
-                sub, dict_mon_pol_matches = match_chem_v6(mon_val, pol_val, compare_any_bond = compare_any_bond,
-                                                       match_residue_number = match_residue_number,
-                                                        timeout=timeout
-                                                        )
-
-                match_data_dict['substructure'][pol_key] = sub
-                match_data_dict['N_match_atoms'][pol_key] = sub.GetNumAtoms()
-                match_data_dict['mon_pol_matches'][pol_key] = dict_mon_pol_matches['Indexes']
-                match_data_dict['mon_pol_atom_names'][pol_key] = dict_mon_pol_matches.get('Names')
+                add_match(pol_key, mon_val, pol_val)
 
         else:
             print('The len of monomer_dict or polymer_dict must be 1.')
@@ -745,35 +802,174 @@ def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False,
         raise e
         # print_red(f'Что-то пошло не так!\n{e}')
         
-def find_ref_aa(mod_mol_dict, path_to_ref_mol=None, match_residue_number = None, main_match_data=True):
+# Наборы референсных остатков для поиска канонических атомов.
+# Шаблон - PDB-файл, где референсный остаток стоит в позиции residue_number
+# (для белков - тримеры GXG_H.pdb), порядок его атомов в файле считается каноническим.
+# Для нуклеиновых кислот достаточно добавить сюда запись со своей папкой шаблонов.
+REF_TEMPLATES = {
+    'protein': {
+        'dir': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'molecules', 'aminoacids_template'),
+        'pattern': '*_H.pdb',
+        'residue_number': 2,
+        # атомы остова: если они не сопоставились, референс выбран неверно
+        'backbone': ['N', 'CA', 'C', 'O'],
+    },
+}
 
-    if path_to_ref_mol:
-        ref_aa_chem_dict = pdb_to_chem(path_to_ref_mol, )
+aa_full_names = {
+    'A': 'alanine', 'C': 'cysteine', 'D': 'aspartate', 'E': 'glutamate',
+    'F': 'phenylalanine', 'G': 'glycine', 'H': 'histidine', 'I': 'isoleucine',
+    'K': 'lysine', 'L': 'leucine', 'M': 'methionine', 'N': 'asparagine',
+    'P': 'proline', 'Q': 'glutamine', 'R': 'arginine', 'S': 'serine',
+    'T': 'threonine', 'V': 'valine', 'W': 'tryptophan', 'Y': 'tyrosine'
+}
+
+
+def resolve_ref_template(ref_base_name, template_paths, residue_type='protein'):
+    """
+    Находит файл шаблона по имени референсного остатка.
+
+    Аргументы:
+        ref_base_name (str) - имя остатка: однобуквенное ('C'), трехбуквенное ('Cys'),
+            полное ('cysteine') или имя файла шаблона ('GCG_H')
+        template_paths (list) - пути к файлам шаблонов
+        residue_type (str) - тип остатка из REF_TEMPLATES
+    Возвращает:
+        str - путь к файлу шаблона
+    """
+    by_name = {os.path.basename(path).split('.')[0].upper(): path for path in template_paths}
+    key = ref_base_name.strip().upper()
+    if key in by_name:
+        return by_name[key]
+
+    if residue_type == 'protein':
+        letter = None
+        if len(key) == 1 and key in aa_dict:
+            letter = key
+        else:
+            for one, three in aa_dict.items():
+                if key in (three.upper(), aa_full_names[one].upper()):
+                    letter = one
+                    break
+        if letter is not None and f'G{letter}G_H' in by_name:
+            return by_name[f'G{letter}G_H']
     else:
-        ref_aa_chem_dict = pdb_to_chem(glob.glob('moleculse/aminoacids_template/*_H.pdb')) 
-    match_data_dict = match_mon_to_pol(mod_mol_dict, ref_aa_chem_dict, 
-                                       match_residue_number = match_residue_number)
+        # Для остальных типов ищем шаблон, в имени которого есть ref_base_name
+        found = [path for name, path in by_name.items() if key in name]
+        if len(found) == 1:
+            return found[0]
 
-    max_name, max_val = None, -1
-    # Находим максимальное совпадение
-    max_name = max(match_data_dict['N_match_atoms'], 
-                  key=match_data_dict['N_match_atoms'].get)
+    raise ValueError(f'Шаблон для остатка "{ref_base_name}" не найден среди: {sorted(by_name)}')
+
+
+def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
+                     residue_type='protein', match_residue_number=None,
+                     only_heavy_mapping=True, main_match_data=True, timeout=3):
+    """
+    Сопоставляет модифицированный остаток с референсными остатками и выбирает референс.
+
+    Аргументы:
+        mod_mol_dict (dict) - словарь {имя: Chem.Mol} модифицированного остатка (одна пара)
+        path_to_ref_mol (str) - папка с шаблонами или путь к одному шаблону;
+            по умолчанию папка из REF_TEMPLATES[residue_type]
+        ref_base_name (str) - имя референсного остатка (см. resolve_ref_template).
+            Если не задано, выбирается шаблон с наибольшим числом совпавших атомов,
+            что не всегда соответствует остатку, из которого собрана модификация.
+        residue_type (str) - тип остатка из REF_TEMPLATES ('protein', ...)
+        match_residue_number (int) - номер референсного остатка в шаблоне;
+            по умолчанию REF_TEMPLATES[residue_type]['residue_number']
+        only_heavy_mapping (bool) - MCS только по тяжелым атомам (быстрее)
+        main_match_data (bool) - вернуть данные только для выбранного шаблона
+        timeout (int) - таймаут поиска MCS для каждого шаблона, с
+    Возвращает:
+        ref_chem_dict (dict) - {имя шаблона: Chem.Mol}
+        match_data_dict (dict) - словарь match_mon_to_pol, ключи - имена шаблонов
+    """
+    template = REF_TEMPLATES[residue_type]
+    if match_residue_number is None:
+        match_residue_number = template['residue_number']
+
+    path_to_ref_mol = path_to_ref_mol or template['dir']
+    if os.path.isdir(path_to_ref_mol):
+        template_paths = sorted(glob.glob(os.path.join(path_to_ref_mol, template['pattern'])))
+    else:
+        template_paths = [path_to_ref_mol]
+    if not template_paths:
+        raise FileNotFoundError(f'Шаблоны не найдены в {path_to_ref_mol}')
+
+    if ref_base_name:
+        template_paths = [resolve_ref_template(ref_base_name, template_paths, residue_type)]
+        print(f'Производится сопоставление с {os.path.basename(template_paths[0]).split(".")[0]}')
+
+    ref_chem_dict = pdb_to_chem(template_paths)
+    match_data_dict = match_mon_to_pol(mod_mol_dict, ref_chem_dict,
+                                       match_residue_number=match_residue_number,
+                                       monomer_key=False, timeout=timeout,
+                                       only_heavy_mapping=only_heavy_mapping)
+    if not match_data_dict['N_match_atoms']:
+        raise ValueError('Не найдено сопоставление ни с одним из шаблонов.')
+
+    max_name = max(match_data_dict['N_match_atoms'], key=match_data_dict['N_match_atoms'].get)
     max_val = match_data_dict['N_match_atoms'][max_name]
-    
-    # Формируем выходные данные
-    exit_data_dict = {
-        'substructure': {max_name: match_data_dict['substructure'][max_name]},
-        'N_match_atoms': {max_name: max_val},
-        'mon_pol_matches': {max_name: match_data_dict['mon_pol_matches'][max_name]},
-        'mon_pol_atom_names': {max_name: match_data_dict['mon_pol_atom_names'][max_name]}
-    }
+    print(f'Reference residue is {max_name}, with {max_val} matched atoms.')
 
-    aa_letter = max_name[1]  # Вторая буква из имени файла
-    short_name = aa_dict[aa_letter.upper()]
-    chem_ref_mol = pdb_to_chem(f'moleculse/aminoacids_template/{max_name}.pdb')
-    
-    print(f'Reference amino acid is {short_name}, with {max_val} matched atoms.')
-    return chem_ref_mol, exit_data_dict if main_match_data else match_data_dict , max_name
+    ref_mol = ref_chem_dict[max_name]
+    matched_names = {ref_mol.GetAtomWithIdx(idx).GetProp('AtomName')
+                     for idx in match_data_dict['mon_pol_matches'][max_name].values()}
+    missing = [name for name in template.get('backbone', []) if name not in matched_names]
+    if missing:
+        print_red(f'⚠ Атомы остова {missing} шаблона {max_name} не сопоставлены. '
+                  f'Возможно, референс выбран неверно - задайте ref_base_name.')
+
+    if main_match_data:
+        match_data_dict = {key: {max_name: val[max_name]} for key, val in match_data_dict.items()}
+    return {max_name: ref_chem_dict[max_name]}, match_data_dict
+
+
+# Старое имя, используется в ноутбуках
+find_ref_aa = find_ref_residue
+
+
+def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
+                           path_to_ref_mol=None, only_heavy_mapping=True, timeout=3):
+    """
+    Перенумеровывает атомы остатка в каноническом порядке референсного остатка.
+
+    Канонические атомы (совпавшие с референсом) идут первыми в том порядке, в котором
+    они стоят в шаблоне; остальные (новые) атомы - следом, сохраняя исходный порядок.
+    Если индексы уже канонические, возвращается копия молекулы без изменений.
+
+    Аргументы:
+        mol (Chem.Mol) - остаток (с H или без H)
+        ref_base_name (str) - имя референсного остатка (см. resolve_ref_template);
+            если не задано, берется шаблон с наибольшим совпадением
+        residue_type (str) - тип остатка из REF_TEMPLATES ('protein', ...)
+        path_to_ref_mol (str) - папка с шаблонами или путь к шаблону
+        only_heavy_mapping (bool) - MCS только по тяжелым атомам
+        timeout (int) - таймаут поиска MCS, с
+    Возвращает:
+        Chem.Mol - перенумерованная молекула. В свойстве 'RefResidue' - имя шаблона.
+    """
+    _, match_data = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
+                                     ref_base_name=ref_base_name, residue_type=residue_type,
+                                     only_heavy_mapping=only_heavy_mapping, timeout=timeout)
+    ref_name, mapping = next(iter(match_data['mon_pol_matches'].items()))
+
+    canonical = sorted(mapping, key=mapping.get)
+    other = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetIdx() not in mapping]
+    new_order = canonical + other
+
+    if new_order == list(range(mol.GetNumAtoms())):
+        print_green('Индексы атомов уже канонические, перенумерация не требуется.')
+        new_mol = Chem.Mol(mol)
+    else:
+        moved = [(old, new) for new, old in enumerate(new_order) if old != new]
+        print(f'Перенумеровано атомов: {len(moved)} из {mol.GetNumAtoms()} '
+              f'(канонических: {len(canonical)})')
+        new_mol = Chem.RenumberAtoms(mol, new_order)
+
+    new_mol.SetProp('RefResidue', ref_name)
+    return new_mol
 
 
 def draw_mon_pol_match(monomer_chem_dict, polymer_chem_dict={}, 
@@ -2007,3 +2203,42 @@ aa_dict = {
     'P': 'Pro', 'Q': 'Gln', 'R': 'Arg', 'S': 'Ser',
     'T': 'Thr', 'V': 'Val', 'W': 'Trp', 'Y': 'Tyr'
 }
+
+
+# =============================================================================
+# ИМПОРТИРОВАННЫЕ ФУНКЦИИ
+# Перенесены из ячеек ноутбуков <PTM>/1_charge_calculation*.ipynb (Шаг 4.1),
+# где они были определены локально. Код перенесён без изменений.
+# =============================================================================
+
+# Источник: Lysine_3M/1_charge_calculation.ipynb (идентичная копия в AF_546_*, Lysine_*;
+# в Lysine_Cro вариант с префиксом имени водорода 'HW' вместо 'HW1')
+def add_protons_and_renumber_H(modifie_residue, resname='MOD', resid=1, segid='A'):
+    atom_map = {atom.GetIdx(): atom.GetProp('AtomName') for atom in modifie_residue.GetAtoms()}
+    names = list(atom_map.values())
+    # print(atom_map)
+
+    # Добавление протонов
+    H_modifie_residue = Chem.AddHs(modifie_residue, addCoords=True)
+    AllChem.Compute2DCoords(H_modifie_residue)
+    
+    # Назначение уникальных имен для новых атомам водорода
+    for atom in H_modifie_residue.GetAtoms():
+        if atom.GetPDBResidueInfo() is None:
+            info = atom.GetPDBResidueInfo()
+            print(info, atom.GetIdx(), atom.GetAtomMapNum())
+            
+            new_name = 'HW1'
+            while new_name in names:
+                new_name = increment_name(new_name)
+            names.append(new_name)
+
+            set_PDB_residue_info(atom, new_name, resname, resid, segid)
+            atom.SetProp('AtomName', new_name)
+            atom.SetAtomMapNum(atom.GetIdx())
+            # atom.SetI() = int(atom.GetAtomMapNum())
+        
+    order = [atom.GetIdx() for atom in H_modifie_residue.GetAtoms()]
+    Chem.rdmolops.RenumberAtoms(H_modifie_residue, order)
+    
+    return H_modifie_residue

@@ -1,0 +1,52 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A research toolkit (docs and notebook text are in Russian) for parameterizing **modified amino acids / post-translational modifications** for the GROMACS **amber14sb** force field. Partial charges come from the **Espaloma Charge** neural network (a patched copy that can pin selected atoms to fixed charges). Topologies come from **acpype**. The work is almost entirely Jupyter notebooks. There is no build system, and the project itself has no test suite.
+
+## Environments
+
+- **`ResParTools_ec.yml`**: creates a conda env named `darwin_ec`. This is the primary env for current work. It has Python 3.12, rdkit 2024.03, dgl 2.3 and pytorch 2.3.1 (CUDA 12 builds), plus MDAnalysis, openbabel, nglview and JupyterLab. It covers step 1 (the charge calculation with `espaloma-charge_mod`). It does **not** include `acpype`, `parmed`, `ambertools` or `psiresp`, so steps 2 and 3 and the RESP notebooks still need another env. The file was exported on the cluster, which is why it has a cluster `prefix:` and pinned builds. Install it with an explicit name. On a machine without an NVIDIA driver, also override the CUDA virtual package. Use at least 12.4, because the pinned ffmpeg build requires `__cuda>=12.4`. torch and dgl then run on CPU:
+  ```
+  CONDA_OVERRIDE_CUDA=12.4 conda env create -n darwin_ec -f ResParTools_ec.yml
+  conda run -n darwin_ec python ...   # or: conda activate darwin_ec
+  ```
+  The yml also pulls upstream `espaloma_charge=0.0.8` from conda-forge. The notebooks add `espaloma-charge_mod` with `sys.path.append`, which puts it at the *end* of the path, so the site-packages copy shadows it. The symptom is `charge() got an unexpected keyword argument 'constraints'`. After you create the env, remove the upstream copy: `conda remove -n darwin_ec --force -y espaloma_charge`.
+- `ai_topmol.yml`: creates a conda env named `espaloma` (Python 3.9, dgl 1.1.2, torch 2.3.1, rdkit). It is used for charge calculation with `espaloma-charge_mod`.
+- `psiresp_min.yml`: creates a conda env named `darwin_resp` (psi4 1.6.1, psiresp 0.4.2, `pydantic<2`). It is used for reference RESP charges (`psiresp.ipynb`, `Lysine_lac/1_charge_calculation_resp.ipynb`).
+- The notebooks' saved kernelspecs name `.conda-espaloma` for step 1 and `.conda-topmol2` for steps 2 and 3. Locally, the `topmol2` env (Python 3.8, not defined by any yml in the repo) is what has acpype and parmed.
+
+The vendored Espaloma has upstream tests, which you run from inside that package: `cd espaloma-charge && pytest espaloma_charge/tests` (single test: `pytest espaloma_charge/tests/test_app.py::<name>`). `espaloma-charge_mod` has no tests of its own.
+
+## Architecture
+
+### `notebooks_and_examples/ResParTools.py`: the shared helper library
+This is one flat module of about 2000 lines of RDKit-based functions. The notebooks import it as `pt`. Its main groups of functions:
+- **I/O**: `read_file`, `smi_to_chem`, `pdb_to_chem`, `save_aa_chem_to_pdb`/`_smiles`, `save_charges_json`, `save_json`. Many of these are wrapped by `@data_to_dict`. They accept a path string, a list of paths or a dict, and they **return a dict keyed by file basename** (`get_name`). The rest of the pipeline passes these `{name: RDKit Mol}` dicts around.
+- **Substructure matching**: `match_chem*` (several versions: `match_chem`, `_v3`, `_v6`), `match_mon_to_pol`, `find_ref_aa`. These map a modified monomer onto polymer (trimer) contexts and onto reference amino acids, so that canonical atom names can be carried over.
+- **PDB/residue naming**: `rdkit_pdb_modification`, `generate_atom_names_by_ref_aa`, `modifie_residue_info`.
+- **Force-field file generation**: `hdb_generator`, `check_atomtypes` (`.atp`), `make_r2b`, `remove_extra_H`.
+
+Some functions are defined twice in the file (for example `check_duplicate_atom_names`). In Python the later definition wins.
+
+Notebooks load it with `sys.path.append(os.path.abspath('..'))` followed by `import ResParTools as pt`. The module was named `param_tool.py` before commit 7f1d61a, and stale `__pycache__/param_tool.*.pyc` files are still present. It is imported under Python 3.8 through 3.12 (`topmol2`, `espaloma`, `darwin_ec`), so keep it compatible with 3.8. That rules out `match` statements and PEP 604 `X | Y` annotations.
+
+### `espaloma-charge_mod/`: patched Espaloma Charge
+This differs from the untouched upstream copy in `espaloma-charge/` in `app.py`, `models.py` and `utils.py`. The key addition is `charge(mol, constraints={atom_idx: fixed_q, ...})`. When constraints are given, the model's final `ChargeEquilibrium` layer is replaced with `ChargeEquilibrium_mod` (in `models.py`). That layer fixes the constrained atoms and spreads the remaining total charge over the free atoms only. The notebooks import this package with `sys.path.append("../../espaloma-charge_mod/")`, not with pip. On first use the model weights are downloaded from the GitHub release URL in `app.py`.
+
+The constraints are how modified residues keep the amber14sb backbone charges. The notebooks pin the backbone atoms (N, H, CA, C, O, …) to the standard amber values and let Espaloma assign charges to the side chain.
+
+### Per-modification pipeline (`notebooks_and_examples/<Lysine_XXX | AF_*>/`)
+Each modification folder follows the same steps. Use `Lysine_3M/` as a reference example.
+1. `1_charge_calculation*.ipynb`: reads the monomer and trimer SMILES from `molecules/`, matches the monomer inside the trimers (N/M/C positions), writes substructures to `molecules/substructure/`, renames atoms to canonical names using the reference amino acids (writes `general_atoms.json`), protonates atoms with non-standard valence (acpype rejects them), then runs constrained `charge(...)` and writes `AI_chrges_<name>.json`.
+2. `2_generate_topology*.ipynb`: runs acpype `ACTopol` on the single residue in `Acpype_data/` (obabel converts PDB to MDL first), then uses parmed to copy the atom names and residue name back into a `*_mod.itp`.
+3. `../3_edd_topology.ipynb` (shared, top level; `Lysine_Cro` has its own copy): parses `aminoacids.rtp`, strips atoms that are not part of the residue, assigns atom types from the parent amino acid, inserts the Espaloma charges, and writes `.rtp`, `.r2b`, `residuetypes.dat`, `.hdb`, `Makefile.am`/`.in` and `.atp` entries into `<mod>/force_field_files/`.
+
+The generated `.rtp` files are then collected into the modified force field `notebooks_and_examples/amber14sb_mod.ff/`. It holds `<Mod>.rtp` (hand/RESP) and `<Mod>_ai.rtp` (Espaloma) variants side by side. `amber14sb_parmbsc1_cufix.ff/` is the unmodified base force field. `aminoacids_dict.json` is the parsed base `aminoacids.rtp`.
+
+### Notebook gotchas
+- Relative paths assume that the cwd is the modification folder, which is where Jupyter starts the kernel. Notebooks that `os.chdir` define `ROOT_DIR` (the absolute path of `notebooks_and_examples/`) in their first cell and build every chdir target from it, for example `os.chdir(f'{ROOT_DIR}/{PTM_folder}/Acpype_data')`. The `ROOT_DIR` line is guarded, so re-running the first cell after a chdir does not change it. Never add absolute cluster paths. The old code used `/home/_projects/2022_md_FRET_nv/param_R_CIT`, which is the same directory as `notebooks_and_examples/`.
+- Saved cell outputs still contain the old paths and `param_tool` tracebacks. Those outputs are historical and were not rewritten.
+- `data/`, `datasets/` and `RESP_data/` are deliberately untracked (they hold large calculation outputs).
