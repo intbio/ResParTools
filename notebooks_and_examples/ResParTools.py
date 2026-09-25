@@ -811,8 +811,12 @@ def match_chem_v6(
         (m2 for m2 in matches2
          if all(atoms_compatible(mol1_work.GetAtomWithIdx(i1), mol2_work.GetAtomWithIdx(i2))
                 for i1, i2 in zip(match1, m2))),
-        matches2[0]
+        None
     )
+    if match2 is None:
+        print_red(f"⚠ Ни одно из {len(matches2)} сопоставлений не совпадает по валентности "
+                  "и заряду атомов, взято первое. Проверьте имена атомов в результате.")
+        match2 = matches2[0]
 
     # индексы переводим в исходные mol_chem_1 / mol_chem_2
     mapping = {mol1_map[i1]: mol2_map[i2] for i1, i2 in zip(match1, match2)}
@@ -1100,6 +1104,7 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
     Возвращает:
         ref_chem_dict (dict) - {имя шаблона: Chem.Mol}
         match_data_dict (dict) - словарь match_mon_to_pol, ключи - имена шаблонов
+        ref_name (str) - имя выбранного шаблона-триплета, например 'GKG_H'
     """
     template = REF_TEMPLATES[residue_type]
     if match_residue_number is None:
@@ -1142,7 +1147,7 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
 
     if main_match_data:
         match_data_dict = {key: {max_name: val[max_name]} for key, val in match_data_dict.items()}
-    return {max_name: ref_chem_dict[max_name]}, match_data_dict
+    return {max_name: ref_chem_dict[max_name]}, match_data_dict, max_name
 
 
 # Старое имя, используется в ноутбуках
@@ -1170,7 +1175,7 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
     Возвращает:
         Chem.Mol - перенумерованная молекула. В свойстве 'RefResidue' - имя шаблона.
     """
-    _, match_data = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
+    _, match_data, _ = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
                                      ref_base_name=ref_base_name, residue_type=residue_type,
                                      only_heavy_mapping=only_heavy_mapping, timeout=timeout,
                                      strict_parent=strict_parent)
