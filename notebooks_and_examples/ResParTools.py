@@ -938,13 +938,50 @@ REF_TEMPLATES = {
     },
 }
 
-aa_full_names = {
-    'A': 'alanine', 'C': 'cysteine', 'D': 'aspartate', 'E': 'glutamate',
-    'F': 'phenylalanine', 'G': 'glycine', 'H': 'histidine', 'I': 'isoleucine',
-    'K': 'lysine', 'L': 'leucine', 'M': 'methionine', 'N': 'asparagine',
-    'P': 'proline', 'Q': 'glutamine', 'R': 'arginine', 'S': 'serine',
-    'T': 'threonine', 'V': 'valine', 'W': 'tryptophan', 'Y': 'tyrosine'
+# Канонические аминокислоты: однобуквенный код -> (трехбуквенный код, название, name)
+AMINO_ACIDS = {
+    'A': ('Ala', 'аланин', 'alanine'),
+    'C': ('Cys', 'цистеин', 'cysteine'),
+    'D': ('Asp', 'аспарагиновая кислота', 'aspartate'),
+    'E': ('Glu', 'глутаминовая кислота', 'glutamate'),
+    'F': ('Phe', 'фенилаланин', 'phenylalanine'),
+    'G': ('Gly', 'глицин', 'glycine'),
+    'H': ('His', 'гистидин', 'histidine'),
+    'I': ('Ile', 'изолейцин', 'isoleucine'),
+    'K': ('Lys', 'лизин', 'lysine'),
+    'L': ('Leu', 'лейцин', 'leucine'),
+    'M': ('Met', 'метионин', 'methionine'),
+    'N': ('Asn', 'аспарагин', 'asparagine'),
+    'P': ('Pro', 'пролин', 'proline'),
+    'Q': ('Gln', 'глутамин', 'glutamine'),
+    'R': ('Arg', 'аргинин', 'arginine'),
+    'S': ('Ser', 'серин', 'serine'),
+    'T': ('Thr', 'треонин', 'threonine'),
+    'V': ('Val', 'валин', 'valine'),
+    'W': ('Trp', 'триптофан', 'tryptophan'),
+    'Y': ('Tyr', 'тирозин', 'tyrosine'),
 }
+aa_full_names = {one: names[2] for one, names in AMINO_ACIDS.items()}
+
+
+def aa_label(letter):
+    """'C' -> 'цистеин (Cys, C)'. Для неизвестного кода возвращает сам код."""
+    if letter not in AMINO_ACIDS:
+        return letter
+    three, name_ru, _ = AMINO_ACIDS[letter]
+    return f'{name_ru} ({three}, {letter})'
+
+
+def template_aa_letter(template_name):
+    """Однобуквенный код остатка шаблона: 'GCG_H' -> 'C', 'AGA_H' -> 'G'."""
+    core = template_name.split('_')[0]
+    return core[1] if len(core) == 3 and core[1] in AMINO_ACIDS else None
+
+
+def template_label(template_name):
+    """'GCG_H' -> 'цистеин (Cys, C), шаблон GCG_H'."""
+    letter = template_aa_letter(template_name)
+    return f'{aa_label(letter)}, шаблон {template_name}' if letter else template_name
 
 
 def resolve_ref_template(ref_base_name, template_paths, residue_type='protein'):
@@ -966,11 +1003,11 @@ def resolve_ref_template(ref_base_name, template_paths, residue_type='protein'):
 
     if residue_type == 'protein':
         letter = None
-        if len(key) == 1 and key in aa_dict:
+        if len(key) == 1 and key in AMINO_ACIDS:
             letter = key
         else:
-            for one, three in aa_dict.items():
-                if key in (three.upper(), aa_full_names[one].upper()):
+            for one, names in AMINO_ACIDS.items():
+                if key in (name.upper() for name in names):
                     letter = one
                     break
         if letter is not None and f'G{letter}G_H' in by_name:
@@ -984,9 +1021,63 @@ def resolve_ref_template(ref_base_name, template_paths, residue_type='protein'):
     raise ValueError(f'Шаблон для остатка "{ref_base_name}" не найден среди: {sorted(by_name)}')
 
 
+def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_name, strict=True):
+    """
+    Проверяет, что модификация действительно построена на заявленном родительском остатке.
+
+    Остов (backbone) и CB должны быть сопоставлены полностью, иначе ValueError.
+    Несопоставленные атомы боковой цепи печатаются: обычно это место модификации
+    (NZ ацетиллизина, NH2 цитруллина - один атом). Если не сопоставлена вся боковая цепь
+    или не меньше 2 атомов и половины цепи, родитель скорее всего указан неверно:
+    при strict=True это ValueError, при strict=False - предупреждение
+    (для модификаций, сильно перестраивающих боковую цепь, например кинуренина из Trp).
+
+    Ограничение: Ala и Gly содержатся почти в любом остатке, поэтому ошибочно
+    заявленный Ala/Gly проверкой не ловится.
+
+    Аргументы:
+        ref_mol (Chem.Mol) - шаблон
+        mapping (dict) - {индекс в модификации: индекс в шаблоне}
+        residue_number (int) - номер родительского остатка в шаблоне
+        backbone (list) - имена атомов остова
+        template_name (str) - имя шаблона для сообщений
+    """
+    residue_atoms = {atom.GetIdx(): atom.GetProp('AtomName') for atom in ref_mol.GetAtoms()
+                     if atom.GetAtomicNum() > 1
+                     and atom.GetPDBResidueInfo().GetResidueNumber() == residue_number}
+    matched = set(mapping.values())
+    required = list(backbone) + (['CB'] if 'CB' in residue_atoms.values() else [])
+
+    missing_required = [name for idx, name in residue_atoms.items()
+                        if name in required and idx not in matched]
+    if missing_required:
+        raise ValueError(
+            f'Модификация не содержит остов заявленного остатка {template_label(template_name)}: '
+            f'не сопоставлены {missing_required}. Проверьте ref_base_name.')
+
+    side_chain = [name for name in residue_atoms.values() if name not in required]
+    missing_side = [name for idx, name in residue_atoms.items()
+                    if name in side_chain and idx not in matched]
+    if not missing_side:
+        return
+    report = f'атомы боковой цепи {missing_side} ({len(missing_side)} из {len(side_chain)})'
+    wrong_parent = (len(missing_side) == len(side_chain)
+                    or (len(missing_side) >= 2 and 2 * len(missing_side) >= len(side_chain)))
+    if wrong_parent and strict:
+        raise ValueError(
+            f'Не сопоставлены {report} остатка {template_label(template_name)}: '
+            'похоже, родительский остаток указан неверно. Проверьте ref_base_name; '
+            'если модификация сильно перестраивает боковую цепь, вызовите с strict_parent=False.')
+    if wrong_parent:
+        print_red(f'⚠ Не сопоставлены {report}: возможно, родительский остаток указан неверно.')
+    else:
+        print_red(f'⚠ Не сопоставлены {report}: вероятно, это место модификации.')
+
+
 def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
                      residue_type='protein', match_residue_number=None,
-                     only_heavy_mapping=True, main_match_data=True, timeout=3):
+                     only_heavy_mapping=True, main_match_data=True, timeout=3,
+                     strict_parent=True):
     """
     Сопоставляет модифицированный остаток с референсными остатками и выбирает референс.
 
@@ -994,15 +1085,18 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
         mod_mol_dict (dict) - словарь {имя: Chem.Mol} модифицированного остатка (одна пара)
         path_to_ref_mol (str) - папка с шаблонами или путь к одному шаблону;
             по умолчанию папка из REF_TEMPLATES[residue_type]
-        ref_base_name (str) - имя референсного остатка (см. resolve_ref_template).
-            Если не задано, выбирается шаблон с наибольшим числом совпавших атомов,
-            что не всегда соответствует остатку, из которого собрана модификация.
+        ref_base_name (str) - родительский остаток, из которого собрана модификация:
+            'C', 'Cys', 'cysteine', 'цистеин' или имя шаблона 'GCG_H' (см. resolve_ref_template).
+            Обязателен, если path_to_ref_mol - папка: по числу совпавших атомов родителя
+            не определить (у меток цепи и кольца совпадают с Lys/Trp больше, чем с Cys).
         residue_type (str) - тип остатка из REF_TEMPLATES ('protein', ...)
         match_residue_number (int) - номер референсного остатка в шаблоне;
             по умолчанию REF_TEMPLATES[residue_type]['residue_number']
         only_heavy_mapping (bool) - MCS только по тяжелым атомам (быстрее)
         main_match_data (bool) - вернуть данные только для выбранного шаблона
         timeout (int) - таймаут поиска MCS для каждого шаблона, с
+        strict_parent (bool) - ошибка, если боковая цепь родителя в основном не сопоставлена
+            (см. check_parent_residue); False - только предупреждение
     Возвращает:
         ref_chem_dict (dict) - {имя шаблона: Chem.Mol}
         match_data_dict (dict) - словарь match_mon_to_pol, ключи - имена шаблонов
@@ -1021,7 +1115,14 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
 
     if ref_base_name:
         template_paths = [resolve_ref_template(ref_base_name, template_paths, residue_type)]
-        print(f'Производится сопоставление с {os.path.basename(template_paths[0]).split(".")[0]}')
+    elif len(template_paths) > 1:
+        options = ', '.join(f"'{one}' - {aa_label(one)}" for one in AMINO_ACIDS) \
+            if residue_type == 'protein' else ', '.join(template_paths)
+        raise ValueError(
+            'Укажите родительский остаток модификации: ref_base_name=...\n'
+            'Автоматический выбор по числу совпавших атомов ненадёжен '
+            '(например, метки на цистеине совпадают с Lys/Trp больше, чем с Cys).\n'
+            f'Варианты: {options}')
 
     ref_chem_dict = pdb_to_chem(template_paths)
     match_data_dict = match_mon_to_pol(mod_mol_dict, ref_chem_dict,
@@ -1033,15 +1134,11 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
 
     max_name = max(match_data_dict['N_match_atoms'], key=match_data_dict['N_match_atoms'].get)
     max_val = match_data_dict['N_match_atoms'][max_name]
-    print(f'Reference residue is {max_name}, with {max_val} matched atoms.')
+    print(f'Родительский остаток: {template_label(max_name)}; сопоставлено атомов: {max_val}.')
 
-    ref_mol = ref_chem_dict[max_name]
-    matched_names = {ref_mol.GetAtomWithIdx(idx).GetProp('AtomName')
-                     for idx in match_data_dict['mon_pol_matches'][max_name].values()}
-    missing = [name for name in template.get('backbone', []) if name not in matched_names]
-    if missing:
-        print_red(f'⚠ Атомы остова {missing} шаблона {max_name} не сопоставлены. '
-                  f'Возможно, референс выбран неверно - задайте ref_base_name.')
+    check_parent_residue(ref_chem_dict[max_name], match_data_dict['mon_pol_matches'][max_name],
+                         match_residue_number, template.get('backbone', []), max_name,
+                         strict=strict_parent)
 
     if main_match_data:
         match_data_dict = {key: {max_name: val[max_name]} for key, val in match_data_dict.items()}
@@ -1053,7 +1150,8 @@ find_ref_aa = find_ref_residue
 
 
 def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
-                           path_to_ref_mol=None, only_heavy_mapping=True, timeout=3):
+                           path_to_ref_mol=None, only_heavy_mapping=True, timeout=3,
+                           strict_parent=True):
     """
     Перенумеровывает атомы остатка в каноническом порядке референсного остатка.
 
@@ -1063,18 +1161,19 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
 
     Аргументы:
         mol (Chem.Mol) - остаток (с H или без H)
-        ref_base_name (str) - имя референсного остатка (см. resolve_ref_template);
-            если не задано, берется шаблон с наибольшим совпадением
+        ref_base_name (str) - родительский остаток (см. find_ref_residue), обязателен
         residue_type (str) - тип остатка из REF_TEMPLATES ('protein', ...)
         path_to_ref_mol (str) - папка с шаблонами или путь к шаблону
         only_heavy_mapping (bool) - MCS только по тяжелым атомам
         timeout (int) - таймаут поиска MCS, с
+        strict_parent (bool) - см. find_ref_residue
     Возвращает:
         Chem.Mol - перенумерованная молекула. В свойстве 'RefResidue' - имя шаблона.
     """
     _, match_data = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
                                      ref_base_name=ref_base_name, residue_type=residue_type,
-                                     only_heavy_mapping=only_heavy_mapping, timeout=timeout)
+                                     only_heavy_mapping=only_heavy_mapping, timeout=timeout,
+                                     strict_parent=strict_parent)
     ref_name, mapping = next(iter(match_data['mon_pol_matches'].items()))
 
     canonical = sorted(mapping, key=mapping.get)
@@ -2318,13 +2417,7 @@ def format_time(seconds):
 
 # ---------------------------------------------
 
-aa_dict = {
-    'A': 'Ala', 'C': 'Cys', 'D': 'Asp', 'E': 'Glu',
-    'F': 'Phe', 'G': 'Gly', 'H': 'His', 'I': 'Ile',
-    'K': 'Lys', 'L': 'Leu', 'M': 'Met', 'N': 'Asn',
-    'P': 'Pro', 'Q': 'Gln', 'R': 'Arg', 'S': 'Ser',
-    'T': 'Thr', 'V': 'Val', 'W': 'Trp', 'Y': 'Tyr'
-}
+aa_dict = {one: names[0] for one, names in AMINO_ACIDS.items()}
 
 
 # =============================================================================
