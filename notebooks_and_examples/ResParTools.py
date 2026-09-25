@@ -146,53 +146,177 @@ def smi_to_chem(str_smi: str, sanitize=True, addH=True, make_N_root=False,format
         # return rdkit_mol
 
 
-@data_to_dict
-def pdb_to_chem(path_to_pdb, removeHs=False, make_N_root=False):
+def _finalize_read_mol(rdkit_mol, path, sanitize, removeHs, format_coord):
     """
-    Открывает PDB файл при помощи RDKit, преобразует его в двухмерную молекулу 
-    и сохраняет имена атомов как свойства RDKit-атомов.
-    
+    Общий хвост для pdb_to_chem и mol2_to_chem: sanitize, удаление H, координаты.
+    Свойства атомов (AtomName, PDB residue info, заряды) переживают RemoveHs,
+    поэтому имена остаются привязаны к своим атомам.
+    """
+    if sanitize:
+        try:
+            Chem.SanitizeMol(rdkit_mol)
+        except Exception as e:
+            raise ValueError(
+                f"{path}: структура не прошла sanitize ({e}). "
+                "Обычно это лишняя связь или не указан формальный заряд. "
+                "Исправьте файл или вызовите с sanitize=False (без ароматичности и проверки валентностей)."
+            )
+    if removeHs:
+        rdkit_mol = Chem.RemoveHs(rdkit_mol, sanitize=sanitize)
+
+    if format_coord == '2D':
+        AllChem.Compute2DCoords(rdkit_mol)
+    elif format_coord != '3D':
+        raise ValueError("Недопустимый формат. Выберите '2D' или '3D'.")
+
+    rdkit_mol.SetProp('AtomNames', str(rdkit_mol.GetNumAtoms()))
+    return rdkit_mol
+
+
+@data_to_dict
+def pdb_to_chem(path_to_pdb, removeHs=False, make_N_root=False, sanitize=True, format_coord='2D'):
+    """
+    Открывает PDB файл при помощи RDKit и сохраняет имена атомов как свойства RDKit-атомов.
+
     Аргументы:
         path_to_pdb (str): Путь к файлу PDB.
-        removeHs (bool): Удалять ли гидрогены. По умолчанию False.
-        make_N_root (bool): Делать ли атом азота корневым для молекулы. По умолчанию False.
-        
+        removeHs (bool): Удалять ли водороды. По умолчанию False.
+        make_N_root (bool): Не используется, оставлен для совместимости вызовов.
+        sanitize (bool): Проверка валентностей и распознавание ароматичности.
+            Нужна, чтобы ароматические связи отличались от двойных так же, как в SMILES.
+        format_coord (str): '2D' - пересчитать координаты для рисования,
+            '3D' - оставить координаты из файла.
+
+    Связи берутся из CONECT, если он есть в файле; иначе RDKit определяет их по расстояниям
+    (proximity bonding). Вместе с CONECT proximity bonding не используется: на 2D и
+    неоптимизированных структурах он добавляет фантомные связи.
+
     Возвращает:
-        Chem.Mol: Молекула RDKit с сохраненными именами атомов.
+        Chem.Mol: Молекула RDKit с сохраненными именами атомов (AtomName).
     """
-    # Загрузка молекулы из PDB
-    rdkit_mol = Chem.MolFromPDBFile(path_to_pdb, removeHs)
-    
-    # smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=False, 
-    #                                      allHsExplicit=True)
-    # rdkit_mol = Chem.MolFromSmiles(smiles_string, sanitize=False)
-    
+    with open(path_to_pdb, "r") as pdb_file:
+        has_conect = any(line.startswith("CONECT") for line in pdb_file)
+
+    rdkit_mol = Chem.MolFromPDBFile(path_to_pdb, sanitize=False, removeHs=False,
+                                    proximityBonding=not has_conect)
     if not rdkit_mol:
         raise ValueError(f"Не удалось загрузить PDB файл: {path_to_pdb}")
-      
-    # Открываем PDB файл для извлечения имен атомов
-    with open(path_to_pdb, "r") as pdb_file:
-        pdb_lines = pdb_file.readlines()
 
-    atom_names = []
-    for line in pdb_lines:
-        if line.startswith("ATOM") or line.startswith("HETATM"):
-            atom_name = line.split()[2]  # Имя атома в формате PDB
-            atom_names.append(atom_name)
+    # Имена атомов RDKit читает из фиксированных колонок PDB (13-16)
+    for atom in rdkit_mol.GetAtoms():
+        atom.SetProp("AtomName", atom.GetPDBResidueInfo().GetName().strip())
 
-    # Проверка соответствия числа атомов
-    # if len(atom_names) != rdkit_mol.GetNumAtoms():
-    #     raise ValueError("Число атомов в PDB файле и RDKit молекуле не совпадает!")
+    return _finalize_read_mol(rdkit_mol, path_to_pdb, sanitize, removeHs, format_coord)
 
-    # Присваиваем имена атомов
-    for atom, name in zip(rdkit_mol.GetAtoms(), atom_names):
-        atom.SetProp("AtomName", name)
-        # atom.SetAtomMapNum(atom.GetIdx())
-    rdkit_mol.SetProp('AtomNames', str(len(atom_names)))
-    # Преобразование трехмерных координат в двумерные
-    AllChem.Compute2DCoords(rdkit_mol)
-    # rdDepictor.SetPreferCoordGen(True)
-    return rdkit_mol
+
+def _read_mol2_atom_block(path_to_mol2):
+    """
+    Читает секции @<TRIPOS>MOLECULE и @<TRIPOS>ATOM (первой молекулы в файле).
+    Возвращает (имя молекулы, тип зарядов, список словарей по атомам в порядке файла).
+    """
+    with open(path_to_mol2, "r") as f:
+        lines = f.read().splitlines()
+
+    mol_name, charge_type, atoms = "", "", []
+    section = None
+    mol_line = 0
+    for line in lines:
+        if line.startswith("@<TRIPOS>"):
+            if section == "ATOM":
+                break
+            section = line[len("@<TRIPOS>"):].strip()
+            mol_line = 0
+            continue
+        if section == "MOLECULE":
+            mol_line += 1
+            if mol_line == 1:
+                mol_name = line.strip()
+            elif mol_line == 4:
+                charge_type = line.strip()
+        elif section == "ATOM" and line.strip():
+            fields = line.split()
+            atom = {"id": int(fields[0]), "name": fields[1], "type": fields[5]}
+            atom["subst_id"] = int(fields[6]) if len(fields) > 6 else 1
+            atom["subst_name"] = fields[7] if len(fields) > 7 else "UNL"
+            atom["charge"] = float(fields[8]) if len(fields) > 8 else 0.0
+            atoms.append(atom)
+    return mol_name, charge_type, atoms
+
+
+@data_to_dict
+def mol2_to_chem(path_to_mol2, sanitize=True, removeHs=False, format_coord='2D'):
+    """
+    Открывает mol2 файл при помощи RDKit и переносит в молекулу всё, что есть в секции ATOM.
+
+    Порядки связей (включая ароматические 'ar') берутся из секции BOND.
+    RDKit сам сохраняет имя, тип SYBYL и заряд атома, но теряет номер и имя остатка,
+    поэтому секция ATOM дополнительно разбирается вручную.
+
+    Аргументы:
+        path_to_mol2 (str): Путь к файлу mol2 (типы атомов SYBYL; файлы с типами GAFF RDKit не читает).
+        sanitize (bool): Проверка валентностей и распознавание ароматичности.
+        removeHs (bool): Удалять ли водороды.
+        format_coord (str): '2D' - пересчитать координаты для рисования, '3D' - оставить из файла.
+
+    Свойства атомов:
+        AtomName (str), Mol2AtomType (str), PartialCharge (float),
+        PDB residue info: имя атома, имя и номер остатка.
+        Имя остатка: subst_name без хвоста с номером остатка (конвенция Tripos: 'KMA2' -> 'KMA').
+    Свойства молекулы:
+        AtomNames, Mol2Name, Mol2ChargeType.
+
+    Возвращает:
+        Chem.Mol
+    """
+    rdkit_mol = Chem.MolFromMol2File(path_to_mol2, sanitize=False, removeHs=False)
+    if not rdkit_mol:
+        raise ValueError(f"Не удалось загрузить mol2 файл: {path_to_mol2} "
+                         "(RDKit понимает только типы атомов SYBYL, не GAFF)")
+
+    mol_name, charge_type, atoms = _read_mol2_atom_block(path_to_mol2)
+    if len(atoms) != rdkit_mol.GetNumAtoms():
+        raise ValueError(f"{path_to_mol2}: в секции ATOM {len(atoms)} атомов, "
+                         f"а RDKit прочитал {rdkit_mol.GetNumAtoms()}")
+
+    for atom, info in zip(rdkit_mol.GetAtoms(), atoms):
+        # RDKit сохраняет порядок атомов из файла; проверяем, что сопоставление верное
+        if atom.HasProp("_TriposAtomName") and atom.GetProp("_TriposAtomName") != info["name"]:
+            raise ValueError(f"{path_to_mol2}: порядок атомов RDKit не совпадает с файлом "
+                             f"(атом {info['id']}: {atom.GetProp('_TriposAtomName')} != {info['name']})")
+        resname = info["subst_name"]
+        if resname.endswith(str(info["subst_id"])) and len(resname) > len(str(info["subst_id"])):
+            resname = resname[:-len(str(info["subst_id"]))]
+
+        atom.SetProp("AtomName", info["name"])
+        atom.SetProp("Mol2AtomType", info["type"])
+        atom.SetDoubleProp("PartialCharge", info["charge"])
+        set_PDB_residue_info(atom, info["name"], resname=resname, resid=info["subst_id"], segid="A")
+
+    # В mol2 нет поля формального заряда, и RDKit превращает заряженные атомы в радикалы
+    # или отвергает их. Восстанавливаем заряды по валентности:
+    #   N с 4 связями (аммоний, иминий)                          -> +1
+    #   O с одной одинарной связью без H (сульфонат, карбоксилат) -> -1,
+    #   только если водороды в файле явные: иначе так же выглядит обычная OH-группа
+    rdkit_mol.UpdatePropertyCache(strict=False)
+    has_explicit_H = any(atom.GetAtomicNum() == 1 for atom in rdkit_mol.GetAtoms())
+    charged = []
+    for atom in rdkit_mol.GetAtoms():
+        if atom.GetFormalCharge() != 0:
+            continue
+        valence = atom.GetExplicitValence()
+        if atom.GetAtomicNum() == 7 and valence == 4:
+            atom.SetFormalCharge(1)
+            charged.append(atom.GetProp("AtomName") + "(+1)")
+        elif atom.GetAtomicNum() == 8 and valence == 1 and has_explicit_H:
+            atom.SetFormalCharge(-1)
+            atom.SetNumRadicalElectrons(0)
+            charged.append(atom.GetProp("AtomName") + "(-1)")
+    if charged:
+        print(f"{path_to_mol2}: формальные заряды восстановлены по валентности: {', '.join(charged)}")
+
+    rdkit_mol.SetProp("Mol2Name", mol_name)
+    rdkit_mol.SetProp("Mol2ChargeType", charge_type)
+    return _finalize_read_mol(rdkit_mol, path_to_mol2, sanitize, removeHs, format_coord)
 
 def file_opener(path, **kwargs):
     """
@@ -214,13 +338,11 @@ def file_opener(path, **kwargs):
     if extension in (".smi", ".smiles"):
         smi_str = read_file(path)
         rdkit_mol = smi_to_chem(smi_str, **kwargs)
-    elif extension == ".mol2":
-        rdkit_mol = mol2_to_chem(path, **kwargs)
-    elif extension == ".pdb":
-        # Используем kwargs для переопределения параметров по умолчанию
-        removeHs = kwargs.get('removeHs', False)
-        format_coord = kwargs.get('format_coord', '3D')
-        rdkit_mol = pdb_to_chem(path, removeHs=removeHs, format_coord=format_coord)
+    elif extension in (".mol2", ".pdb"):
+        # Для файлов с геометрией по умолчанию сохраняем координаты из файла
+        kwargs.setdefault('format_coord', '3D')
+        reader = mol2_to_chem if extension == ".mol2" else pdb_to_chem
+        rdkit_mol = reader(path, **kwargs)
     else:
         raise ValueError(f"Неподдерживаемый формат файла: {extension}. "
                        f"Поддерживаемые: .smi, .smiles, .mol2, .pdb")
