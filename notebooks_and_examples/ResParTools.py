@@ -104,7 +104,7 @@ def _package_versions():
 
 
 def _log_environment(notebook=None):
-    module_path = os.path.abspath(__file__)
+    module_path = os.path.realpath(__file__)  # настоящий файл, даже если модуль подключён ссылкой
     return {
         'notebook': notebook or os.environ.get('JPY_SESSION_NAME') or 'не определён',
         'cwd': os.getcwd(),
@@ -437,6 +437,30 @@ def logged(func):
     return wrapper
 
 
+def _snapshot_output_files(params):
+    """
+    Файлы, которые функция могла записать: для каждого строкового параметра-пути - файлы
+    в его папке, чьё имя начинается с имени из пути (функции сохранения сами дописывают
+    расширение и суффиксы вроде _no_H). Возвращает {путь: время изменения}.
+    """
+    snapshot = {}
+    for value in params.values():
+        if not isinstance(value, str) or len(value) >= 1024 or '\n' in value:
+            continue
+        folder, prefix = os.path.split(os.path.abspath(value))
+        if not prefix or not os.path.isdir(folder):
+            continue
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if name.startswith(prefix) and os.path.isfile(path):
+                snapshot[path] = os.path.getmtime(path)
+    return snapshot
+
+
 def _logged_call(func, signature, args, kwargs):
     _LOG['counter'] += 1
     call_id = _LOG['counter']
@@ -478,6 +502,7 @@ def _logged_call(func, signature, args, kwargs):
             original_showwarning(message, category, filename, lineno, file, line)
         warnings.showwarning = showwarning
 
+    files_before = _snapshot_output_files(params)
     started = time.time()
     try:
         result = func(*args, **kwargs)
@@ -496,9 +521,9 @@ def _logged_call(func, signature, args, kwargs):
         _LOG['stack'].pop()
 
     seconds = round(time.time() - started, 3)
-    written = [_describe_file(value) for value in params.values()
-               if isinstance(value, str) and len(value) < 1024 and os.path.isfile(value)
-               and os.path.getmtime(value) >= started - 1]
+    files_after = _snapshot_output_files(params)
+    written = [_describe_file(path) for path, mtime in sorted(files_after.items())
+               if files_before.get(path) != mtime]
     result_description = _describe(result, call_id, f'{label}.result', save_files=top_level)
     _log_write_txt(f'{indent}    результат = {_short(result_description, indent + "    ")}')
     for info in written:
@@ -2077,6 +2102,33 @@ def rdkit_pdb_modification_old(rdkit_mol, resname='MOD', resid=1, segid='A'):
 
     return rdkit_mol  
 
+def find_backbone_match(rdkit_mol, C_terminal=False):
+    """
+    Находит атомы остова аминокислотного остатка по шаблону H-N-CA(H)-C(=O)
+    (тот же, что в rdkit_pdb_modification_old). Водороды должны быть явными атомами.
+
+    Аргументы:
+        rdkit_mol (Chem.Mol) - остаток
+        C_terminal (bool) - C-концевой остаток: у C два кислорода (OC1 - двойная связь, OC2 - одинарная)
+    Возвращает:
+        (CA_idx, backbone) - backbone = [N, CA, C, O] или [N, CA, C, OC1, OC2] при C_terminal
+    Если подходящих остовов нет или их больше одного, вызывает ValueError: выбор был бы угадыванием.
+    """
+    smarts = '[H][N][C]([H])C(=O)[O]' if C_terminal else '[H][N][C]([H])C=O'
+    matches = rdkit_mol.GetSubstructMatches(Chem.MolFromSmarts(smarts), uniquify=False)
+    # совпадения, отличающиеся только выбором H при N и CA, - это один и тот же остов
+    backbones = sorted({(m[1], m[2], m[4], m[5], m[6]) if C_terminal else (m[1], m[2], m[4], m[5])
+                        for m in matches})
+    if not backbones:
+        raise ValueError(f"Остов аминокислоты ({smarts}) не найден: проверьте, что водороды явные "
+                         f"и что C_terminal={C_terminal} соответствует остатку.")
+    if len(backbones) > 1:
+        raise ValueError(f"Найдено {len(backbones)} возможных остовов (индексы N, CA, C, O...): "
+                         f"{backbones}. Остов неоднозначен.")
+    backbone = list(backbones[0])
+    return backbone[1], backbone
+
+
 @logged
 def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
                            force_numeric=False, C_terminal=False):
@@ -2567,28 +2619,33 @@ def save_aa_chem_to_pdb(rdkit_mol, path, resname = 'MOD', resid = 1, segid = 'A'
     AllChem.EmbedMolecule(rdkit_mol)
     AllChem.UFFOptimizeMolecule(rdkit_mol)
     
-    rdkit_mol = rdkit_pdb_modification(rdkit_mol, 
+    if len(resname) > 3:
+        print_red(f"⚠ Имя остатка '{resname}' длиннее 3 символов: RDKit запишет в PDB только "
+                  f"'{resname[:3]}'.")
+    rdkit_mol = rdkit_pdb_modification(rdkit_mol,
                      resname = resname, resid = resid, segid = segid)
-    rw_mol = Chem.RWMol(rdkit_mol)  # делаем редактируемую копию
-    h_indices = [atom.GetIdx() for atom in rw_mol.GetAtoms() if atom.GetAtomicNum() == 1]
-    for idx in sorted(h_indices, reverse=True):  # удалять нужно с конца, иначе индексы съедут
-        rw_mol.RemoveAtom(idx)
-    rdkit_mol_no_H = rw_mol.GetMol()
-    
-    # Запись в файл
-    
+    # RemoveHs с пересчётом валентностей: иначе у ароматических атомов, потерявших явные H,
+    # не определено число водородов, кольцо не кекулизуется и PDB не записывается
+    # (так было при удалении H через RemoveAtom и при RemoveHs(sanitize=False))
+    rdkit_mol_no_H = Chem.RemoveHs(rdkit_mol)
+
+    # Запись в файл: текст PDB формируется до открытия файла, чтобы при ошибке
+    # не оставить на месте старого файла пустой
+
     output_path = f"{path_to_file}/{file_name}.pdb" if path_to_file else f"{file_name}.pdb"
+    pdb_block = Chem.MolToPDBBlock(rdkit_mol)
     with open(output_path, "w") as file:
-        file.write(Chem.MolToPDBBlock(rdkit_mol))
+        file.write(pdb_block)
     print(f'{file_name}.pdb saved to {path_to_file or "current directory"}')
-    
+
     if '_H'in file_name:
         file_name = file_name.replace('_H', '_no_H')
     else:
         file_name = file_name + '_no_H'
     output_path = f"{path_to_file}/{file_name}.pdb" if path_to_file else f"{file_name}.pdb"
+    pdb_block = Chem.MolToPDBBlock(rdkit_mol_no_H)
     with open(output_path, "w") as file:
-        file.write(Chem.MolToPDBBlock(rdkit_mol_no_H))
+        file.write(pdb_block)
     print(f'{file_name}.pdb saved to {path_to_file or "current directory"}')
 
 def smi_to_mol2(smi_input, output_format, file_name=None, addh=True):
