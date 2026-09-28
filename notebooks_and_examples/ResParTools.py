@@ -845,15 +845,28 @@ def mol2_to_chem(path_to_mol2, sanitize=True, removeHs=False, format_coord='2D')
 @logged
 def file_opener(path, **kwargs):
     """
-    Открывает файл с молекулой, автоматически определяя формат.
-    
+    Открывает файл с молекулой, автоматически определяя формат (.smi/.smiles, .mol2, .pdb).
+
     Parameters:
     -----------
-    path : str
-        Путь к файлу
+    path : str или list[str]
+        Путь к файлу или список путей (форматы в списке могут быть разными)
     **kwargs : dict
         Дополнительные параметры для функций загрузки
+    Возвращает:
+        dict {имя файла без расширения: Chem.Mol}, как pdb_to_chem и smi_to_chem
     """
+    if isinstance(path, (list, tuple)):
+        result = {}
+        for one_path in path:
+            opened = file_opener(one_path, **dict(kwargs))
+            duplicates = set(result) & set(opened)
+            if duplicates:
+                print_red(f'⚠ Молекулы с одинаковыми именами {sorted(duplicates)}: '
+                          f'{one_path} заменяет открытую ранее.')
+            result.update(opened)
+        return result
+
     path_obj = Path(path)
     name = path_obj.stem
     extension = path_obj.suffix.lower()
