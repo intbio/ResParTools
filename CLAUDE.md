@@ -51,6 +51,16 @@ The generated `.rtp` files are then collected into the modified force field `not
 - Saved cell outputs still contain the old paths and `param_tool` tracebacks. Those outputs are historical and were not rewritten.
 - `data/`, `datasets/` and `RESP_data/` are deliberately untracked (they hold large calculation outputs).
 
+### Лог для отладки
+Включается в ячейке ноутбука, по умолчанию выключен:
+```python
+pt.start_log()        # новая папка logs/<дата_время>/ в текущей папке модификации
+...                   # ячейки пайплайна
+pt.log_note('заряды Espaloma', charges=charges)   # своя запись из ноутбука
+pt.stop_log()
+```
+В папке запуска: `log.txt` (читаемый журнал: вызовы с параметрами, вложенные вызовы с отступом, сообщения функций, словари сопоставления, записанные файлы, время), `calls.jsonl` (то же в машинном виде) и `files/` (молекулы из вызовов верхнего уровня в PDB, SDF, mol2, SVG с подписями «индекс:имя»). В заголовке: ноутбук, окружение, версии пакетов, ветка, коммит и незакоммиченные файлы, sha256 модуля. Логируются функции с декоратором `@logged`; для функций с `@data_to_dict` он ставится под ним. `logs/` в `.gitignore`.
+
 ## Правила работы (согласованы с автором проекта)
 
 ### Проверка изменений
