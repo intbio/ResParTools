@@ -1710,11 +1710,18 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
                            path_to_ref_mol=None, only_heavy_mapping=True, timeout=3,
                            strict_parent=True):
     """
-    Перенумеровывает атомы остатка в каноническом порядке референсного остатка.
+    Перенумеровывает атомы остатка: основание (атомы родительского остатка) - в порядке
+    шаблона, остальные атомы - обходом молекулярного графа от основания.
 
-    Канонические атомы (совпавшие с референсом) идут первыми в том порядке, в котором
-    они стоят в шаблоне; остальные (новые) атомы - следом, сохраняя исходный порядок.
-    Если индексы уже канонические, возвращается копия молекулы без изменений.
+    1. В остатке ищется родительский остаток (find_ref_residue); его атомы получают номера
+       в том порядке, в котором стоят в шаблоне (amber: N H CA HA CB HB1 HB2 ... C O).
+    2. Новые атомы вставляются сразу за каноническим тяжёлым атомом, к которому пришиты
+       (и за его водородами): для метки на Cys - N H CA HA CB HB1 HB2 SG [метка] C O,
+       для N-метилирования - N H [метил] CA ...
+    3. Внутри вставки - обход в ширину, каждый водород сразу за своим тяжёлым атомом.
+       Порядок ветвей задаётся каноническим рангом RDKit, поэтому результат не зависит
+       от исходного порядка атомов (например, от того, как был записан SMILES).
+    Если индексы уже в таком порядке, возвращается копия молекулы без изменений.
 
     Аргументы:
         mol (Chem.Mol) - остаток (с H или без H)
@@ -1725,7 +1732,8 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
         timeout (int) - таймаут поиска MCS, с
         strict_parent (bool) - см. find_ref_residue
     Возвращает:
-        Chem.Mol - перенумерованная молекула. В свойстве 'RefResidue' - имя шаблона.
+        Chem.Mol - перенумерованная молекула. Свойства: 'RefResidue' - имя шаблона,
+        'OldIndices' - JSON-список: на позиции нового индекса стоит старый индекс атома.
     """
     _, match_data, _ = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
                                      ref_base_name=ref_base_name, residue_type=residue_type,
@@ -1733,9 +1741,56 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
                                      strict_parent=strict_parent)
     ref_name, mapping = next(iter(match_data['mon_pol_matches'].items()))
 
+    # канонический ранг атомов: не зависит от исходной нумерации
+    rank = list(Chem.CanonicalRankAtoms(mol, breakTies=True))
+    placed = set(mapping)
+
+    def by_rank(atoms):
+        return sorted(atoms, key=lambda atom: rank[atom.GetIdx()])
+
+    def new_block(anchor_idx):
+        """Новые атомы, пришитые к каноническому атому anchor_idx: обход в ширину."""
+        block = []
+        anchor = mol.GetAtomWithIdx(anchor_idx)
+        # лишние водороды самого канонического атома (например, у изменённой NZ)
+        for h in by_rank(anchor.GetNeighbors()):
+            if h.GetAtomicNum() == 1 and h.GetIdx() not in placed:
+                placed.add(h.GetIdx())
+                block.append(h.GetIdx())
+        queue = [a.GetIdx() for a in by_rank(anchor.GetNeighbors())
+                 if a.GetAtomicNum() > 1 and a.GetIdx() not in placed]
+        placed.update(queue)
+        while queue:
+            idx = queue.pop(0)
+            block.append(idx)
+            atom = mol.GetAtomWithIdx(idx)
+            for nbr in by_rank(atom.GetNeighbors()):
+                if nbr.GetIdx() in placed:
+                    continue
+                placed.add(nbr.GetIdx())
+                if nbr.GetAtomicNum() == 1:
+                    block.append(nbr.GetIdx())
+                else:
+                    queue.append(nbr.GetIdx())
+        return block
+
+    # канонические атомы в порядке шаблона; вставка новых атомов - перед следующим
+    # каноническим тяжёлым атомом, т.е. после водородов своего якоря
     canonical = sorted(mapping, key=mapping.get)
-    other = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetIdx() not in mapping]
-    new_order = canonical + other
+    new_order, anchor = [], None
+    for idx in canonical:
+        if mol.GetAtomWithIdx(idx).GetAtomicNum() > 1:
+            if anchor is not None:
+                new_order += new_block(anchor)
+            anchor = idx
+        new_order.append(idx)
+    if anchor is not None:
+        new_order += new_block(anchor)
+
+    leftover = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetIdx() not in placed]
+    if leftover:
+        print_red(f'⚠ Атомы {leftover} не связаны с основанием остатка и поставлены в конец.')
+        new_order += leftover
 
     if new_order == list(range(mol.GetNumAtoms())):
         print_green('Индексы атомов уже канонические, перенумерация не требуется.')
@@ -1747,6 +1802,7 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
         new_mol = Chem.RenumberAtoms(mol, new_order)
 
     new_mol.SetProp('RefResidue', ref_name)
+    new_mol.SetProp('OldIndices', json.dumps(new_order))
     return new_mol
 
 
