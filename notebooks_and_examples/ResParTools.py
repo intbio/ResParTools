@@ -613,15 +613,44 @@ def read_file(path):
     with open (path, 'r') as f:
         return f.readline().strip()
 
+def _mol_from_mapped_smiles(str_smi, sanitize=True):
+    """
+    Читает SMILES, записанный с atom_map=True (номер у каждого атома, 1..n).
+    Водороды берутся из файла как есть (открытые валентности остатка в цепи не
+    «залечиваются»), атомы расставляются по номерам, номера снимаются.
+    Если номера есть не у всех атомов, возвращает None - SMILES читается как обычно.
+    """
+    if not re.search(r'\[[^\]]*:\d+\]', str_smi):
+        return None
+    params = Chem.SmilesParserParams()
+    params.removeHs = False
+    params.sanitize = sanitize
+    mol = Chem.MolFromSmiles(str_smi, params)
+    if mol is None:
+        return None
+    maps = [atom.GetAtomMapNum() for atom in mol.GetAtoms()]
+    if sorted(maps) != list(range(1, mol.GetNumAtoms() + 1)):
+        return None
+    order = [0] * mol.GetNumAtoms()
+    for atom in mol.GetAtoms():
+        order[atom.GetAtomMapNum() - 1] = atom.GetIdx()
+    mol = Chem.RenumberAtoms(mol, order)
+    for atom in mol.GetAtoms():
+        atom.SetAtomMapNum(0)
+    return mol
+
+
 @data_to_dict
 @logged
 def smi_to_chem(str_smi: str, sanitize=True, addH=True, make_N_root=False,format_coord='2D'):
     """
     Преобразует SMILES-строку в объект молекулы RDKit и добавляет атомы водорода.
     """
-    rdkit_mol = Chem.MolFromSmiles(str_smi, sanitize) # переводим во внутренний формат chem
-    if addH:
-        rdkit_mol = Chem.AddHs(rdkit_mol) # протонируем
+    rdkit_mol = _mol_from_mapped_smiles(str_smi, sanitize)
+    if rdkit_mol is None:
+        rdkit_mol = Chem.MolFromSmiles(str_smi, sanitize) # переводим во внутренний формат chem
+        if addH:
+            rdkit_mol = Chem.AddHs(rdkit_mol) # протонируем
         
     if format_coord == '2D':
         # Рассчитываем 2D координаты
@@ -888,30 +917,56 @@ def file_opener(path, **kwargs):
     return rdkit_mol
 
 
-def draw_mol_with_atom_index(mol, charge_list = None, size=(600,400), prefer_coord_gfen = False):
+def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gfen = True):
     """
-    Добавляет номера атомов в атрибуты атомов молекулы.
-    size=(600,400)
+    Рисует молекулу с настоящими индексами атомов (включая 0). Рисуется копия:
+    координаты, номера атомов и другие свойства исходной молекулы не меняются.
+
+    Аргументы:
+        mol (Chem.Mol) - молекула
+        charge_list (list) - заряды атомов; если длина совпадает с числом атомов,
+            подпись атома - «индекс: заряд»
+        size (tuple) - размер картинки; по умолчанию подбирается по числу атомов
+        prefer_coord_gfen (bool) - 2D-раскладка CoordGen (аккуратнее для больших молекул
+            и молекул из PDB); False - стандартная раскладка RDKit
+    Возвращает:
+        PIL.Image
     """
-    if charge_list is not None and len(charge_list) == len(mol.GetAtoms()):
-        for i, atom in enumerate(mol.GetAtoms()):
-            # atom.SetAtomMapNum(atom.GetIdx())
-            # atom.SetDoubleProp('PartialCharge', charge_list[i])
-            atom.SetProp('atomNote',str("%4.4f" % charge_list[i]))
-    else:   
-        for i, atom in enumerate(mol.GetAtoms()):
-            atom.SetAtomMapNum(atom.GetIdx())
-    
+    import io as _io
+    from PIL import Image
+
+    draw_mol = Chem.Mol(mol)
+    draw_mol.RemoveAllConformers()
+    with_charges = charge_list is not None and len(charge_list) == draw_mol.GetNumAtoms()
+    for atom in draw_mol.GetAtoms():
+        atom.SetAtomMapNum(0)  # номера из SMILES не должны подменять индексы на картинке
+        idx = atom.GetIdx()
+        atom.SetProp('atomNote', f'{idx}: {charge_list[idx]:.4f}' if with_charges else str(idx))
+
+    # CoordGen вызывается напрямую, без глобальной настройки RDKit (SetPreferCoordGen),
+    # чтобы не менять раскладку других картинок в сессии
     if prefer_coord_gfen:
-        rdDepictor.SetPreferCoordGen(True)
-        if mol is not None:
-            mol.RemoveAllConformers()  # Удалить старые координаты
-            rdDepictor.Compute2DCoords(mol)
+        from rdkit.Chem import rdCoordGen
+        try:
+            rdCoordGen.AddCoords(draw_mol)
+        except Exception:
+            rdDepictor.Compute2DCoords(draw_mol)
     else:
-        if mol is not None:
-            AllChem.Compute2DCoords(mol)
-        
-    return Draw.MolToImage(mol, size)   
+        rdDepictor.Compute2DCoords(draw_mol)
+
+    if size is None:
+        width = int(min(1600, max(600, 110 * draw_mol.GetNumAtoms() ** 0.5)))
+        size = (width, int(width * 0.7))
+    drawer = rdMolDraw2D.MolDraw2DCairo(*size)
+    drawer.drawOptions().annotationFontScale = 0.6
+    try:
+        rdMolDraw2D.PrepareAndDrawMolecule(drawer, draw_mol)
+    except Exception:
+        drawer = rdMolDraw2D.MolDraw2DCairo(*size)
+        drawer.drawOptions().annotationFontScale = 0.6
+        drawer.DrawMolecule(rdMolDraw2D.PrepareMolForDrawing(draw_mol, kekulize=False))
+    drawer.FinishDrawing()
+    return Image.open(_io.BytesIO(drawer.GetDrawingText()))
 
 
 # def modify_atoms_for_charge(mol):
@@ -1389,9 +1444,9 @@ def match_chem_v6(
     substructure_H.UpdatePropertyCache(strict=False)
     Chem.FastFindRings(substructure_H)
 
-    substructure_noH, _ = remove_hydrogens_preserve_indices(substructure_H)
+    substructure_no_H, _ = remove_hydrogens_preserve_indices(substructure_H)
 
-    substructure_dict = {"H": substructure_H, "noH": substructure_noH}
+    substructure_dict = {"H": substructure_H, "noH": substructure_no_H}
 
     # === 8. Словарь соответствий ===
     dict_matches = {"Indexes": full_mapping}
@@ -1406,6 +1461,19 @@ def match_chem_v6(
 
     return substructure_dict, dict_matches
     
+class _MatchData(dict):
+    """
+    Словарь результатов match_mon_to_pol. Старые имена ключей из ранних ноутбуков
+    ('substructure_noH') перенаправляются на новые, не дублируясь в словаре.
+    """
+    _OLD_KEYS = {'substructure_noH': 'substructure_no_H'}
+
+    def __missing__(self, key):
+        if key in self._OLD_KEYS:
+            return self[self._OLD_KEYS[key]]
+        raise KeyError(key)
+
+
 @logged
 def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False,
                      match_residue_number = None, monomer_key = True, timeout = 3,
@@ -1418,7 +1486,7 @@ def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False,
     Возвращает:
         Словарь match_data_dict со следующими подсловарями:
         - substructure - сожердит общие подструктуры мономера и полимера (с H), для каждого из полимеров
-        - substructure_noH - те же подструктуры без H
+        - substructure_no_H - те же подструктуры без H
         - mon_pol_matches - содержит словари соответствия номеров атомов в общей подструктуре
         с номерами атомов в полимере
         Пары, для которых сопоставление не найдено, пропускаются.
@@ -1435,17 +1503,17 @@ def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False,
             return
 
         match_data_dict['substructure'][key] = sub['H']
-        match_data_dict['substructure_noH'][key] = sub['noH']
+        match_data_dict['substructure_no_H'][key] = sub['noH']
         match_data_dict['N_match_atoms'][key] = sub['H'].GetNumAtoms()
         match_data_dict['mon_pol_matches'][key] = dict_mon_pol_matches['Indexes']
         match_data_dict['mon_pol_atom_names'][key] = dict_mon_pol_matches.get('Names')
 
     try:
-        match_data_dict = {'substructure': {},
-                           'substructure_noH': {},
+        match_data_dict = _MatchData({'substructure': {},
+                           'substructure_no_H': {},
                            'mon_pol_matches': {},
                            'N_match_atoms': {},
-                           'mon_pol_atom_names':{}}
+                           'mon_pol_atom_names':{}})
 
         if (len(monomer_dict) >= 1 and len(polymer_dict) == 1) and monomer_key is True:
 
@@ -1933,19 +2001,30 @@ def find_amino_nitrogen(mol):
         return sub_base[1]
     return -1
 
+def _with_atom_map(mol):
+    """Копия молекулы, в которой номер атома в SMILES = индекс + 1 (0 в SMILES - «без номера»)."""
+    mapped = Chem.Mol(mol)
+    for atom in mapped.GetAtoms():
+        atom.SetAtomMapNum(atom.GetIdx() + 1)
+    return mapped
+
+
 @logged
-def save_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, rootedAtAtom=-1):
+def save_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, rootedAtAtom=-1, atom_map=False):
+    """Сохраняет молекулу в SMILES; atom_map - см. save_aa_chem_to_smiles."""
     path_dir = path.rsplit('/', 1)
     if len(path_dir) > 1:
         os.makedirs(path_dir[0], exist_ok=True) 
-    smiles_string = Chem.MolToSmiles(rdkit_mol, canonical = canonical, 
+    smiles_string = Chem.MolToSmiles(_with_atom_map(rdkit_mol) if atom_map else rdkit_mol,
+                                     canonical = canonical, 
                                      allHsExplicit = allHsExplicit, 
                                      rootedAtAtom = rootedAtAtom)
     with open(f"{path}.smiles", "w") as file:
         file.write(smiles_string)
 
 @logged
-def save_aa_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, make_N_root=False):
+def save_aa_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, make_N_root=False,
+                           atom_map=False):
     """
     Сохраняет молекулу в формате SMILES.
     Аргументы:
@@ -1953,6 +2032,8 @@ def save_aa_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, 
         path - строка с путем к файлу и его именем для сохранения
         make_N_root - искать ли аминогруппу и делать ли ее началом молекулы
         canonical, allHsExplicit - параметры для генерации SMILES
+        atom_map - записать у каждого атома его номер (индекс + 1, т.к. 0 в SMILES - «без номера»);
+            smi_to_chem по этим номерам восстановит исходные индексы и водороды без изменений
     """
     if make_N_root:
         rootedAtAtom = find_amino_nitrogen(rdkit_mol)
@@ -1963,12 +2044,13 @@ def save_aa_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, 
     path_to_file, file_name = path_parser(path, ['smi', 'smiles'])
     
     # Генерация строки SMILES
-    smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=canonical, 
+    smiles_string = Chem.MolToSmiles(_with_atom_map(rdkit_mol) if atom_map else rdkit_mol,
+                                     canonical=canonical, 
                                      allHsExplicit=allHsExplicit, 
                                      rootedAtAtom=rootedAtAtom)
 
     # Сохранение в файл
-    output_path = f"{path_to_file}/{file_name}" if path_to_file else {file_name}
+    output_path = f"{path_to_file}/{file_name}" if path_to_file else file_name
     with open(f"{output_path}.smiles", "w") as file:
         file.write(smiles_string)
     print(f'{file_name}.smiles saved to {path_to_file or "current directory"}')
