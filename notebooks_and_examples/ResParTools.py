@@ -1029,7 +1029,8 @@ def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_na
     """
     Проверяет, что модификация действительно построена на заявленном родительском остатке.
 
-    Остов (backbone) и CB должны быть сопоставлены полностью, иначе ValueError.
+    Остов (backbone) и CB должны быть сопоставлены полностью, иначе ValueError
+    (при strict=False - предупреждение).
     Несопоставленные атомы боковой цепи печатаются: обычно это место модификации
     (NZ ацетиллизина, NH2 цитруллина - один атом). Если не сопоставлена вся боковая цепь
     или не меньше 2 атомов и половины цепи, родитель скорее всего указан неверно:
@@ -1055,9 +1056,11 @@ def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_na
     missing_required = [name for idx, name in residue_atoms.items()
                         if name in required and idx not in matched]
     if missing_required:
-        raise ValueError(
-            f'Модификация не содержит остов заявленного остатка {template_label(template_name)}: '
-            f'не сопоставлены {missing_required}. Проверьте ref_base_name.')
+        message = (f'Модификация не содержит остов остатка {template_label(template_name)}: '
+                   f'не сопоставлены {missing_required}. Проверьте ref_base_name.')
+        if strict:
+            raise ValueError(message)
+        print_red(f'⚠ {message}')
 
     side_chain = [name for name in residue_atoms.values() if name not in required]
     missing_side = [name for idx, name in residue_atoms.items()
@@ -1081,7 +1084,7 @@ def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_na
 def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
                      residue_type='protein', match_residue_number=None,
                      only_heavy_mapping=True, main_match_data=True, timeout=3,
-                     strict_parent=True):
+                     strict_parent=True, type_match_dict=None):
     """
     Сопоставляет модифицированный остаток с референсными остатками и выбирает референс.
 
@@ -1091,8 +1094,10 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
             по умолчанию папка из REF_TEMPLATES[residue_type]
         ref_base_name (str) - родительский остаток, из которого собрана модификация:
             'C', 'Cys', 'cysteine', 'цистеин' или имя шаблона 'GCG_H' (см. resolve_ref_template).
-            Обязателен, если path_to_ref_mol - папка: по числу совпавших атомов родителя
-            не определить (у меток цепи и кольца совпадают с Lys/Trp больше, чем с Cys).
+            Нужно указывать всегда: по числу совпавших атомов родителя не определить
+            (у меток цепи и кольца совпадают с Lys/Trp больше, чем с Cys).
+            Старые ноутбуки вызывают функцию без него: тогда шаблон выбирается автоматически,
+            как раньше, а все проверки родителя выдают предупреждения вместо ошибок.
         residue_type (str) - тип остатка из REF_TEMPLATES ('protein', ...)
         match_residue_number (int) - номер референсного остатка в шаблоне;
             по умолчанию REF_TEMPLATES[residue_type]['residue_number']
@@ -1101,6 +1106,7 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
         timeout (int) - таймаут поиска MCS для каждого шаблона, с
         strict_parent (bool) - ошибка, если боковая цепь родителя в основном не сопоставлена
             (см. check_parent_residue); False - только предупреждение
+        type_match_dict - устаревший параметр старых ноутбуков, ни на что не влияет
     Возвращает:
         ref_chem_dict (dict) - {имя шаблона: Chem.Mol}
         match_data_dict (dict) - словарь match_mon_to_pol, ключи - имена шаблонов
@@ -1118,16 +1124,19 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
     if not template_paths:
         raise FileNotFoundError(f'Шаблоны не найдены в {path_to_ref_mol}')
 
+    if type_match_dict is not None:
+        print_red('⚠ Параметр type_match_dict устарел и ни на что не влияет: '
+                  'имена атомов всегда возвращаются в match_data_dict["mon_pol_atom_names"].')
+
     if ref_base_name:
         template_paths = [resolve_ref_template(ref_base_name, template_paths, residue_type)]
     elif len(template_paths) > 1:
-        options = ', '.join(f"'{one}' - {aa_label(one)}" for one in AMINO_ACIDS) \
-            if residue_type == 'protein' else ', '.join(template_paths)
-        raise ValueError(
-            'Укажите родительский остаток модификации: ref_base_name=...\n'
-            'Автоматический выбор по числу совпавших атомов ненадёжен '
-            '(например, метки на цистеине совпадают с Lys/Trp больше, чем с Cys).\n'
-            f'Варианты: {options}')
+        # Старый вызов без родителя: работаем как раньше, но проверки только предупреждают
+        strict_parent = False
+        print_red('⚠ Родительский остаток не указан (ref_base_name): шаблон будет выбран '
+                  'по числу совпавших атомов, как в старых версиях. Результат ненадёжен: '
+                  'для меток на цистеине так выбирается Lys или Trp. '
+                  "Укажите родителя, например ref_base_name='C' или 'K'.")
 
     ref_chem_dict = pdb_to_chem(template_paths)
     match_data_dict = match_mon_to_pol(mod_mol_dict, ref_chem_dict,

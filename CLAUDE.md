@@ -50,3 +50,27 @@ The generated `.rtp` files are then collected into the modified force field `not
 - Relative paths assume that the cwd is the modification folder, which is where Jupyter starts the kernel. Notebooks that `os.chdir` define `ROOT_DIR` (the absolute path of `notebooks_and_examples/`) in their first cell and build every chdir target from it, for example `os.chdir(f'{ROOT_DIR}/{PTM_folder}/Acpype_data')`. The `ROOT_DIR` line is guarded, so re-running the first cell after a chdir does not change it. Never add absolute cluster paths. The old code used `/home/_projects/2022_md_FRET_nv/param_R_CIT`, which is the same directory as `notebooks_and_examples/`.
 - Saved cell outputs still contain the old paths and `param_tool` tracebacks. Those outputs are historical and were not rewritten.
 - `data/`, `datasets/` and `RESP_data/` are deliberately untracked (they hold large calculation outputs).
+
+## Правила работы (согласованы с автором проекта)
+
+### Проверка изменений
+- Любое изменение функции проверять на эталонном наборе: `Lysine_prop`, `Lysine_Malonyl`, `Lysine_Formyl`, `Lysine_3M`, `AF_546_cys` (лизины разной сложности и флуоресцентная метка на цистеине).
+- Проверять не только то, что код не падает, а **содержание результата**: имена и нумерацию атомов, имена остатков, сопоставления подструктур, соответствие номенклатуре GROMACS/amber14sb. Главный риск — код, который «работает», но выдаёт файлы с неверными именами.
+- Перед изменением поведения фиксировать результат «до» и сравнивать с «после» на данных проекта.
+
+### Обратная совместимость
+- Старые ноутбуки — запись того, как работал функционал раньше. Их **не редактировать**.
+- Если новая версия функции несовместима со старым вызовом, функция должна **распознать старый вызов и выдать предупреждение**, а не падать. Не менять поведение по умолчанию у массово используемых функций (например, `pdb_to_chem(format_coord='2D')`).
+
+### Общность
+- Сейчас примеры — модификации лизина и метки на цистеине, но библиотека строится для **любых аминокислот и нуклеиновых кислот** и для работы с датасетами. Не зашивать в код предположения о конкретном остатке или типе полимера; типы остатков описываются данными (`REF_TEMPLATES`, `AMINO_ACIDS`).
+
+### Поведение функций
+- Никаких молчаливых запасных вариантов: если функция подменяет результат (берёт первое совпадение, восстанавливает заряд и т. п.), она сообщает об этом.
+- Родительский остаток модификации указывается явно (`ref_base_name`); автовыбор по числу совпавших атомов ненадёжен. Старые вызовы без него работают по-старому с предупреждением.
+- В сообщениях аминокислоты называть полностью: «цистеин (Cys, C), шаблон GCG_H».
+- В консоли остаются только базовые сообщения, анимации долгих операций и предупреждения (как было в библиотеке). Подробности — в файл лога, который включается командой в ячейке ноутбука и по умолчанию выключен.
+
+### Порядок работы
+- Ошибки разбираются по одной, с обсуждением. Найденное по пути записывается в список, а не исправляется сразу.
+- Коммиты — в рабочую ветку; на GitHub (`intbio`) ничего не отправлять без явного согласия.
