@@ -917,7 +917,8 @@ def file_opener(path, **kwargs):
     return rdkit_mol
 
 
-def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gfen = True):
+def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gfen = True,
+                             highlight_atoms=None, show_names=False):
     """
     Рисует молекулу с настоящими индексами атомов (включая 0). Рисуется копия:
     координаты, номера атомов и другие свойства исходной молекулы не меняются.
@@ -929,6 +930,11 @@ def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gf
         size (tuple) - размер картинки; по умолчанию подбирается по числу атомов
         prefer_coord_gfen (bool) - 2D-раскладка CoordGen (аккуратнее для больших молекул
             и молекул из PDB); False - стандартная раскладка RDKit
+        highlight_atoms (list) - индексы атомов для подсветки (например, атомы родительского
+            остатка: свойство 'ParentAtoms' после renumber_residue_atoms); связи между
+            подсвеченными атомами тоже подсвечиваются
+        show_names (bool) - добавить к подписи имя атома (свойство 'AtomName', например
+            из PDB): «индекс:имя»; у атомов без имени - только индекс
     Возвращает:
         PIL.Image
     """
@@ -941,7 +947,10 @@ def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gf
     for atom in draw_mol.GetAtoms():
         atom.SetAtomMapNum(0)  # номера из SMILES не должны подменять индексы на картинке
         idx = atom.GetIdx()
-        atom.SetProp('atomNote', f'{idx}: {charge_list[idx]:.4f}' if with_charges else str(idx))
+        note = str(idx)
+        if show_names and atom.HasProp('AtomName') and atom.GetProp('AtomName').strip():
+            note = f"{idx}:{atom.GetProp('AtomName').strip()}"
+        atom.SetProp('atomNote', f'{note}: {charge_list[idx]:.4f}' if with_charges else note)
 
     # CoordGen вызывается напрямую, без глобальной настройки RDKit (SetPreferCoordGen),
     # чтобы не менять раскладку других картинок в сессии
@@ -959,12 +968,21 @@ def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gf
         size = (width, int(width * 0.7))
     drawer = rdMolDraw2D.MolDraw2DCairo(*size)
     drawer.drawOptions().annotationFontScale = 0.6
+    hl_atoms = sorted(set(int(i) for i in highlight_atoms)) if highlight_atoms else []
+    bad = [i for i in hl_atoms if not 0 <= i < draw_mol.GetNumAtoms()]
+    if bad:
+        raise ValueError(f'Индексы для подсветки вне молекулы ({draw_mol.GetNumAtoms()} атомов): {bad}')
+    hl_set = set(hl_atoms)
+    hl_bonds = [b.GetIdx() for b in draw_mol.GetBonds()
+                if b.GetBeginAtomIdx() in hl_set and b.GetEndAtomIdx() in hl_set]
     try:
-        rdMolDraw2D.PrepareAndDrawMolecule(drawer, draw_mol)
+        rdMolDraw2D.PrepareAndDrawMolecule(drawer, draw_mol, highlightAtoms=hl_atoms,
+                                           highlightBonds=hl_bonds)
     except Exception:
         drawer = rdMolDraw2D.MolDraw2DCairo(*size)
         drawer.drawOptions().annotationFontScale = 0.6
-        drawer.DrawMolecule(rdMolDraw2D.PrepareMolForDrawing(draw_mol, kekulize=False))
+        drawer.DrawMolecule(rdMolDraw2D.PrepareMolForDrawing(draw_mol, kekulize=False),
+                            highlightAtoms=hl_atoms, highlightBonds=hl_bonds)
     drawer.FinishDrawing()
     return Image.open(_io.BytesIO(drawer.GetDrawingText()))
 
@@ -1787,8 +1805,9 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
        (и за его водородами): для метки на Cys - N H CA HA CB HB1 HB2 SG [метка] C O,
        для N-метилирования - N H [метил] CA ...
     3. Внутри вставки - обход в ширину, каждый водород сразу за своим тяжёлым атомом.
-       Порядок ветвей задаётся каноническим рангом RDKit, поэтому результат не зависит
-       от исходного порядка атомов (например, от того, как был записан SMILES).
+       Порядок ветвей задаётся каноническим рангом RDKit без учёта стереохимии, поэтому
+       результат не зависит от исходного порядка атомов (например, от того, как был записан
+       SMILES) и от R/S стереоцентров.
     Если индексы уже в таком порядке, возвращается копия молекулы без изменений.
 
     Аргументы:
@@ -1801,7 +1820,9 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
         strict_parent (bool) - см. find_ref_residue
     Возвращает:
         Chem.Mol - перенумерованная молекула. Свойства: 'RefResidue' - имя шаблона,
-        'OldIndices' - JSON-список: на позиции нового индекса стоит старый индекс атома.
+        'OldIndices' - JSON-список: на позиции нового индекса стоит старый индекс атома,
+        'ParentAtoms' - JSON-список новых индексов атомов, сопоставленных с шаблоном
+        родительского остатка (для подсветки: draw_mol_with_atom_index(highlight_atoms=...)).
     """
     _, match_data, _ = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
                                      ref_base_name=ref_base_name, residue_type=residue_type,
@@ -1809,8 +1830,9 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
                                      strict_parent=strict_parent)
     ref_name, mapping = next(iter(match_data['mon_pol_matches'].items()))
 
-    # канонический ранг атомов: не зависит от исходной нумерации
-    rank = list(Chem.CanonicalRankAtoms(mol, breakTies=True))
+    # канонический ранг атомов: не зависит от исходной нумерации и от стереохимии
+    # (стереохимия, прочитанная из случайной 3D-структуры, меняла порядок при каждом запуске)
+    rank = list(Chem.CanonicalRankAtoms(mol, breakTies=True, includeChirality=False))
     placed = set(mapping)
 
     def by_rank(atoms):
@@ -1871,6 +1893,8 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
 
     new_mol.SetProp('RefResidue', ref_name)
     new_mol.SetProp('OldIndices', json.dumps(new_order))
+    new_index = {old: new for new, old in enumerate(new_order)}
+    new_mol.SetProp('ParentAtoms', json.dumps(sorted(new_index[idx] for idx in canonical)))
     return new_mol
 
 
@@ -2073,10 +2097,22 @@ def save_chem_to_mol(rdkit_mol, path, rootedAtAtom=-1):
         file.write(Chem.MolToMolBlock(rdkit_mol))
         
 @logged
-def save_chem_to_pdb(rdkit_mol, path, rootedAtAtom=-1):
+def save_chem_to_pdb(rdkit_mol, path, rootedAtAtom=-1, coords='2D', stereo=None, ca_config='L',
+                     stereo_default='R', random_seed=42):
     """
-    Сохраняет молекулу в формате pdb, устанавливая корневой атом, если задан.
+    Сохраняет молекулу в PDB как есть: исходная индексация атомов, без имён атомов и остатка.
+    Переданная молекула не меняется (координаты задаются на копии).
+
+    Аргументы:
+        rdkit_mol (Chem.Mol) - молекула
+        path (str) - путь без расширения, пишется <path>.pdb
+        rootedAtAtom (int) - устаревший параметр: переставить атомы через SMILES с корнем
+            в этом атоме (меняет индексы атомов)
+        coords (str) - '2D' (по умолчанию) или '3D'; stereo, ca_config, stereo_default,
+            random_seed - параметры 3D-структуры и стереохимии, см. set_mol_coords.
+            До 2026-09 функция всегда строила 3D-структуру со случайной стереохимией.
     """
+    rdkit_mol = Chem.Mol(rdkit_mol)
     if rootedAtAtom != -1:
         # Используем SMILES для переупорядочивания атомов
         smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True, 
@@ -2089,10 +2125,11 @@ def save_chem_to_pdb(rdkit_mol, path, rootedAtAtom=-1):
     path_dir = path.rsplit('/', 1)
     if len(path_dir) > 1:
         os.makedirs(path_dir[0], exist_ok=True) 
-    AllChem.EmbedMolecule(rdkit_mol)
-    AllChem.UFFOptimizeMolecule(rdkit_mol)
+    set_mol_coords(rdkit_mol, coords=coords, stereo=stereo, ca_config=ca_config,
+                   stereo_default=stereo_default, random_seed=random_seed)
+    pdb_block = Chem.MolToPDBBlock(rdkit_mol)
     with open(f"{path}.pdb", "w") as file:
-        file.write(Chem.MolToPDBBlock(rdkit_mol))
+        file.write(pdb_block)
         
 @logged
 def generate_atom_names_by_ref_aa(mod_aa_mol, ref_aa_mol, dict_match, output_path):
@@ -2280,286 +2317,399 @@ def find_backbone_match(rdkit_mol, C_terminal=False):
     return backbone[1], backbone
 
 
+GREEK_LEVELS = 'BGDEZHTIKLMN'  # буква уровня боковой цепи: 1 связь от CA - B, 2 - G, 3 - D, ...
+NAMING_METHODS = ('greek', 'index')
+
+
+class _NamingError(ValueError):
+    """Буквенный способ неприменим к остатку (слишком много уровней, длинные имена)."""
+
+
+def _greek_heavy_names(mol, CA_idx, heavy_atoms):
+    """
+    Буквенные имена тяжёлых атомов боковой цепи: элемент + буква уровня (число связей от CA)
+    + номер, если на уровне несколько атомов (1..n в порядке индексов).
+    heavy_atoms - атомы, которые нужно назвать; путь от CA идёт только через них.
+    Возвращает ({индекс: имя}, [индексы, не связанные с CA через heavy_atoms]).
+    """
+    depth = {CA_idx: 0}
+    queue = deque([CA_idx])
+    while queue:
+        idx = queue.popleft()
+        for nbr in sorted(a.GetIdx() for a in mol.GetAtomWithIdx(idx).GetNeighbors()):
+            if nbr in heavy_atoms and nbr not in depth:
+                depth[nbr] = depth[idx] + 1
+                queue.append(nbr)
+    levels = defaultdict(list)
+    for idx, d in depth.items():
+        if idx != CA_idx:
+            levels[d].append(idx)
+    if levels and max(levels) > len(GREEK_LEVELS):
+        raise _NamingError(f'боковая цепь длиннее {len(GREEK_LEVELS)} уровней '
+                           f'(самый дальний атом в {max(levels)} связях от CA)')
+    names = {}
+    for d in sorted(levels):
+        atoms = sorted(levels[d])
+        for k, idx in enumerate(atoms, 1):
+            element = mol.GetAtomWithIdx(idx).GetSymbol().upper()
+            names[idx] = f'{element}{GREEK_LEVELS[d - 1]}' + (str(k) if len(atoms) > 1 else '')
+    unreached = sorted(set(heavy_atoms) - set(depth))
+    return names, unreached
+
+
+def _hydrogen_names(mol, heavy_names, hydrogens):
+    """
+    Имена водородов при названных тяжёлых атомах: H + имя атома без элемента, при нескольких
+    водородах - ещё номер: N -> H (H1 H2 H3), CA -> HA, CB -> HB1 HB2, SG -> HG, CD1 -> HD11 HD12.
+    hydrogens - водороды, которые нужно назвать.
+    """
+    names = {}
+    for idx, name in heavy_names.items():
+        atom = mol.GetAtomWithIdx(idx)
+        suffix = name[len(atom.GetSymbol()):]
+        hs = sorted(h.GetIdx() for h in atom.GetNeighbors()
+                    if h.GetAtomicNum() == 1 and h.GetIdx() in hydrogens)
+        for k, h_idx in enumerate(hs, 1):
+            names[h_idx] = f'H{suffix}' + (str(k) if len(hs) > 1 else '')
+    return names
+
+
+def _pdb_atom_name_field(name, element):
+    """Поле имени атома PDB (колонки 13-16): однобуквенный элемент начинается с 14-й колонки."""
+    if len(name) < 4 and len(element) == 1:
+        return f' {name:<3}'
+    return f'{name:<4}'
+
+
 @logged
 def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
-                           force_numeric=False, C_terminal=False):
+                           force_numeric=False, C_terminal=False, naming='greek', parent_atoms=None):
     """
-    Назначает PDB имена атомов с поуровневым сбором и глобальными индексами на уровне.
+    Назначает атомам остатка PDB-имена и параметры остатка (имя, номер, цепь).
+    Меняет и возвращает переданную молекулу (save_aa_chem_to_pdb передаёт сюда копию).
+    Имена строятся только по графу молекулы и индексам атомов; старые имена не используются,
+    поэтому повторный вызов на той же молекуле даёт те же имена.
+
+    Остов (find_backbone_match): N, CA, C, O (C-концевой остаток: OC1, OC2).
+
+    naming='greek' - буквенный способ (по умолчанию), как в amber14sb.
+        Тяжёлые атомы боковой цепи делятся на уровни по числу связей от CA:
+        1 - B, 2 - G, 3 - D, 4 - E, 5 - Z, 6 - H, 7 - T, 8 - I, 9 - K, 10 - L, 11 - M, 12 - N.
+        Имя = элемент + буква уровня; номер добавляется, только если на уровне несколько
+        тяжёлых атомов (1..n в порядке индексов): CB, SG; CD1, CD2.
+        Водороды: H + имя атома без элемента, при нескольких водородах - ещё номер:
+        при N - H (H1 H2 H3), при CA - HA, HB1 HB2, HG, HD11 HD12.
+        Если уровней больше 12 или имя длиннее 4 символов, буквенный способ неприменим:
+        функция сообщает об этом и называет атомы способом 'index'.
+    naming='index' - атомы родительского остатка (parent_atoms) называются буквенным способом,
+        остальные - элемент + индекс атома: C8, N15, H122 (индекс из шага 3.1 виден в имени).
+        Без parent_atoms родительскими считаются только атомы остова и их водороды.
+
+    Аргументы:
+        rdkit_mol (Chem.Mol) - остаток с явными водородами
+        resname, resid, segid - имя (до 3 символов), номер и цепь остатка
+        force_numeric (bool) - устаревший параметр, равносилен naming='index'
+        C_terminal (bool) - C-концевой остаток (OC1, OC2)
+        naming (str) - 'greek' или 'index'
+        parent_atoms (list) - индексы атомов родительского остатка (свойство 'ParentAtoms'
+            после renumber_residue_atoms); используется при naming='index'
+    Возвращает:
+        Chem.Mol - та же молекула; имена в свойстве атомов 'AtomName' и в PDB residue info.
     """
-    from collections import deque, defaultdict
-    
-    greek_levels = {1: "B", 2: "G", 3: "D", 4: "E", 5: "Z", 6: "H",
-                    7: "T", 8: "I", 9: "K", 10: "L", 11: "M", 12: "N"}
+    if force_numeric:
+        print_red("⚠ force_numeric устарел: используется naming='index'.")
+        naming = 'index'
+    if naming not in NAMING_METHODS:
+        raise ValueError(f"naming='{naming}': допустимые способы {NAMING_METHODS}")
 
-    atom_names = {}
-    used_names = set()
-    visited = set()
-    numeric_mode = force_numeric
-    heavy_counter = 0
-    processed_hydrogens = set()
-    hydrogen_counts = {}
+    old_resnames = {atom.GetPDBResidueInfo().GetResidueName().strip()
+                    for atom in rdkit_mol.GetAtoms() if atom.GetPDBResidueInfo() is not None}
+    old_resnames -= {'', 'UNL'}
+    if old_resnames:
+        print(f"Атомы уже названы (остаток {', '.join(sorted(old_resnames))}): "
+              "имена назначаются заново, старые имена не используются.")
 
-    # ---------------------------------------------------------
-    # 1. Поиск backbone
-    # ---------------------------------------------------------
     CA_idx, backbone = find_backbone_match(rdkit_mol, C_terminal)
+    backbone_names = ["N", "CA", "C", "OC1", "OC2"] if C_terminal else ["N", "CA", "C", "O"]
+    backbone_heavy = dict(zip(backbone, backbone_names))
 
-    backbone_names = ["N", "CA", "C", "O"]
-    if len(backbone) == 5:
-        backbone_names = ["N", "CA", "C", "OC1", "OC2"]
+    heavy_all = {a.GetIdx() for a in rdkit_mol.GetAtoms() if a.GetAtomicNum() > 1}
+    hydrogens_all = {a.GetIdx() for a in rdkit_mol.GetAtoms() if a.GetAtomicNum() == 1}
+    side_all = heavy_all - set(backbone)
 
-    for idx, name in zip(backbone, backbone_names):
-        atom_names[idx] = name
-        used_names.add(name)
-        if rdkit_mol.GetAtomWithIdx(idx).GetSymbol() != "H":
-            heavy_counter += 1
-        visited.add(idx)
+    def greek_names(heavy_side, hydrogens):
+        heavy_names, unreached = _greek_heavy_names(rdkit_mol, CA_idx, heavy_side)
+        heavy_names.update(backbone_heavy)
+        names = dict(heavy_names)
+        names.update(_hydrogen_names(rdkit_mol, heavy_names, hydrogens))
+        long_names = sorted(name for name in names.values() if len(name) > 4)
+        if long_names:
+            raise _NamingError(f'имена длиннее 4 символов: {long_names}')
+        return names, unreached
 
-    N_idx = backbone[0]
-
-    # ---------------------------------------------------------
-    # 2. Назначение HA
-    # ---------------------------------------------------------
-    for nbr in rdkit_mol.GetAtomWithIdx(CA_idx).GetNeighbors():
-        if nbr.GetSymbol() == "H" and nbr.GetIdx() not in atom_names:
-            atom_names[nbr.GetIdx()] = "HA"
-            used_names.add("HA")
-            processed_hydrogens.add(nbr.GetIdx())
-
-    # ---------------------------------------------------------
-    # 3. Протоны аминогруппы
-    # ---------------------------------------------------------
-    amine_counter = 1
-    for nbr in rdkit_mol.GetAtomWithIdx(N_idx).GetNeighbors():
-        if nbr.GetSymbol() == "H" and nbr.GetIdx() not in atom_names:
-            name = f"H{amine_counter}"
-            atom_names[nbr.GetIdx()] = name
-            used_names.add(name)
-            processed_hydrogens.add(nbr.GetIdx())
-            amine_counter += 1
-
-    # ---------------------------------------------------------
-    # 4. Поуровневый сбор атомов
-    # ---------------------------------------------------------
-    current_level = [(CA_idx, 0)]  # (atom_idx, depth)
-    next_level = []
-    
-    # Словарь для сбора атомов по уровням
-    # {depth: [(atom_idx, element, parent_idx)]}
-    level_atoms = defaultdict(list)
-    
-    # BFS для сбора всех атомов по уровням
-    level = 0
-    while current_level:
-        next_level = []
-        for current_idx, depth in current_level:
-            current_atom = rdkit_mol.GetAtomWithIdx(current_idx)
-            
-            for nbr in current_atom.GetNeighbors():
-                nbr_idx = nbr.GetIdx()
-                
-                if nbr_idx in visited or nbr_idx in backbone:
-                    continue
-                    
-                if nbr.GetSymbol() != "H":  # Тяжелый атом
-                    element = nbr.GetSymbol()
-                    
-                    # Сохраняем атом для этого уровня
-                    level_atoms[depth + 1].append((nbr_idx, element, current_idx))
-                    visited.add(nbr_idx)
-                    next_level.append((nbr_idx, depth + 1))
-        
-        current_level = next_level
-    
-    # ---------------------------------------------------------
-    # 5. Назначение имен по уровням
-    # ---------------------------------------------------------
-    for depth in sorted(level_atoms.keys()):
-        atoms_on_level = level_atoms[depth]
-        
-        print(f"\nУровень {depth}: {len(atoms_on_level)} атомов")
-        
-        # Определяем букву для этого уровня
-        if not numeric_mode and depth in greek_levels:
-            level_letter = greek_levels[depth]
-            print(f"  Буква уровня: {level_letter}")
+    method = naming
+    if naming == 'greek':
+        try:
+            names, unreached = greek_names(side_all, hydrogens_all)
+        except _NamingError as e:
+            print_red(f"⚠ Буквенный способ неприменим: {e}. Атомы названы способом 'index'"
+                      + ("." if parent_atoms is not None else
+                         " (parent_atoms не переданы: буквенные имена только у остова)."))
+            method = 'index'
         else:
-            level_letter = None
-            if not numeric_mode:
-                numeric_mode = True
-                print(f"  Переход в numeric режим на глубине {depth}")
-        
-        # Глобальный счетчик для этого уровня
-        level_counter = 1
-        
-        # Назначаем имена ВСЕМ атомам на этом уровне
-        for atom_idx, element, parent_idx in atoms_on_level:
-            name = None
-            
-            # Greek режим
-            if not numeric_mode and level_letter:
-                # Базовая часть имени: элемент + буква уровня
-                base = f"{element}{level_letter}"
-                
-                # ВСЕГДА добавляем глобальный индекс уровня
-                # Даже если в имени уже есть индекс (OZ1, NZ2), мы его заменяем!
-                candidate = f"{base}{level_counter}"
-                
-                if len(candidate) <= 4 and candidate not in used_names:
-                    name = candidate
-                    print(f"    {element}{level_letter} (бывший) -> {name} (индекс {level_counter})")
-            
-            # Numeric режим
-            if name is None:
-                if not numeric_mode:
-                    numeric_mode = True
-                    print(f"    Переход в numeric режим для {element} на глубине {depth}")
-                
-                heavy_counter += 1
-                base_name = f"{element}{heavy_counter}"
-                name = base_name[:4]
-                
-                # Проверка уникальности
-                counter = 1
-                while name in used_names:
-                    name = f"{base_name}_{counter}"[:4]
-                    counter += 1
-                
-                print(f"    {element} -> {name} (numeric)")
-            
-            atom_names[atom_idx] = name
-            used_names.add(name)
-            
-            # Сохраняем информацию о том, какой глобальный индекс получил атом
-            atom_global_index = level_counter
-            level_counter += 1
-            
-            # -------------------------------------------------
-            # Водороды этого атома
-            # -------------------------------------------------
-            atom = rdkit_mol.GetAtomWithIdx(atom_idx)
-            h_neighbors = []
-            
-            for h in atom.GetNeighbors():
-                h_idx = h.GetIdx()
-                if (h.GetSymbol() == "H" and 
-                    h_idx not in processed_hydrogens and 
-                    h_idx not in backbone):
-                    h_neighbors.append(h)
-            
-            if h_neighbors:
-                if name not in hydrogen_counts:
-                    hydrogen_counts[name] = 1
-                
-                # Для водородов используем родительский индекс
-                parent_index = "".join(c for c in name if c.isdigit())
-                
-                if numeric_mode:
-                    for h in h_neighbors:
-                        hname = f"H{parent_index}{hydrogen_counts[name]}"
-                        hydrogen_counts[name] += 1
-                        
-                        if len(hname) > 4:
-                            hname = f"H{parent_index}"[:4]
-                        
-                        # Проверка уникальности
-                        counter = 1
-                        base_hname = hname
-                        while hname in used_names:
-                            hname = f"{base_hname}_{counter}"[:4]
-                            counter += 1
-                        
-                        atom_names[h.GetIdx()] = hname
-                        used_names.add(hname)
-                        processed_hydrogens.add(h.GetIdx())
-                        print(f"      водород {hname}")
-                else:
-                    # В Greek режиме водороды наследуют родительский суффикс
-                    parent_suffix = name[1:]  # все кроме первого символа
-                    
-                    for h in h_neighbors:
-                        if len(h_neighbors) == 1:
-                            hname = f"H{parent_suffix}"
-                        else:
-                            hname = f"H{parent_suffix}{hydrogen_counts[name]}"
-                            hydrogen_counts[name] += 1
-                        
-                        if len(hname) > 4:
-                            hname = f"H{parent_suffix}"[:4]
-                        
-                        # Проверка уникальности
-                        counter = 1
-                        base_hname = hname
-                        while hname in used_names:
-                            hname = f"{base_hname}_{counter}"[:4]
-                            counter += 1
-                        
-                        atom_names[h.GetIdx()] = hname
-                        used_names.add(hname)
-                        processed_hydrogens.add(h.GetIdx())
-                        print(f"      водород {hname}")
+            if unreached:
+                raise ValueError(f'Атомы {unreached} не связаны с CA через боковую цепь: '
+                                 'это не один остаток.')
 
-    # ---------------------------------------------------------
-    # 6. Проверка пропущенных атомов
-    # ---------------------------------------------------------
-    for atom in rdkit_mol.GetAtoms():
-        idx = atom.GetIdx()
-        if idx not in atom_names:
-            print(f"Предупреждение: атом {idx} ({atom.GetSymbol()}) не получил имя")
-            element = atom.GetSymbol()
-            heavy_counter += 1
-            base_name = f"{element}{heavy_counter}"
-            name = base_name[:4]
-            
-            counter = 1
-            while name in used_names:
-                name = f"{base_name}_{counter}"[:4]
-                counter += 1
-            
-            atom_names[idx] = name
-            used_names.add(name)
+    if method == 'index':
+        if parent_atoms is None:
+            parent = set(backbone) | {h.GetIdx() for idx in backbone
+                                      for h in rdkit_mol.GetAtomWithIdx(idx).GetNeighbors()
+                                      if h.GetAtomicNum() == 1}
+        else:
+            parent = {int(i) for i in parent_atoms}
+            bad = sorted(i for i in parent if not 0 <= i < rdkit_mol.GetNumAtoms())
+            if bad:
+                raise ValueError(f'parent_atoms: индексы вне молекулы ({rdkit_mol.GetNumAtoms()} атомов): {bad}')
+            missing = sorted(set(backbone) - parent)
+            if missing:
+                raise ValueError(f'parent_atoms не содержат атомы остова {missing}: '
+                                 'список не от этой молекулы или от другой нумерации.')
+        try:
+            names, unreached = greek_names(side_all & parent, hydrogens_all & parent)
+        except _NamingError as e:
+            raise ValueError(f'Родительский остаток нельзя назвать буквенным способом: {e}')
+        if unreached:
+            raise ValueError(f'Атомы родительского остатка {unreached} не связаны с CA '
+                             'через другие атомы родительского остатка.')
+        for atom in rdkit_mol.GetAtoms():
+            if atom.GetIdx() not in names:
+                names[atom.GetIdx()] = f'{atom.GetSymbol().upper()}{atom.GetIdx()}'
+        long_names = sorted(name for name in names.values() if len(name) > 4)
+        if long_names:
+            raise ValueError(f'Имена длиннее 4 символов (поле PDB): {long_names}')
 
-    # ---------------------------------------------------------
-    # 7. Запись PDB
-    # ---------------------------------------------------------
+    counts = Counter(names.values())
+    duplicates = {name: sorted(i for i, n in names.items() if n == name)
+                  for name, c in counts.items() if c > 1}
+    if duplicates:
+        raise ValueError(f'Повторяющиеся имена атомов (имя: индексы): {duplicates}')
+
     for atom in rdkit_mol.GetAtoms():
-        idx = atom.GetIdx()
-        name = atom_names.get(idx, "UNK")
-        
+        name = names[atom.GetIdx()]
         info = Chem.AtomPDBResidueInfo()
-        info.SetName(name.ljust(4))
+        info.SetName(_pdb_atom_name_field(name, atom.GetSymbol()))
         info.SetResidueName(resname)
         info.SetResidueNumber(resid)
         info.SetChainId(segid)
-        atom.SetProp("AtomName", name.strip())
+        info.SetIsHeteroAtom(False)
+        atom.SetProp("AtomName", name)
         atom.SetMonomerInfo(info)
 
-    check_duplicate_atom_names(rdkit_mol)
+    if method == 'greek':
+        print(f"Имена атомов (буквенный способ): {' '.join(names[i] for i in sorted(names))}")
+    else:
+        rule_named = [i for i in sorted(names) if names[i] != f'{rdkit_mol.GetAtomWithIdx(i).GetSymbol().upper()}{i}']
+        print(f"Имена атомов (способ 'index'): родительский остаток - "
+              f"{' '.join(names[i] for i in rule_named)}; "
+              f"остальные {rdkit_mol.GetNumAtoms() - len(rule_named)} атомов - элемент + индекс.")
+    log_note('имена атомов', method=method, names={i: names[i] for i in sorted(names)})
     return rdkit_mol
 
 
-def check_duplicate_atom_names(mol):
-    """Проверяет уникальность имен атомов"""
-    name_to_indices = {}
-    for atom in mol.GetAtoms():
-        if atom.HasProp("AtomName"):
-            name = atom.GetProp("AtomName")
-            idx = atom.GetIdx()
-            if name not in name_to_indices:
-                name_to_indices[name] = []
-            name_to_indices[name].append(idx)
-    
-    duplicates = {name: indices for name, indices in name_to_indices.items() if len(indices) > 1}
-    
-    if duplicates:
-        print("⚠️ Обнаружены дубликаты имен:")
-        for name, indices in duplicates.items():
-            print(f"  {name}: индексы {indices}")
-        return False
-    
-    print("✅ Все имена атомов уникальны")
-    return True
-    
+COORD_TYPES = ('2D', '3D')
+
+
+def _ca_volume(conf, N_idx, CA_idx, C_idx, CB_idx):
+    """
+    Ориентированный объём у CA: (N-CA)·((C-CA)×(CB-CA)). У L-аминокислот он положительный
+    (проверено по всем шаблонам molecules/aminoacids_template/*_H.pdb), у D - отрицательный.
+    В отличие от R/S, знак не зависит от приоритетов CIP (L-цистеин - это R).
+    """
+    p = [np.array(conf.GetAtomPosition(i)) for i in (N_idx, CA_idx, C_idx, CB_idx)]
+    return float(np.dot(p[0] - p[1], np.cross(p[2] - p[1], p[3] - p[1])))
+
+
+def _embed_3d(mol, random_seed):
+    if AllChem.EmbedMolecule(mol, randomSeed=random_seed, enforceChirality=True) != 0:
+        raise ValueError('Не удалось построить 3D-структуру с заданной стереохимией '
+                         '(EmbedMolecule). Проверьте параметр stereo.')
+
+
+def set_mol_coords(rdkit_mol, coords='2D', stereo=None, ca_config='L', stereo_default='R',
+                   random_seed=42):
+    """
+    Задаёт координаты молекулы: 2D-раскладку или 3D-структуру с заданной стереохимией.
+    Меняет переданную молекулу (функции сохранения передают сюда копию).
+
+    coords='2D' (по умолчанию) - плоская раскладка RDKit. Она однозначна, не зависит от
+        случайных чисел, и по ней RDKit при чтении PDB не придумывает стереохимию.
+        Стереохимия в 2D PDB не сохраняется, параметры stereo и ca_config не используются.
+    coords='3D' - 3D-структура (EmbedMolecule + оптимизация UFF) с заданной стереохимией:
+        1. stereo={индекс: 'R' или 'S'} - явно заданные стереоцентры (по правилам CIP);
+        2. CA аминокислоты (если в молекуле найден остов N-CA-C=O с явными H) -
+           ca_config: 'L' (по умолчанию, как в белках), 'D' или None (как остальные центры).
+           L/D задаётся по геометрии, а не через R/S: L-цистеин по CIP - R, остальные L - S;
+        3. остальные стереоцентры: если конфигурация уже задана в молекуле (например, @ в
+           SMILES), она сохраняется; иначе ставится stereo_default ('R' или 'S') и функция
+           сообщает, какие центры так заданы;
+        4. random_seed фиксирует построение: одна и та же молекула даёт одни и те же координаты.
+        После оптимизации конфигурации проверяются по 3D-координатам.
+
+    Аргументы:
+        rdkit_mol (Chem.Mol) - молекула (для 3D - с явными водородами)
+        coords (str) - '2D' или '3D'
+        stereo (dict) - {индекс атома: 'R'/'S'}
+        ca_config (str) - 'L', 'D' или None
+        stereo_default (str) - 'R' или 'S' для незаданных стереоцентров
+        random_seed (int) - затравка случайных чисел для 3D
+    Возвращает:
+        Chem.Mol - та же молекула с одним конформером.
+    """
+    if coords not in COORD_TYPES:
+        raise ValueError(f"coords='{coords}': допустимые значения {COORD_TYPES}")
+    if coords == '2D':
+        if stereo:
+            print_red("⚠ stereo задаётся только при coords='3D': в 2D стереохимия не сохраняется.")
+        rdkit_mol.RemoveAllConformers()
+        rdDepictor.Compute2DCoords(rdkit_mol)
+        return rdkit_mol
+
+    from rdkit.Chem import rdCIPLabeler
+    stereo = {int(k): str(v).upper() for k, v in (stereo or {}).items()}
+    if stereo_default not in ('R', 'S'):
+        raise ValueError(f"stereo_default='{stereo_default}': допустимо 'R' или 'S'")
+    if ca_config not in ('L', 'D', None):
+        raise ValueError(f"ca_config='{ca_config}': допустимо 'L', 'D' или None")
+    if any(v not in ('R', 'S') for v in stereo.values()):
+        raise ValueError(f"stereo: конфигурации задаются как 'R' или 'S': {stereo}")
+
+    centers = [idx for idx, _ in Chem.FindMolChiralCenters(rdkit_mol, includeUnassigned=True,
+                                                           useLegacyImplementation=False)]
+    bad = sorted(set(stereo) - set(centers))
+    if bad:
+        raise ValueError(f'stereo: атомы {bad} не стереоцентры (стереоцентры: {centers})')
+
+    # CA и его соседи по остову
+    ca = None
+    if ca_config is not None:
+        try:
+            CA_idx, backbone = find_backbone_match(rdkit_mol)
+        except ValueError as e:
+            print(f'Остов аминокислоты не найден ({e}); CA задаётся как остальные стереоцентры.')
+        else:
+            N_idx, C_idx = backbone[0], backbone[2]
+            cb = [a.GetIdx() for a in rdkit_mol.GetAtomWithIdx(CA_idx).GetNeighbors()
+                  if a.GetAtomicNum() > 1 and a.GetIdx() not in (N_idx, C_idx)]
+            if CA_idx in stereo:
+                print(f'CA ({CA_idx}) задан в stereo: {stereo[CA_idx]}, ca_config не используется.')
+            elif len(cb) == 1 and CA_idx in centers:
+                ca = (N_idx, CA_idx, C_idx, cb[0])
+    ca_idx = ca[1] if ca else None
+
+    # R/S: явно заданные, уже заданные в молекуле, по умолчанию
+    target = dict(stereo)
+    by_default = []
+    for idx in centers:
+        if idx in target or idx == ca_idx:
+            continue
+        tag = rdkit_mol.GetAtomWithIdx(idx).GetChiralTag()
+        if tag in (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW):
+            continue
+        target[idx] = stereo_default
+        by_default.append(idx)
+    for idx in target:
+        rdkit_mol.GetAtomWithIdx(idx).SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+
+    # CA: тег подбирается по ориентации в 3D
+    if ca is not None:
+        ca_atom = rdkit_mol.GetAtomWithIdx(ca_idx)
+        was_set = ca_atom.GetChiralTag() in (Chem.ChiralType.CHI_TETRAHEDRAL_CW,
+                                             Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+        if not was_set:
+            ca_atom.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+        probe = Chem.Mol(rdkit_mol)
+        _embed_3d(probe, random_seed)
+        if (_ca_volume(probe.GetConformer(), *ca) > 0) != (ca_config == 'L'):
+            ca_atom.InvertChirality()
+            if was_set:
+                print_red(f'⚠ CA ({ca_idx}) в исходной молекуле не {ca_config}; '
+                          f'задаётся {ca_config} (ca_config).')
+
+    # подгонка R/S: метка CIP центра может зависеть от соседних центров, поэтому несколько проходов
+    for _ in range(3):
+        rdCIPLabeler.AssignCIPLabels(rdkit_mol)
+        wrong = [idx for idx, cip in target.items()
+                 if rdkit_mol.GetAtomWithIdx(idx).HasProp('_CIPCode')
+                 and rdkit_mol.GetAtomWithIdx(idx).GetProp('_CIPCode') != cip]
+        if not wrong:
+            break
+        for idx in wrong:
+            rdkit_mol.GetAtomWithIdx(idx).InvertChirality()
+    no_label = [idx for idx in target if not rdkit_mol.GetAtomWithIdx(idx).HasProp('_CIPCode')]
+    if no_label:
+        print_red(f'⚠ Для центров {no_label} метка R/S не определяется (CIP): '
+                  'их конфигурация выбрана произвольно, но воспроизводимо.')
+
+    rdkit_mol.RemoveAllConformers()
+    _embed_3d(rdkit_mol, random_seed)
+    AllChem.UFFOptimizeMolecule(rdkit_mol)
+
+    # проверка по 3D-координатам
+    check = Chem.Mol(rdkit_mol)
+    Chem.AssignStereochemistryFrom3D(check)
+    rdCIPLabeler.AssignCIPLabels(check)
+
+    def cip(idx):
+        atom = check.GetAtomWithIdx(idx)
+        return atom.GetProp('_CIPCode') if atom.HasProp('_CIPCode') else '?'
+
+    got = {idx: cip(idx) for idx in target}
+    mismatch = {idx: (target[idx], got[idx]) for idx in target
+                if idx not in no_label and got[idx] != target[idx]}
+    if ca is not None and (_ca_volume(rdkit_mol.GetConformer(), *ca) > 0) != (ca_config == 'L'):
+        mismatch[ca_idx] = (ca_config, 'L' if ca_config == 'D' else 'D')
+    if mismatch:
+        raise ValueError(f'3D-структура не совпала с заданной стереохимией (атом: (задано, получено)): {mismatch}')
+
+    parts = []
+    if ca is not None:
+        parts.append(f'CA ({ca_idx}) - {ca_config} ({cip(ca_idx)} по CIP)')
+    if stereo:
+        parts.append('заданы: ' + ', '.join(f'{i} - {c}' for i, c in sorted(stereo.items())))
+    kept = sorted(set(centers) - set(target) - {ca_idx})
+    if kept:
+        parts.append('из молекулы: ' + ', '.join(f'{i} - {cip(i)}' for i in kept))
+    if by_default:
+        parts.append(f'по умолчанию {stereo_default}: {by_default}')
+    print('3D-структура, стереоцентры: ' + ('; '.join(parts) if parts else 'нет'))
+    return rdkit_mol
+
+
+# Дубликат: ниже в модуле есть второе определение check_duplicate_atom_names, оно и действует
+# (в Python работает последнее определение). Этот вариант закомментирован, чтобы не путаться.
+# def check_duplicate_atom_names(mol):
+#     """Проверяет уникальность имен атомов"""
+#     name_to_indices = {}
+#     for atom in mol.GetAtoms():
+#         if atom.HasProp("AtomName"):
+#             name = atom.GetProp("AtomName")
+#             idx = atom.GetIdx()
+#             if name not in name_to_indices:
+#                 name_to_indices[name] = []
+#             name_to_indices[name].append(idx)
+#
+#     duplicates = {name: indices for name, indices in name_to_indices.items() if len(indices) > 1}
+#
+#     if duplicates:
+#         print("⚠️ Обнаружены дубликаты имен:")
+#         for name, indices in duplicates.items():
+#             print(f"  {name}: индексы {indices}")
+#         return False
+#
+#     print("✅ Все имена атомов уникальны")
+#     return True
+
 def remove_extra_H(top, extra_pattern_H = 'HW'):
     atom_to_remove = [atom for atom in top.atoms if extra_pattern_H in atom.name]
     print(f"Найденные атомы для удаления: {atom_to_remove}")
@@ -2740,15 +2890,30 @@ def make_r2b(path_to_r2b = '', reference_aa = '', add_aa_name = '', param_folder
     print(f'Save in  {save_path}')        
         
 @logged
-def save_aa_chem_to_pdb(rdkit_mol, path, resname = 'MOD', resid = 1, segid = 'A', make_N_root=False, atom_names_list=None):
+def save_aa_chem_to_pdb(rdkit_mol, path, resname = 'MOD', resid = 1, segid = 'A', make_N_root=False,
+                        atom_names_list=None, naming='greek', parent_atoms=None, coords='2D',
+                        stereo=None, ca_config='L', stereo_default='R', random_seed=42):
     """
-    Сохраняет молекулу в формате PDB, устанавливая корневой атом, если задан.
+    Сохраняет остаток в PDB: имена атомов (rdkit_pdb_modification), имя, номер и цепь остатка.
+    Пишутся два файла: <path>.pdb и <path>_no_H.pdb. Переданная молекула не меняется
+    (всё делается на копии), поэтому повторный запуск ячейки даёт тот же результат.
+
     Аргументы:
-        rdkit_mol - RDKit.Chem молекула
+        rdkit_mol - RDKit.Chem молекула с явными водородами
         path - строка с путем к файлу и его именем для сохранения
-        make_N_root - искать ли аминогруппу и делать ли ее началом молекулы
+        resname, resid, segid - имя остатка (до 3 символов), номер, цепь
+        make_N_root - устаревший параметр: переставить атомы через SMILES с корнем в аминогруппе
+        atom_names_list - не используется, оставлен для совместимости вызовов
+        naming - способ именования атомов: 'greek' (по умолчанию) или 'index'
+        parent_atoms - индексы атомов родительского остатка для naming='index'
+        coords - '2D' (по умолчанию) или '3D'; stereo, ca_config, stereo_default,
+            random_seed - параметры 3D-структуры и стереохимии, см. set_mol_coords.
+            До 2026-09 функция всегда строила 3D-структуру со случайной стереохимией.
     """
-    
+    rdkit_mol = Chem.Mol(rdkit_mol)
+    if make_N_root and parent_atoms is not None:
+        raise ValueError('make_N_root переставляет атомы, и индексы parent_atoms перестают им '
+                         'соответствовать: используйте что-то одно.')
     if make_N_root:
         root_idx = find_amino_nitrogen(rdkit_mol)
         if root_idx != -1:
@@ -2766,15 +2931,14 @@ def save_aa_chem_to_pdb(rdkit_mol, path, resname = 'MOD', resid = 1, segid = 'A'
     # Получение пути и имени файла
     path_to_file, file_name = path_parser(path, ['pdb'])
     
-    # Генерация 3D-конформации и оптимизация молекулы
-    AllChem.EmbedMolecule(rdkit_mol)
-    AllChem.UFFOptimizeMolecule(rdkit_mol)
-    
+    set_mol_coords(rdkit_mol, coords=coords, stereo=stereo, ca_config=ca_config,
+                   stereo_default=stereo_default, random_seed=random_seed)
+
     if len(resname) > 3:
         print_red(f"⚠ Имя остатка '{resname}' длиннее 3 символов: RDKit запишет в PDB только "
                   f"'{resname[:3]}'.")
-    rdkit_mol = rdkit_pdb_modification(rdkit_mol,
-                     resname = resname, resid = resid, segid = segid)
+    rdkit_mol = rdkit_pdb_modification(rdkit_mol, resname=resname, resid=resid, segid=segid,
+                                       naming=naming, parent_atoms=parent_atoms)
     # RemoveHs с пересчётом валентностей: иначе у ароматических атомов, потерявших явные H,
     # не определено число водородов, кольцо не кекулизуется и PDB не записывается
     # (так было при удалении H через RemoveAtom и при RemoveHs(sanitize=False))
@@ -2901,11 +3065,6 @@ def show_list_of_conf(directory, show_full = False):
         print(conf_text)
 
         
-from collections import Counter
-
-from rdkit import Chem
-from rdkit.Chem import AllChem
-
 def check_PDB_residue_info(atom):
     """
     Проверяет, что параметры остатка были правильно установлены для атома.
@@ -2930,8 +3089,6 @@ def check_duplicate_atom_names(mol):
     atom_names = [atom.GetProp('AtomName') for atom in mol.GetAtoms()]
 
     # Подсчитываем частоту появления каждого имени
-    name_count = Counter(atom_names)
-    print(name_count)
     # Формируем словарь с именами атомов и их индексами в молекуле
     atom_indices = {}
     for i, atom in enumerate(mol.GetAtoms()):
@@ -2956,7 +3113,7 @@ def check_duplicate_atom_names(mol):
 def set_PDB_residue_info(atom, atom_name, resname='MOD', resid=1, segid='A'):
     
     info = Chem.AtomPDBResidueInfo()
-    info.SetName(atom_name.ljust(4))        # Имя должно быть ровно 4 символа
+    info.SetName(_pdb_atom_name_field(atom_name, atom.GetSymbol()))  # колонки 13-16 PDB
     info.SetResidueName(resname)            # Устанавливаем имя остатка
     info.SetResidueNumber(resid)            # Устанавливаем номер остатка
     info.SetChainId(segid)                  # Устанавливаем ID сегмента
@@ -2967,7 +3124,10 @@ def set_PDB_residue_info(atom, atom_name, resname='MOD', resid=1, segid='A'):
 @logged
 def modifie_residue_info(modified_mol,  index_map, resname='MOD', resid=1, segid='A'):
     """
-    Назначает новые имена атомам в молекуле согласно индексному отображению.
+    Переименовывает атомы по словарю {старое имя: новое имя} и задаёт всем атомам параметры
+    остатка (имя, номер, цепь). Если имя атома, не упомянутого в словаре, совпадает с одним
+    из новых имён, атом получает следующее свободное имя (increment_name).
+    Меняет и возвращает переданную молекулу.
     """
     # ref_mol_atom_dict = {atom.GetIdx(): atom.GetProp('AtomName') for atom in reference_mol.GetAtoms() if atom.GetPDBResidueInfo().GetResidueNumber()==2 }
     
@@ -2986,6 +3146,8 @@ def modifie_residue_info(modified_mol,  index_map, resname='MOD', resid=1, segid
                 while new_name in ref_names:
                     new_name = increment_name(new_name)
                 print(f'Имя атома {atom_name} с индексом {atom.GetIdx()} заменено на имя {new_name} ')
+                atom_name = new_name
+                atom.SetProp("AtomName", atom_name)
             set_PDB_residue_info(atom, atom_name, resname, resid, segid)
     return modified_mol
 
@@ -3043,8 +3205,10 @@ def add_names_from_residue(modified_chem, index_map, resname='MOD', resid=1, seg
     # ref_mol = list(reference_chem.values())[0] # костыль работы с словарем молекулы
    
 
-    key_map = next(iter(match_data_dict['mon_pol_matches'].keys()))
-    index_map = match_data_dict['mon_pol_matches'][key_map]
+    # старые ноутбуки передают сюда целиком словарь данных сопоставления (match_data_dict)
+    if isinstance(index_map, dict) and 'mon_pol_matches' in index_map:
+        key_map = next(iter(index_map['mon_pol_matches'].keys()))
+        index_map = index_map['mon_pol_matches'][key_map]
     # Присваиваем новые имена атомам в модифицированной молекуле
     # Перезадаем параметры модифицированного остатка  
     mod_residue = modifie_residue_info(mod_mol, index_map, resname, resid, segid)
