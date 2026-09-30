@@ -19,6 +19,7 @@ from rdkit.Chem.Draw import IPythonConsole
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw, rdFMCS
 from rdkit.Chem import rdDepictor
+from rdkit.Geometry import Point3D
 from typing import Callable
 
 import datetime
@@ -917,40 +918,65 @@ def file_opener(path, **kwargs):
     return rdkit_mol
 
 
-def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gfen = True,
-                             highlight_atoms=None, show_names=False):
-    """
-    Рисует молекулу с настоящими индексами атомов (включая 0). Рисуется копия:
-    координаты, номера атомов и другие свойства исходной молекулы не меняются.
+_DRAW_BACKBONE = Chem.MolFromSmarts('[NX3][CX4]C=O')  # N-CA-C=O по тяжёлым атомам
 
-    Аргументы:
-        mol (Chem.Mol) - молекула
-        charge_list (list) - заряды атомов; если длина совпадает с числом атомов,
-            подпись атома - «индекс: заряд»
-        size (tuple) - размер картинки; по умолчанию подбирается по числу атомов
-        prefer_coord_gfen (bool) - 2D-раскладка CoordGen (аккуратнее для больших молекул
-            и молекул из PDB); False - стандартная раскладка RDKit
-        highlight_atoms (list) - индексы атомов для подсветки (например, атомы родительского
-            остатка: свойство 'ParentAtoms' после renumber_residue_atoms); связи между
-            подсвеченными атомами тоже подсвечиваются
-        show_names (bool) - добавить к подписи имя атома (свойство 'AtomName', например
-            из PDB): «индекс:имя»; у атомов без имени - только индекс
-    Возвращает:
-        PIL.Image
-    """
-    import io as _io
-    from PIL import Image
 
+def _orient_backbone_down(mol, prefer_atoms=None):
+    """
+    Поворачивает 2D-координаты молекулы (только для рисования): остов N-CA-C внизу, остальная
+    молекула над ним, N слева, C справа - этапы и разные остатки на картинках ориентированы
+    одинаково. Остов ищется по тяжёлым атомам (N-CA-C=O); если остовов несколько (тример),
+    берётся тот, что целиком в prefer_atoms (подсвеченные атомы). Если остов не найден или
+    выбор неоднозначен, координаты не меняются. Возвращает True, если поворот сделан.
+    """
+    matches = mol.GetSubstructMatches(_DRAW_BACKBONE)
+    if prefer_atoms and len(matches) > 1:
+        inside = [m for m in matches if set(m[:3]) <= set(prefer_atoms)]
+        matches = inside or matches
+    if len(matches) != 1 or mol.GetNumConformers() == 0:
+        return False
+    n_idx, ca_idx, c_idx = matches[0][:3]
+    conf = mol.GetConformer()
+    pos = np.array(conf.GetPositions())[:, :2]
+    heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
+    direction = pos[heavy].mean(axis=0) - pos[[n_idx, ca_idx, c_idx]].mean(axis=0)
+    if np.linalg.norm(direction) < 1e-6:
+        return False
+    # поворот: направление «остов -> центр молекулы» смотрит вверх (+y на картинке RDKit)
+    angle = np.pi / 2 - np.arctan2(direction[1], direction[0])
+    rot = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    new = (pos - pos[ca_idx]) @ rot.T
+    if new[n_idx, 0] > new[c_idx, 0]:  # N слева, C справа
+        new[:, 0] *= -1
+    for idx, (x, y) in enumerate(new):
+        conf.SetAtomPosition(idx, Point3D(float(x), float(y), 0.0))
+    return True
+
+
+def _prepare_draw_mol(mol, charge_list=None, prefer_coord_gfen=True, highlight_atoms=None,
+                      show_names=False, show_index=True, orient_backbone=True):
+    """
+    Копия молекулы для рисования: подписи атомов «индекс:имя: заряд» (atomNote), 2D-раскладка,
+    проверенные индексы подсветки. Общая часть draw_molecule и draw_mol_grid.
+    Возвращает (молекула, атомы для подсветки, связи для подсветки).
+    """
     draw_mol = Chem.Mol(mol)
     draw_mol.RemoveAllConformers()
     with_charges = charge_list is not None and len(charge_list) == draw_mol.GetNumAtoms()
+    if charge_list is not None and not with_charges:
+        print_red(f'⚠ Зарядов {len(charge_list)}, атомов {draw_mol.GetNumAtoms()}: '
+                  'молекула нарисована без зарядов.')
     for atom in draw_mol.GetAtoms():
         atom.SetAtomMapNum(0)  # номера из SMILES не должны подменять индексы на картинке
         idx = atom.GetIdx()
-        note = str(idx)
+        parts = [str(idx)] if show_index else []
         if show_names and atom.HasProp('AtomName') and atom.GetProp('AtomName').strip():
-            note = f"{idx}:{atom.GetProp('AtomName').strip()}"
-        atom.SetProp('atomNote', f'{note}: {charge_list[idx]:.4f}' if with_charges else note)
+            parts.append(atom.GetProp('AtomName').strip())
+        note = ':'.join(parts)
+        if with_charges:
+            note = f'{note}: {charge_list[idx]:.4f}' if note else f'{charge_list[idx]:.4f}'
+        if note:
+            atom.SetProp('atomNote', note)
 
     # CoordGen вызывается напрямую, без глобальной настройки RDKit (SetPreferCoordGen),
     # чтобы не менять раскладку других картинок в сессии
@@ -963,11 +989,6 @@ def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gf
     else:
         rdDepictor.Compute2DCoords(draw_mol)
 
-    if size is None:
-        width = int(min(1600, max(600, 110 * draw_mol.GetNumAtoms() ** 0.5)))
-        size = (width, int(width * 0.7))
-    drawer = rdMolDraw2D.MolDraw2DCairo(*size)
-    drawer.drawOptions().annotationFontScale = 0.6
     hl_atoms = sorted(set(int(i) for i in highlight_atoms)) if highlight_atoms else []
     bad = [i for i in hl_atoms if not 0 <= i < draw_mol.GetNumAtoms()]
     if bad:
@@ -975,6 +996,53 @@ def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gf
     hl_set = set(hl_atoms)
     hl_bonds = [b.GetIdx() for b in draw_mol.GetBonds()
                 if b.GetBeginAtomIdx() in hl_set and b.GetEndAtomIdx() in hl_set]
+    if orient_backbone:
+        _orient_backbone_down(draw_mol, hl_set)
+    return draw_mol, hl_atoms, hl_bonds
+
+
+def _auto_draw_size(n_atoms):
+    width = int(min(1600, max(600, 110 * n_atoms ** 0.5)))
+    return (width, int(width * 0.7))
+
+
+def draw_molecule(mol, charge_list = None, size=None, prefer_coord_gfen = True,
+                  highlight_atoms=None, show_names=False, show_index=True, orient_backbone=True):
+    """
+    Основная отрисовка молекулы. Рисуется копия: координаты, номера атомов и другие
+    свойства исходной молекулы не меняются. Старое имя функции - draw_mol_with_atom_index
+    (работает так же). Несколько молекул рядом - draw_mol_grid.
+
+    Подпись атома собирается из включённых частей: «индекс:имя: заряд».
+
+    Аргументы:
+        mol (Chem.Mol) - молекула
+        charge_list (list) - заряды атомов; добавляются к подписи, если длина совпадает
+            с числом атомов (иначе функция предупреждает и рисует без зарядов)
+        size (tuple) - размер картинки; по умолчанию подбирается по числу атомов
+        prefer_coord_gfen (bool) - 2D-раскладка CoordGen (аккуратнее для больших молекул
+            и молекул из PDB); False - стандартная раскладка RDKit
+        highlight_atoms (list) - индексы атомов для подсветки (например, атомы родительского
+            остатка: свойство 'ParentAtoms' после renumber_residue_atoms); связи между
+            подсвеченными атомами тоже подсвечиваются
+        show_names (bool) - добавить к подписи имя атома (свойство 'AtomName', например
+            из PDB); у атомов без имени имя не пишется
+        show_index (bool) - показывать настоящие индексы атомов (включая 0), по умолчанию True
+        orient_backbone (bool) - повернуть картинку: остов аминокислоты (N-CA-C) внизу,
+            N слева, C справа (см. _orient_backbone_down); молекулы без остова не поворачиваются
+    Возвращает:
+        PIL.Image
+    """
+    import io as _io
+    from PIL import Image
+
+    draw_mol, hl_atoms, hl_bonds = _prepare_draw_mol(mol, charge_list, prefer_coord_gfen,
+                                                     highlight_atoms, show_names, show_index,
+                                                     orient_backbone)
+    if size is None:
+        size = _auto_draw_size(draw_mol.GetNumAtoms())
+    drawer = rdMolDraw2D.MolDraw2DCairo(*size)
+    drawer.drawOptions().annotationFontScale = 0.6
     try:
         rdMolDraw2D.PrepareAndDrawMolecule(drawer, draw_mol, highlightAtoms=hl_atoms,
                                            highlightBonds=hl_bonds)
@@ -985,6 +1053,116 @@ def draw_mol_with_atom_index(mol, charge_list = None, size=None, prefer_coord_gf
                             highlightAtoms=hl_atoms, highlightBonds=hl_bonds)
     drawer.FinishDrawing()
     return Image.open(_io.BytesIO(drawer.GetDrawingText()))
+
+
+# старое имя: во всех ноутбуках до 2026-09 вызывается draw_mol_with_atom_index
+draw_mol_with_atom_index = draw_molecule
+
+
+def draw_mol_grid(mols, legends=None, highlight_atoms=None, show_index=True, show_names=False,
+                  charge_lists=None, mols_per_row=3, sub_img_size=None, prefer_coord_gfen=True,
+                  orient_backbone=True):
+    """
+    Несколько молекул на одной картинке (сетка), с теми же подписями и подсветкой, что
+    у draw_molecule. Например, этапы подготовки остатка рядом: исходная молекула,
+    перенумерованная, с именами атомов. Молекулы не меняются.
+
+    Параметры highlight_atoms, show_index, show_names, charge_lists задаются одним значением
+    для всех молекул или списком - по значению на каждую молекулу.
+
+    Аргументы:
+        mols (list или dict) - молекулы; dict {подпись: молекула} задаёт и подписи
+        legends (list) - подписи под молекулами
+        highlight_atoms (list) - список индексов для каждой молекулы (или None)
+        show_index, show_names (bool или list) - см. draw_molecule
+        charge_lists (list) - заряды для каждой молекулы (или None)
+        mols_per_row (int) - молекул в строке
+        sub_img_size (tuple) - размер одной ячейки; по умолчанию - по самой большой молекуле
+        prefer_coord_gfen, orient_backbone (bool) - см. draw_molecule; при orient_backbone
+            все молекулы с остовом ориентированы одинаково: остов внизу, N слева
+    Возвращает:
+        PIL.Image
+    """
+    import io as _io
+    from PIL import Image
+
+    if isinstance(mols, dict):
+        if legends is None:
+            legends = list(mols)
+        mols = list(mols.values())
+    mols = list(mols)
+    n = len(mols)
+    if n == 0:
+        raise ValueError('draw_mol_grid: список молекул пуст')
+
+    def per_mol(value, name, is_list_value=False):
+        # одно значение на все молекулы или список по молекулам
+        if value is None:
+            return [None] * n
+        if is_list_value:
+            # список списков - по молекулам; иначе один список на все
+            per = isinstance(value, (list, tuple)) and len(value) == n and all(
+                v is None or isinstance(v, (list, tuple, np.ndarray)) for v in value)
+            return list(value) if per else [value] * n
+        if isinstance(value, (list, tuple)):
+            if len(value) != n:
+                raise ValueError(f'{name}: {len(value)} значений на {n} молекул')
+            return list(value)
+        return [value] * n
+
+    highlights = per_mol(highlight_atoms, 'highlight_atoms', is_list_value=True)
+    charges = per_mol(charge_lists, 'charge_lists', is_list_value=True)
+    indices = per_mol(show_index, 'show_index')
+    names = per_mol(show_names, 'show_names')
+    if legends is not None and len(legends) != n:
+        raise ValueError(f'legends: {len(legends)} подписей на {n} молекул')
+
+    prepared = [_prepare_draw_mol(m, charges[i], prefer_coord_gfen, highlights[i],
+                                  names[i], indices[i], orient_backbone) for i, m in enumerate(mols)]
+    if sub_img_size is None:
+        sub_img_size = _auto_draw_size(max(m.GetNumAtoms() for m in mols))
+    n_col = max(1, min(mols_per_row, n))
+    n_row = (n + n_col - 1) // n_col
+    w, h = sub_img_size
+    drawer = rdMolDraw2D.MolDraw2DCairo(w * n_col, h * n_row, w, h)
+    drawer.drawOptions().annotationFontScale = 0.6
+    drawer.DrawMolecules([p[0] for p in prepared],
+                         highlightAtoms=[p[1] for p in prepared],
+                         highlightBonds=[p[2] for p in prepared],
+                         # место под подписи оставляет RDKit (заполнитель '_'), сами подписи рисует PIL
+                         legends=['_'] * n if legends is not None else None)
+    drawer.FinishDrawing()
+    image = Image.open(_io.BytesIO(drawer.GetDrawingText())).convert('RGB')
+    if legends is not None:
+        # подписи рисует PIL: RDKit выводит кириллицу в подписях квадратами
+        _draw_legends(image, [str(x) for x in legends], n_col, sub_img_size)
+    return image
+
+
+def _legend_font(size):
+    """Шрифт с кириллицей для подписей: DejaVuSans из matplotlib, иначе шрифт PIL по умолчанию."""
+    from PIL import ImageFont
+    try:
+        import matplotlib
+        path = os.path.join(matplotlib.get_data_path(), 'fonts', 'ttf', 'DejaVuSans.ttf')
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _draw_legends(image, legends, n_col, sub_img_size):
+    """Подписи по центру внизу каждой ячейки сетки."""
+    from PIL import ImageDraw
+    w, h = sub_img_size
+    font = _legend_font(max(16, h // 25))
+    draw = ImageDraw.Draw(image)
+    for i, text in enumerate(legends):
+        x0, y0 = (i % n_col) * w, (i // n_col) * h
+        box = draw.textbbox((0, 0), text, font=font)
+        # белый прямоугольник закрывает метку-заполнитель RDKit
+        draw.rectangle([x0, y0 + h - h // 10, x0 + w - 1, y0 + h - 1], fill='white')
+        draw.text((x0 + (w - (box[2] - box[0])) / 2, y0 + h - h // 20 - (box[3] - box[1]) / 2),
+                  text, fill='black', font=font)
 
 
 # def modify_atoms_for_charge(mol):
@@ -1822,7 +2000,7 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
         Chem.Mol - перенумерованная молекула. Свойства: 'RefResidue' - имя шаблона,
         'OldIndices' - JSON-список: на позиции нового индекса стоит старый индекс атома,
         'ParentAtoms' - JSON-список новых индексов атомов, сопоставленных с шаблоном
-        родительского остатка (для подсветки: draw_mol_with_atom_index(highlight_atoms=...)).
+        родительского остатка (для подсветки: draw_molecule(highlight_atoms=...)).
     """
     _, match_data, _ = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
                                      ref_base_name=ref_base_name, residue_type=residue_type,
@@ -2007,9 +2185,12 @@ def path_parser(path: str, file_types: list):
     # else:
     #     path_to_file = 'current directory'
 
-    # Удаление указанных расширений из имени файла
-    for type_name in formated_file_types:
-        file_name = file_name.replace(type_name, '')
+    # Удаление расширения из списка в конце имени файла. Раньше расширения вырезались
+    # replace'ом в любом месте имени: 'X_rn_H.smiles' с ['smi', 'smiles'] давало 'X_rn_Hles'
+    for type_name in sorted(formated_file_types, key=len, reverse=True):
+        if file_name.endswith(type_name):
+            file_name = file_name[:-len(type_name)]
+            break
 
     return path_to_file, file_name
         
@@ -2033,104 +2214,110 @@ def _with_atom_map(mol):
     return mapped
 
 
+def _reroot_via_smiles(rdkit_mol, rootedAtAtom, func_name, sanitize):
+    """
+    Старое поведение rootedAtAtom в save_chem_to_pdb / save_chem_to_mol: молекула
+    переписывается через SMILES с корнем в атоме rootedAtAtom. Индексы атомов меняются,
+    имена атомов, параметры остатка, свойства молекулы и координаты теряются.
+    """
+    print_red(f'⚠ {func_name}(rootedAtAtom={rootedAtAtom}) устарел: атомы переставляются через '
+              'SMILES, индексы меняются, имена атомов и параметры остатка теряются. '
+              'Для порядка атомов остатка используйте renumber_residue_atoms.')
+    smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True,
+                                     allHsExplicit=True, rootedAtAtom=rootedAtAtom)
+    return Chem.MolFromSmiles(smiles_string, sanitize=sanitize)
+
+
 @logged
-def save_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, rootedAtAtom=-1, atom_map=False):
-    """Сохраняет молекулу в SMILES; atom_map - см. save_aa_chem_to_smiles."""
-    path_dir = path.rsplit('/', 1)
-    if len(path_dir) > 1:
-        os.makedirs(path_dir[0], exist_ok=True) 
+def save_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, rootedAtAtom=-1,
+                        atom_map=False):
+    """
+    Сохраняет молекулу в SMILES (<path>.smiles). Молекула не меняется.
+
+    Аргументы:
+        rdkit_mol (Chem.Mol) - молекула
+        path (str) - путь к файлу; расширение .smi/.smiles можно не писать
+        canonical (bool) - канонический порядок обхода графа (True) или порядок индексов (False)
+        allHsExplicit (bool) - писать водороды в квадратных скобках у каждого атома
+        rootedAtAtom (int) - атом, с которого начинается запись строки (-1 - по умолчанию).
+            Меняет только текст строки, не молекулу
+        atom_map (bool) - записать у каждого атома его номер (индекс + 1, т.к. 0 в SMILES -
+            «без номера»); smi_to_chem по этим номерам восстановит исходные индексы
+    """
+    path_to_file, file_name = path_parser(path, ['smi', 'smiles'])
     smiles_string = Chem.MolToSmiles(_with_atom_map(rdkit_mol) if atom_map else rdkit_mol,
-                                     canonical = canonical, 
-                                     allHsExplicit = allHsExplicit, 
-                                     rootedAtAtom = rootedAtAtom)
-    with open(f"{path}.smiles", "w") as file:
+                                     canonical=canonical,
+                                     allHsExplicit=allHsExplicit,
+                                     rootedAtAtom=rootedAtAtom)
+    output_path = os.path.join(path_to_file, f'{file_name}.smiles')
+    with open(output_path, "w") as file:
         file.write(smiles_string)
+    print(f'Сохранено: {output_path}')
+
 
 @logged
 def save_aa_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, make_N_root=False,
                            atom_map=False):
     """
-    Сохраняет молекулу в формате SMILES.
-    Аргументы:
-        rdkit_mol - RDKit.Chem молекула
-        path - строка с путем к файлу и его именем для сохранения
-        make_N_root - искать ли аминогруппу и делать ли ее началом молекулы
-        canonical, allHsExplicit - параметры для генерации SMILES
-        atom_map - записать у каждого атома его номер (индекс + 1, т.к. 0 в SMILES - «без номера»);
-            smi_to_chem по этим номерам восстановит исходные индексы и водороды без изменений
+    Старое имя save_chem_to_smiles (параметры те же, порядок позиционных аргументов прежний).
+    make_N_root=True - строка начинается с азота аминогруппы (find_amino_nitrogen);
+    меняется только текст строки, не молекула.
     """
-    if make_N_root:
-        rootedAtAtom = find_amino_nitrogen(rdkit_mol)
-    else:
-        rootedAtAtom = -1
+    rootedAtAtom = find_amino_nitrogen(rdkit_mol) if make_N_root else -1
+    save_chem_to_smiles(rdkit_mol, path, canonical=canonical, allHsExplicit=allHsExplicit,
+                        rootedAtAtom=rootedAtAtom, atom_map=atom_map)
 
-    # Получение пути и имени файла
-    path_to_file, file_name = path_parser(path, ['smi', 'smiles'])
-    
-    # Генерация строки SMILES
-    smiles_string = Chem.MolToSmiles(_with_atom_map(rdkit_mol) if atom_map else rdkit_mol,
-                                     canonical=canonical, 
-                                     allHsExplicit=allHsExplicit, 
-                                     rootedAtAtom=rootedAtAtom)
 
-    # Сохранение в файл
-    output_path = f"{path_to_file}/{file_name}" if path_to_file else file_name
-    with open(f"{output_path}.smiles", "w") as file:
-        file.write(smiles_string)
-    print(f'{file_name}.smiles saved to {path_to_file or "current directory"}')
-        
 @logged
 def save_chem_to_mol(rdkit_mol, path, rootedAtAtom=-1):
     """
-    Сохраняет молекулу в формате MOL, устанавливая корневой атом, если задан.
+    Сохраняет молекулу в формате MOL (<path>.mol).
+    rootedAtAtom - устаревший параметр (см. _reroot_via_smiles): функция предупреждает
+    и переставляет атомы, как раньше.
     """
     if rootedAtAtom != -1:
-        # Используем SMILES для переупорядочивания атомов
-        smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True, 
-                                         allHsExplicit=True, rootedAtAtom=rootedAtAtom)
-        rdkit_mol = Chem.MolFromSmiles(smiles_string, sanitize=True)
-    
+        rdkit_mol = _reroot_via_smiles(rdkit_mol, rootedAtAtom, 'save_chem_to_mol', sanitize=True)
+
     path_dir = path.rsplit('/', 1)
     if len(path_dir) > 1:
-        os.makedirs(path_dir[0], exist_ok=True) 
+        os.makedirs(path_dir[0], exist_ok=True)
     with open(f"{path}.mol", "w") as file:
         file.write(Chem.MolToMolBlock(rdkit_mol))
-        
+
+
 @logged
 def save_chem_to_pdb(rdkit_mol, path, rootedAtAtom=-1, coords='2D', stereo=None, ca_config='L',
                      stereo_default='R', random_seed=42):
     """
-    Сохраняет молекулу в PDB как есть: исходная индексация атомов, без имён атомов и остатка.
+    Сохраняет молекулу в PDB (<path>.pdb) с её индексацией атомов. Если у атомов есть
+    PDB-информация (имена атомов, остаток - после rdkit_pdb_modification или из PDB-файла),
+    она записывается; иначе RDKit пишет свои имена (элемент + номер), остаток UNL, HETATM.
     Переданная молекула не меняется (координаты задаются на копии).
 
     Аргументы:
         rdkit_mol (Chem.Mol) - молекула
-        path (str) - путь без расширения, пишется <path>.pdb
-        rootedAtAtom (int) - устаревший параметр: переставить атомы через SMILES с корнем
-            в этом атоме (меняет индексы атомов)
+        path (str) - путь без расширения
+        rootedAtAtom (int) - устаревший параметр (см. _reroot_via_smiles): функция
+            предупреждает и переставляет атомы, как раньше
         coords (str) - '2D' (по умолчанию) или '3D'; stereo, ca_config, stereo_default,
             random_seed - параметры 3D-структуры и стереохимии, см. set_mol_coords.
             До 2026-09 функция всегда строила 3D-структуру со случайной стереохимией.
     """
     rdkit_mol = Chem.Mol(rdkit_mol)
     if rootedAtAtom != -1:
-        # Используем SMILES для переупорядочивания атомов
-        smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True, 
-                                         allHsExplicit=True, rootedAtAtom=rootedAtAtom)
-        rdkit_mol = Chem.MolFromSmiles(smiles_string, sanitize=False)
-    try:
-        Chem.SanitizeMol(rdkit_mol, sanitizeOps=Chem.SANITIZE_ALL, catchErrors=True)
-    except ValueError as e:
-        print("Ошибка санации:", e)
+        rdkit_mol = _reroot_via_smiles(rdkit_mol, rootedAtAtom, 'save_chem_to_pdb', sanitize=False)
+    failed = Chem.SanitizeMol(rdkit_mol, sanitizeOps=Chem.SANITIZE_ALL, catchErrors=True)
+    if failed != Chem.SanitizeFlags.SANITIZE_NONE:
+        print_red(f'⚠ Санитизация не прошла ({failed}): молекула сохраняется как есть.')
     path_dir = path.rsplit('/', 1)
     if len(path_dir) > 1:
-        os.makedirs(path_dir[0], exist_ok=True) 
+        os.makedirs(path_dir[0], exist_ok=True)
     set_mol_coords(rdkit_mol, coords=coords, stereo=stereo, ca_config=ca_config,
                    stereo_default=stereo_default, random_seed=random_seed)
     pdb_block = Chem.MolToPDBBlock(rdkit_mol)
     with open(f"{path}.pdb", "w") as file:
         file.write(pdb_block)
-        
+
 @logged
 def generate_atom_names_by_ref_aa(mod_aa_mol, ref_aa_mol, dict_match, output_path):
     """
@@ -3337,32 +3524,55 @@ aa_dict = {one: names[0] for one, names in AMINO_ACIDS.items()}
 # Источник: Lysine_3M/1_charge_calculation.ipynb (идентичная копия в AF_546_*, Lysine_*;
 # в Lysine_Cro вариант с префиксом имени водорода 'HW' вместо 'HW1')
 @logged
-def add_protons_and_renumber_H(modifie_residue, resname='MOD', resid=1, segid='A'):
-    atom_map = {atom.GetIdx(): atom.GetProp('AtomName') for atom in modifie_residue.GetAtoms()}
-    names = list(atom_map.values())
-    # print(atom_map)
+def add_protons_and_renumber_H(modifie_residue, resname='MOD', resid=1, segid='A', h_name='HW1'):
+    """
+    Шаг 4.1: достраивает водороды у атомов с неполной валентностью. acpype не строит
+    топологию для таких атомов, поэтому у вырезанного из тримера остатка появляются протоны,
+    которых нет в белке: на N (вместо связи с предыдущим остатком) и на C (вместо связи
+    со следующим). В 3_edd_topology они удаляются из топологии.
 
-    # Добавление протонов
+    1. Атомы остатка сохраняют свои индексы, имена и параметры остатка: новые водороды
+       добавляются в конец (индексы и заряды шага 5 совпадают с шагом 4).
+    2. Новые водороды получают свободные имена h_name, h_name+1, ... (HW1, HW2, ...),
+       параметры остатка resname, resid, segid и свойство атома 'AddedH' = True.
+    3. Список индексов новых водородов - в свойстве молекулы 'AddedH' (JSON).
+    Атомы с формальным зарядом (например, O- сульфогруппы) не протонируются: RDKit
+    считает их валентность полной.
+
+    Аргументы:
+        modifie_residue (Chem.Mol) - остаток после шага 4 (у всех атомов есть 'AtomName')
+        resname, resid, segid - параметры остатка для новых водородов
+        h_name (str) - имя первого нового водорода (в Lysine_Cro использовалось 'HW')
+    Возвращает:
+        Chem.Mol - новая молекула с 2D-координатами (исходная не меняется).
+    """
+    n_old = modifie_residue.GetNumAtoms()
+    unnamed = [a.GetIdx() for a in modifie_residue.GetAtoms() if not a.HasProp('AtomName')]
+    if unnamed:
+        raise ValueError(f'У атомов {unnamed} нет имён (AtomName): на вход нужен остаток после шага 4.')
+    names = [a.GetProp('AtomName') for a in modifie_residue.GetAtoms()]
+
     H_modifie_residue = Chem.AddHs(modifie_residue, addCoords=True)
-    AllChem.Compute2DCoords(H_modifie_residue)
-    
-    # Назначение уникальных имен для новых атомам водорода
-    for atom in H_modifie_residue.GetAtoms():
-        if atom.GetPDBResidueInfo() is None:
-            info = atom.GetPDBResidueInfo()
-            print(info, atom.GetIdx(), atom.GetAtomMapNum())
-            
-            new_name = 'HW1'
-            while new_name in names:
-                new_name = increment_name(new_name)
-            names.append(new_name)
+    added = list(range(n_old, H_modifie_residue.GetNumAtoms()))
 
-            set_PDB_residue_info(atom, new_name, resname, resid, segid)
-            atom.SetProp('AtomName', new_name)
-            atom.SetAtomMapNum(atom.GetIdx())
-            # atom.SetI() = int(atom.GetAtomMapNum())
-        
-    order = [atom.GetIdx() for atom in H_modifie_residue.GetAtoms()]
-    Chem.rdmolops.RenumberAtoms(H_modifie_residue, order)
-    
+    report = []
+    for idx in added:
+        atom = H_modifie_residue.GetAtomWithIdx(idx)
+        new_name = h_name
+        while new_name in names:
+            new_name = increment_name(new_name)
+        names.append(new_name)
+        set_PDB_residue_info(atom, new_name, resname, resid, segid)
+        atom.SetProp('AtomName', new_name)
+        atom.SetBoolProp('AddedH', True)
+        heavy = atom.GetNeighbors()[0]
+        report.append(f"{new_name} - {heavy.GetProp('AtomName')} ({heavy.GetIdx()})")
+    H_modifie_residue.SetProp('AddedH', json.dumps(added))
+    AllChem.Compute2DCoords(H_modifie_residue)
+
+    if added:
+        print(f"Добавлены водороды (имя - атом): {', '.join(report)}")
+    else:
+        print_green('Все атомы со стандартной валентностью, водороды не добавлены.')
+    log_note('добавленные водороды', added={i: r for i, r in zip(added, report)})
     return H_modifie_residue
