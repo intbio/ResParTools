@@ -1,0 +1,19 @@
+ATOM      1  N   K1M A   2      -4.017  -1.410   0.000  1.00  0.00           N  
+ATOM      2  CA  K1M A   2      -3.997   0.089   0.000  1.00  0.00           C  
+ATOM      3  CB  K1M A   2      -2.497   0.070   0.000  1.00  0.00           C  
+ATOM      4  CG  K1M A   2      -0.997   0.051   0.000  1.00  0.00           C  
+ATOM      5  CD  K1M A   2       0.502   0.032   0.000  1.00  0.00           C  
+ATOM      6  CE  K1M A   2       2.002   0.012   0.000  1.00  0.00           C  
+ATOM      7  NZ  K1M A   2       3.502  -0.007   0.000  1.00  0.00           N1+
+ATOM      8  CH  K1M A   2       5.002  -0.026   0.000  1.00  0.00           C  
+ATOM      9  C   K1M A   2      -5.497   0.109   0.000  1.00  0.00           C  
+ATOM     10  O   K1M A   2      -6.230   1.417   0.000  1.00  0.00           O  
+CONECT    1    2
+CONECT    2    3    9
+CONECT    3    4
+CONECT    4    5
+CONECT    5    6
+CONECT    6    7
+CONECT    7    8
+CONECT    9   10   10
+END

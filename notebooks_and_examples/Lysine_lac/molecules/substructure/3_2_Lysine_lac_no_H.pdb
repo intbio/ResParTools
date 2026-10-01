@@ -1,0 +1,25 @@
+ATOM      1  N   KLA A   2      -5.422  -1.192   0.000  1.00  0.00           N  
+ATOM      2  CA  KLA A   2      -5.202   0.291   0.000  1.00  0.00           C  
+ATOM      3  CB  KLA A   2      -3.718   0.071   0.000  1.00  0.00           C  
+ATOM      4  CG  KLA A   2      -2.235  -0.150   0.000  1.00  0.00           C  
+ATOM      5  CD  KLA A   2      -0.751  -0.370   0.000  1.00  0.00           C  
+ATOM      6  CE  KLA A   2       0.733  -0.590   0.000  1.00  0.00           C  
+ATOM      7  NZ  KLA A   2       2.217  -0.811   0.000  1.00  0.00           N  
+ATOM      8  CH  KLA A   2       3.149   0.364   0.000  1.00  0.00           C  
+ATOM      9  OT1 KLA A   2       2.598   1.759   0.000  1.00  0.00           O  
+ATOM     10  CT2 KLA A   2       4.633   0.143   0.000  1.00  0.00           C  
+ATOM     11  OI1 KLA A   2       4.853   1.627   0.000  1.00  0.00           O  
+ATOM     12  CI2 KLA A   2       6.117  -0.077   0.000  1.00  0.00           C  
+ATOM     13  C   KLA A   2      -6.686   0.512   0.000  1.00  0.00           C  
+ATOM     14  O   KLA A   2      -7.237   1.907   0.000  1.00  0.00           O  
+CONECT    1    2
+CONECT    2    3   13
+CONECT    3    4
+CONECT    4    5
+CONECT    5    6
+CONECT    6    7
+CONECT    7    8
+CONECT    8    9    9   10
+CONECT   10   11   12
+CONECT   13   14   14
+END

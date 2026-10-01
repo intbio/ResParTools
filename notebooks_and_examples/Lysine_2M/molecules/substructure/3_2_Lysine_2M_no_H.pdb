@@ -1,0 +1,20 @@
+ATOM      1  N   K2M A   2      -4.466  -1.373   0.000  1.00  0.00           N  
+ATOM      2  CA  K2M A   2      -4.374   0.124   0.000  1.00  0.00           C  
+ATOM      3  CB  K2M A   2      -2.877   0.033   0.000  1.00  0.00           C  
+ATOM      4  CG  K2M A   2      -1.379  -0.059   0.000  1.00  0.00           C  
+ATOM      5  CD  K2M A   2       0.118  -0.151   0.000  1.00  0.00           C  
+ATOM      6  CE  K2M A   2       1.615  -0.243   0.000  1.00  0.00           C  
+ATOM      7  NZ  K2M A   2       3.112  -0.335   0.000  1.00  0.00           N1+
+ATOM      8  CH1 K2M A   2       4.609  -0.427   0.000  1.00  0.00           C  
+ATOM      9  CH2 K2M A   2       3.204   1.162   0.000  1.00  0.00           C  
+ATOM     10  C   K2M A   2      -5.871   0.216   0.000  1.00  0.00           C  
+ATOM     11  O   K2M A   2      -6.540   1.559   0.000  1.00  0.00           O  
+CONECT    1    2
+CONECT    2    3   10
+CONECT    3    4
+CONECT    4    5
+CONECT    5    6
+CONECT    6    7
+CONECT    7    8    9
+CONECT   10   11   11
+END

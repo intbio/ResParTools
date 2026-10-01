@@ -1,0 +1,26 @@
+ATOM      1  N   KBU A   2      -6.040  -1.216   0.000  1.00  0.00           N  
+ATOM      2  CA  KBU A   2      -5.854   0.272   0.000  1.00  0.00           C  
+ATOM      3  CB  KBU A   2      -4.365   0.086   0.000  1.00  0.00           C  
+ATOM      4  CG  KBU A   2      -2.877  -0.101   0.000  1.00  0.00           C  
+ATOM      5  CD  KBU A   2      -1.389  -0.287   0.000  1.00  0.00           C  
+ATOM      6  CE  KBU A   2       0.100  -0.473   0.000  1.00  0.00           C  
+ATOM      7  NZ  KBU A   2       1.588  -0.660   0.000  1.00  0.00           N  
+ATOM      8  CH  KBU A   2       2.494   0.536   0.000  1.00  0.00           C  
+ATOM      9  OT1 KBU A   2       1.911   1.918   0.000  1.00  0.00           O  
+ATOM     10  CT2 KBU A   2       3.982   0.350   0.000  1.00  0.00           C  
+ATOM     11  CI  KBU A   2       5.470   0.163   0.000  1.00  0.00           C  
+ATOM     12  CK  KBU A   2       6.959  -0.023   0.000  1.00  0.00           C  
+ATOM     13  C   KBU A   2      -7.342   0.458   0.000  1.00  0.00           C  
+ATOM     14  O   KBU A   2      -7.925   1.840   0.000  1.00  0.00           O  
+CONECT    1    2
+CONECT    2    3   13
+CONECT    3    4
+CONECT    4    5
+CONECT    5    6
+CONECT    6    7
+CONECT    7    8
+CONECT    8    9    9   10
+CONECT   10   11
+CONECT   11   12
+CONECT   13   14   14
+END
