@@ -10,6 +10,9 @@ RESP (шаг 6) для модификаций лизина на кластере
         проверка узла: замер psi4 на 1..cpus потоках и маленькая задача RESP целиком
     python cluster/resp_cluster.py prepare [папки ...]
         подготовить задачи RESP (конформации, ограничения, run_resp.sbatch)
+    python cluster/resp_cluster.py review  [папки ...]
+        проверка перед запуском: молекула ACE-остаток-NME, фиксированные заряды по остаткам,
+        эквивалентные атомы, конформации, стереохимия; картинка review.png в папке задачи
     python cluster/resp_cluster.py submit  [папки ...] [--chain]
         отправить задачи; --chain - по очереди (каждая следующая после предыдущей)
     python cluster/resp_cluster.py status  [папки ...]
@@ -123,6 +126,17 @@ def cmd_status(args):
               f' | результат: {"есть" if done else "нет"}')
 
 
+def cmd_review(args):
+    for folder in args.folders:
+        mon = os.path.splitext(os.path.basename(PARAMS[folder]['monomer_file']))[0]
+        job = _job_dir(folder, mon)
+        if not os.path.exists(os.path.join(job, pt.SPEC_FILE)):
+            print(f'{folder}: не подготовлено (prepare)')
+            continue
+        print()
+        pt.review_resp_job(job)
+
+
 def cmd_collect(args):
     for folder in args.folders:
         mon, residue, _ = _residue(folder)
@@ -149,7 +163,7 @@ def cmd_collect(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='RESP на кластере SLURM (см. описание в начале файла).')
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('check', 'prepare', 'submit', 'status', 'collect'):
+    for name in ('check', 'prepare', 'review', 'submit', 'status', 'collect'):
         p = sub.add_parser(name)
         if name != 'check':
             p.add_argument('folders', nargs='*', help='папки модификаций (по умолчанию все лизины)')
@@ -169,7 +183,7 @@ def main(argv=None):
         if unknown:
             sys.exit(f'Неизвестные папки: {unknown}')
         args.folders = args.folders or LYSINES
-    {'check': cmd_check, 'prepare': cmd_prepare, 'submit': cmd_submit,
+    {'check': cmd_check, 'prepare': cmd_prepare, 'review': cmd_review, 'submit': cmd_submit,
      'status': cmd_status, 'collect': cmd_collect}[args.command](args)
 
 

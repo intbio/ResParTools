@@ -47,6 +47,10 @@ SPEC_FILE = 'spec.json'
 # запуск модуля из командной строки (python -m respartools.resp даёт RuntimeWarning, т.к.
 # пакет уже импортирует resp)
 _WORKER = 'import sys; from respartools.resp import _main; _main(sys.argv[1:])'
+# Fortran-библиотека в psi4 печатает трассировку, когда psiresp закрывает рабочие процессы
+# после расчёта ESP (forrtl: process killed (SIGTERM)) - это не ошибка; трассировка отключается
+_QUIET_ENV = {'FOR_DISABLE_STACK_TRACE': '1'}
+os.environ.update(_QUIET_ENV)
 RESULT_FILE = 'result.json'
 
 
@@ -558,6 +562,20 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
     folder = os.path.abspath(os.path.join(working_dir, name))
     os.makedirs(folder, exist_ok=True)
     symbols = [a.GetSymbol() for a in conf_mol.GetAtoms()]
+    res_names = {mapping[i]: residue_chem.GetAtomWithIdx(i).GetProp('AtomName')
+                 for i in range(n_res) if residue_chem.GetAtomWithIdx(i).HasProp('AtomName')}
+    atom_names, atom_residues = [], []
+    for atom in conf_mol.GetAtoms():
+        info = atom.GetPDBResidueInfo()
+        if atom.GetIdx() in res_names:
+            atom_names.append(res_names[atom.GetIdx()])
+            atom_residues.append('остаток')
+        elif atom.HasProp('AtomName'):
+            atom_names.append(atom.GetProp('AtomName'))
+            atom_residues.append(info.GetResidueName().strip() if info is not None else 'кэп')
+        else:
+            atom_names.append(f'{atom.GetSymbol()}{atom.GetIdx()}')
+            atom_residues.append('сосед')
     frozen = [] if _backbone_pairs(fix_backbone) is None else [dihedrals['phi'], dihedrals['psi']]
     conformers = []
     for d in described:
@@ -577,6 +595,9 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
         'residue_atoms': mapping, 'residue_charge': residue_charge,
         'fixed': {str(k): v for k, v in fixed.items()}, 'equivalent_groups': groups,
         'dihedrals': dihedrals, 'frozen': frozen, 'conformers': conformers,
+        'atom_names': atom_names, 'atom_residues': atom_residues,
+        'stereo': {(f'{atom_names[k[1]]}={atom_names[k[2]]}' if isinstance(k, tuple) else atom_names[k]): v
+                   for k, v in labels.items()},
         'qm': {'method': method, 'basis': basis, 'g_convergence': g_convergence, 'scf_type': scf_type,
                'opt_chunk': opt_chunk, 'max_opt_steps': max_opt_steps},
     }
@@ -587,6 +608,58 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
           f'{len(fixed)}, групп эквивалентных атомов {len(groups)}, конформаций {len(conformers)}')
     log_note('RESP: задача', spec={k: v for k, v in spec.items() if k != 'molblock'})
     return folder
+
+
+@logged
+def review_resp_job(folder, image=True):
+    """
+    Сводка подготовленной задачи RESP для проверки перед запуском: молекула (SMILES, атомы,
+    заряды), фиксированные заряды по остаткам (кэп ACE / остаток / кэп NME) и их суммы,
+    группы эквивалентных атомов, конформации (phi/psi, энергия MMFF, контакт), стереохимия.
+    image=True - картинка review.png в папке задачи: подсвечены атомы с фиксированным зарядом.
+    """
+    folder = os.path.abspath(folder)
+    spec = json.load(open(os.path.join(folder, SPEC_FILE)))
+    mol = Chem.MolFromMolBlock(spec['molblock'], removeHs=False)
+    names = spec.get('atom_names') or [f'{a.GetSymbol()}{a.GetIdx()}' for a in mol.GetAtoms()]
+    residues = spec.get('atom_residues') or ['?'] * mol.GetNumAtoms()
+    fixed = {int(k): v for k, v in spec['fixed'].items()}
+    print(f'===== {spec["name"]} ({spec["context"]})')
+    print(f'молекула: {Chem.MolToSmiles(Chem.RemoveHs(mol))}')
+    print(f'атомов {mol.GetNumAtoms()} (остаток {len(spec["residue_atoms"])}), заряд молекулы '
+          f'{spec["total_charge"]:+d}, заряд остатка {spec["residue_charge"]:+d}')
+    by_res = defaultdict(list)
+    for idx in sorted(fixed):
+        by_res[residues[idx]].append(idx)
+    for res in sorted(by_res, key=lambda r: {'ACE': 0, 'остаток': 1, 'NME': 2}.get(r, 3)):
+        idxs = by_res[res]
+        total = sum(fixed[i] for i in idxs)
+        print(f'фиксированы ({res}, {len(idxs)}): ' + ', '.join(f'{names[i]} {fixed[i]:+.4f}' for i in idxs)
+              + f' | сумма {total:+.4f}')
+    free_res = [i for i in spec['residue_atoms'] if i not in fixed]
+    fixed_res_sum = sum(fixed[i] for i in spec['residue_atoms'] if i in fixed)
+    print(f'свободные атомы остатка: {len(free_res)}, их суммарный заряд будет '
+          f'{spec["residue_charge"] - fixed_res_sum:+.4f}')
+    if spec['equivalent_groups']:
+        print('эквивалентные атомы: ' + '; '.join('=' .join(names[i] for i in g) for g in spec['equivalent_groups']))
+    print('стереохимия: ' + (', '.join(f'{k} {v}' for k, v in spec.get('stereo', {}).items()) or 'нет'))
+    frozen = ', '.join('-'.join(names[i] for i in quad) for quad in spec['frozen']) or 'нет'
+    print(f'замороженные углы остова: {frozen}')
+    for c in spec['conformers']:
+        print(f"  {c['label']:9s} phi {c['mmff_phi']:7.1f} psi {c['mmff_psi']:7.1f} | dE MMFF {c['mmff_dE']:5.2f} "
+              f"ккал/моль | контакт боковой цепи с остовом: {'да' if c['contact'] else 'нет'}")
+    qm = spec['qm']
+    print(f"QM: {qm['method']}/{qm['basis']}, оптимизация {qm['g_convergence']}, scf_type {qm['scf_type']}")
+    if image:
+        for atom, name in zip(mol.GetAtoms(), names):
+            atom.SetProp('AtomName', name)
+        mol2d = Chem.Mol(mol)
+        mol2d.RemoveAllConformers()
+        img = draw_molecule(mol2d, highlight_atoms=sorted(fixed), show_names=True, show_index=False)
+        path = os.path.join(folder, 'review.png')
+        img.save(path)
+        print(f'картинка: {path} (подсвечены атомы с фиксированным зарядом)')
+        return img
 
 
 def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
@@ -919,6 +992,7 @@ def write_slurm_script(folder, cpus=24, mem='32G', time_limit='08:00:00', n_para
     lines += ['', 'cd "$SLURM_SUBMIT_DIR"', env_setup,
               f'export PYTHONPATH="$SLURM_SUBMIT_DIR/{root}:$PYTHONPATH"',
               f'export OMP_NUM_THREADS={threads}',
+              'export FOR_DISABLE_STACK_TRACE=1   # без трассировок Fortran при закрытии процессов psiresp',
               f'python -c "{_WORKER}" . --threads {threads} --parallel {n_parallel} '
               f'--memory {per_job}', '']
     path = os.path.join(folder, 'run_resp.sbatch')
@@ -978,6 +1052,7 @@ def prepare_cluster_check(residue_chem, constraints, folder='RESP_data/cluster_c
         lines.append(f'#SBATCH --partition={partition}')
     lines += ['', 'cd "$SLURM_SUBMIT_DIR"', env_setup,
               f'export PYTHONPATH="$SLURM_SUBMIT_DIR/{root}:$PYTHONPATH"',
+              'export FOR_DISABLE_STACK_TRACE=1   # без трассировок Fortran при закрытии процессов psiresp',
               'echo "узел: $(hostname), ядер: $(nproc), python: $(which python)"',
               f'python bench.py {" ".join(map(str, threads))}',
               f'python -c "{_WORKER}" cluster_test --threads {cpus} --parallel 1 --memory 8GB', '']
@@ -1119,6 +1194,7 @@ def _main(argv=None):
 # Импорт из других модулей пакета - в конце файла (см. CLAUDE.md, правило импортов).
 from .charges import read_rtp_charges  # noqa: E402
 from .residue import find_backbone_match, set_mol_coords  # noqa: E402
+from .draw import draw_molecule  # noqa: E402
 
 if __name__ == '__main__':
     _main()
