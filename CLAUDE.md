@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A research toolkit (docs and notebook text are in Russian) for parameterizing **modified amino acids / post-translational modifications** for the GROMACS **amber14sb** force field. Partial charges come from the **Espaloma Charge** neural network (a patched copy that can pin selected atoms to fixed charges). Topologies come from **acpype**. The work is almost entirely Jupyter notebooks. There is no build system, and the project itself has no test suite.
 
+## Docs and tests
+- `docs/PIPELINE.md` - pipeline map (steps, functions, files, environments); `docs/PLAN.md` - status, decisions, next steps, known data issues. Keep both updated when the pipeline or plan changes.
+- `tests/test_reference.py` - reference-set tests (Lysine_prop, Lysine_Malonyl, Lysine_Formyl, Lysine_3M, AF_546_cys): steps 1-4.1 compared with committed files, rtp constraints, capped monomer, RESP preparation (no QM). Run in `darwin_resp`: `python -m pytest tests -q -m "not slow"` (~30 s) or all (~3 min). Run them after any library change; if behaviour changes on purpose, regenerate the files with the notebooks and commit them.
+
 ## Environments
 
 - **`ResParTools_ec.yml`**: creates a conda env named `darwin_ec`. This is the primary env for current work. It has Python 3.12, rdkit 2024.03, dgl 2.3 and pytorch 2.3.1 (CUDA 12 builds), plus MDAnalysis, openbabel, nglview and JupyterLab. It covers step 1 (the charge calculation with `espaloma-charge_mod`). It does **not** include `acpype`, `parmed`, `ambertools` or `psiresp`, so steps 2 and 3 and the RESP notebooks still need another env. The file was exported on the cluster, which is why it has a cluster `prefix:` and pinned builds. Install it with an explicit name. On a machine without an NVIDIA driver, also override the CUDA virtual package. Use at least 12.4, because the pinned ffmpeg build requires `__cuda>=12.4`. torch and dgl then run on CPU:
