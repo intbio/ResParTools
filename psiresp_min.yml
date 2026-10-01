@@ -1,14 +1,22 @@
+# Окружение для RESP (шаг 6 ResParTools, папка notebooks_and_examples/cluster/).
+# Создание:  conda env create -n darwin_resp -f psiresp_min.yml
+# Версии проверены 2026-10 (локально, Linux x86_64): psi4 1.6.1 собирается только для
+# Python <= 3.10, psiresp 0.4.2 требует pydantic 1. Полный снимок окружения -
+# darwin_resp.lock.yml (если подбор пакетов на другой машине разойдётся).
 name: darwin_resp
 channels:
   - psi4
   - conda-forge
 dependencies:
-  - python
+  - python=3.9
   - psi4=1.6.1
   - psiresp=0.4.2
-  - pydantic<2.0
-  - rdkit=2024
-  - numpy
+  - qcelemental=0.25.1
+  - pydantic=1.10
+  - rdkit=2024.03
+  - numpy=1.26
+  - scipy=1.13
+  - pillow
   - ipykernel
   - nglview=3.1.4
   - setuptools<80
