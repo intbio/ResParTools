@@ -22,16 +22,21 @@ The vendored Espaloma has upstream tests, which you run from inside that package
 
 ## Architecture
 
-### `notebooks_and_examples/ResParTools.py`: the shared helper library
-This is one flat module of about 2000 lines of RDKit-based functions. The notebooks import it as `pt`. Its main groups of functions:
-- **I/O**: `read_file`, `smi_to_chem`, `pdb_to_chem`, `save_aa_chem_to_pdb`/`_smiles`, `save_charges_json`, `save_json`. Many of these are wrapped by `@data_to_dict`. They accept a path string, a list of paths or a dict, and they **return a dict keyed by file basename** (`get_name`). The rest of the pipeline passes these `{name: RDKit Mol}` dicts around.
-- **Substructure matching**: `match_chem*` (several versions: `match_chem`, `_v3`, `_v6`), `match_mon_to_pol`, `find_ref_aa`. These map a modified monomer onto polymer (trimer) contexts and onto reference amino acids, so that canonical atom names can be carried over.
-- **PDB/residue naming**: `rdkit_pdb_modification`, `generate_atom_names_by_ref_aa`, `modifie_residue_info`.
-- **Force-field file generation**: `hdb_generator`, `check_atomtypes` (`.atp`), `make_r2b`, `remove_extra_H`.
+### `notebooks_and_examples/respartools/`: the shared helper library (package)
+Since 2026-10 the library is a package; `notebooks_and_examples/ResParTools.py` is only an entry point that re-exports every name of every module (including `_private` ones), so notebooks keep using `import ResParTools as pt` and old notebooks work unchanged. Modules:
+- **`log`**: debug log (`start_log`, `stop_log`, `log_note`, `@logged`).
+- **`utils`**: `get_name`, `@data_to_dict`, `path_parser`, `print_red`/`print_green`, `_PACKAGE_ROOT` (= `notebooks_and_examples/`, base for data paths).
+- **`fileio`**: `file_opener`, `smi_to_chem`, `pdb_to_chem`, `mol2_to_chem`, `save_chem_to_smiles`/`_pdb`/`_mol`, `save_aa_chem_to_pdb`, `save_charges_json`. Functions with `@data_to_dict` accept a path, a list or a dict and **return a dict keyed by file basename**.
+- **`draw`**: `draw_molecule` (old name `draw_mol_with_atom_index`), `draw_mol_grid`, `draw_mon_pol_match`.
+- **`matching`**: `match_chem*`, `match_mon_to_pol`, `REF_TEMPLATES`, `AMINO_ACIDS`, `find_ref_residue` (old name `find_ref_aa`).
+- **`residue`**: `renumber_residue_atoms`, `rdkit_pdb_modification` (atom names), `find_backbone_match`, `set_mol_coords` (2D/3D, stereo), `modifie_residue_info`, `check_duplicate_atom_names`, `add_protons_and_renumber_H`.
+- **`forcefield`**: `hdb_generator`, `check_atomtypes` (`.atp`), `make_r2b`, `remove_extra_H`.
+- **`charges`**: `read_rtp_charges`, `charge_constraints_from_rtp` (Espaloma/RESP constraints from amber14sb by atom name).
+- **`legacy`**: compatibility for functions old notebooks call.
 
-Some functions are defined twice in the file (for example `check_duplicate_atom_names`). In Python the later definition wins.
+Imports between package modules: `log`/`utils` are imported at the top of a module (decorators, paths); all other intra-package imports are at the **end** of the module, so mutual references do not break import. Keep that rule when adding functions.
 
-Notebooks load it with `sys.path.append(os.path.abspath('..'))` followed by `import ResParTools as pt`. The module was named `param_tool.py` before commit 7f1d61a, and stale `__pycache__/param_tool.*.pyc` files are still present. It is imported under Python 3.8 through 3.12 (`topmol2`, `espaloma`, `darwin_ec`), so keep it compatible with 3.8. That rules out `match` statements and PEP 604 `X | Y` annotations.
+The module was named `param_tool.py` before commit 7f1d61a, and stale `__pycache__/param_tool.*.pyc` files are still present. It is imported under Python 3.8 through 3.12 (`topmol2`, `espaloma`, `darwin_ec`, `darwin_resp`), so keep it compatible with 3.8. That rules out `match` statements and PEP 604 `X | Y` annotations.
 
 ### `espaloma-charge_mod/`: patched Espaloma Charge
 This differs from the untouched upstream copy in `espaloma-charge/` in `app.py`, `models.py` and `utils.py`. The key addition is `charge(mol, constraints={atom_idx: fixed_q, ...})`. When constraints are given, the model's final `ChargeEquilibrium` layer is replaced with `ChargeEquilibrium_mod` (in `models.py`). That layer fixes the constrained atoms and spreads the remaining total charge over the free atoms only. The notebooks import this package with `sys.path.append("../../espaloma-charge_mod/")`, not with pip. On first use the model weights are downloaded from the GitHub release URL in `app.py`.
