@@ -11,6 +11,7 @@ ResParTools: подготовка модифицированных остатк�
     residue     - перенумерация, имена атомов, координаты, параметры остатка, протонирование
     forcefield  - файлы силового поля (hdb, atp, r2b)
     charges     - заряды: ограничения из rtp, списки зарядов
+    resp        - заряды RESP (шаг 6): кэпы, конформации, psi4, psiresp, SLURM
     legacy      - совместимость со старыми ноутбуками
 
 В ноутбуках пакет подключается как раньше: import ResParTools as pt
@@ -24,7 +25,8 @@ from .matching import *  # noqa: F401,F403
 from .residue import *  # noqa: F401,F403
 from .forcefield import *  # noqa: F401,F403
 from .charges import *  # noqa: F401,F403
+from .resp import *  # noqa: F401,F403
 from .legacy import *  # noqa: F401,F403
-from . import log, utils, fileio, draw, matching, residue, forcefield, charges, legacy
+from . import log, utils, fileio, draw, matching, residue, forcefield, charges, resp, legacy
 
-MODULES = (log, utils, fileio, draw, matching, residue, forcefield, charges, legacy)
+MODULES = (log, utils, fileio, draw, matching, residue, forcefield, charges, resp, legacy)
