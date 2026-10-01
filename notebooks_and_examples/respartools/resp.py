@@ -446,17 +446,29 @@ def resp_conformers(mol, dihedrals, residue_atoms, fix_backbone=True, n_sidechai
             energies[cid] = ff.CalcEnergy()
         order = sorted(energies, key=energies.get)
         e_min = energies[order[0]]
-        in_window = [c for c in order if energies[c] - e_min <= energy_window]
-        no_contact = [c for c in in_window
-                      if not _polar_contacts(work.GetConformer(c), side_polar, backbone_polar, contact_cutoff)]
-        candidates = no_contact if (exclude_contacts and len(no_contact) >= n_sidechain) else in_window
-        if exclude_contacts and len(no_contact) < n_sidechain:
-            print_red(f'⚠ {label}: конформаций без контакта боковой цепи с остовом {len(no_contact)} '
-                      f'из нужных {n_sidechain}; берутся и конформации с контактом.')
+        # Контакт боковой цепи с остовом в газе (например, COO- на NH остова) - артефакт газовой
+        # фазы, в воде его нет. Поэтому при exclude_contacts отбор идёт среди конформаций без
+        # контакта, а окно энергии отсчитывается от самой низкой из них.
+        pool_ok = order
+        if exclude_contacts:
+            no_contact = [c for c in order
+                          if not _polar_contacts(work.GetConformer(c), side_polar, backbone_polar, contact_cutoff)]
+            if len(no_contact) >= n_sidechain:
+                pool_ok = no_contact
+                shift = energies[no_contact[0]] - e_min
+                if shift > energy_window:
+                    print(f'{label}: все конформации в окне {energy_window} ккал/моль свёрнуты (контакт '
+                          f'боковой цепи с остовом); взяты конформации без контакта, самая низкая - на '
+                          f'{shift:.1f} ккал/моль выше минимума MMFF (газовая фаза).')
+            else:
+                print_red(f'⚠ {label}: в пуле конформаций без контакта боковой цепи с остовом '
+                          f'{len(no_contact)} из нужных {n_sidechain}; берутся и конформации с контактом.')
+        e_ref = energies[pool_ok[0]]
+        candidates = [c for c in pool_ok if energies[c] - e_ref <= energy_window]
         if len(candidates) < n_sidechain:
             print_red(f'⚠ {label}: в окне {energy_window} ккал/моль {len(candidates)} конформаций '
                       f'из нужных {n_sidechain}; добавляются следующие по энергии.')
-            candidates = order[:max(n_sidechain, len(candidates))]
+            candidates = pool_ok[:n_sidechain]
         align = backbone_core if angles is not None else residue_atoms
         picked = [candidates[0]]
         while len(picked) < min(n_sidechain, len(candidates)):
@@ -481,6 +493,7 @@ def resp_conformers(mol, dihedrals, residue_atoms, fix_backbone=True, n_sidechai
                               'contact': _polar_contacts(conf, side_polar, backbone_polar, contact_cutoff)})
     print(f'Конформации RESP ({format_time(time.time() - start)}): ' + '; '.join(
         f"{d['label']} (phi {d['mmff_phi']}, psi {d['mmff_psi']}, dE {d['mmff_dE']})" for d in described))
+    chosen_mol.SetProp('ContactAtoms', json.dumps([side_polar, backbone_polar, contact_cutoff]))
     return chosen_mol, described
 
 
@@ -552,7 +565,10 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
     print(f'Стереохимия конформаций проверена: центров {len(labels) - n_bonds} (R/S), двойных связей '
           f'{n_bonds} (E/Z) - как задано'
           + (', CA - L' if context == 'capped' else ''))
-    ranks = list(Chem.CanonicalRankAtoms(conf_mol, breakTies=False))
+    # эквивалентность по графу без порядков связей и формальных зарядов: резонансные атомы
+    # (O- и =O карбоксилата и сульфогруппы) равноценны, как в стандартном RESP; водороды
+    # в графе есть, поэтому C=O и C-OH различаются
+    ranks = list(Chem.CanonicalRankAtoms(_plain_graph(conf_mol), breakTies=False))
     eq = defaultdict(list)
     for idx, rank in enumerate(ranks):
         if idx not in fixed:
@@ -596,6 +612,7 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
         'fixed': {str(k): v for k, v in fixed.items()}, 'equivalent_groups': groups,
         'dihedrals': dihedrals, 'frozen': frozen, 'conformers': conformers,
         'atom_names': atom_names, 'atom_residues': atom_residues,
+        'contact_atoms': json.loads(conf_mol.GetProp('ContactAtoms')),
         'stereo': {(f'{atom_names[k[1]]}={atom_names[k[2]]}' if isinstance(k, tuple) else atom_names[k]): v
                    for k, v in labels.items()},
         'qm': {'method': method, 'basis': basis, 'g_convergence': g_convergence, 'scf_type': scf_type,
@@ -787,6 +804,21 @@ def run_resp_job(folder, n_threads=4, n_parallel=1, memory='4 GB', n_processes=N
     if bad:
         raise RuntimeError(f'Не сошлись за {spec["qm"]["max_opt_steps"]} шагов: {bad}. '
                            'Повторный запуск продолжит с последней геометрии (увеличьте max_opt_steps).')
+
+    # проверка: не свернулась ли боковая цепь к остову при оптимизации (артефакт газовой фазы)
+    if spec.get('contact_atoms'):
+        side_polar, backbone_polar, cutoff = spec['contact_atoms']
+        for label in labels:
+            xyz = _read_xyz(os.path.join(folder, 'conformers', label, 'optimized.xyz'))
+            d = np.linalg.norm(xyz[side_polar][:, None, :] - xyz[backbone_polar][None, :, :], axis=2) \
+                if side_polar and backbone_polar else np.array([[np.inf]])
+            statuses[label]['contact_after_opt'] = bool((d < cutoff).any())
+            statuses[label]['min_contact_distance'] = round(float(d.min()), 2)
+        folded = [label for label in labels if statuses[label]['contact_after_opt']]
+        if folded:
+            print_red(f'⚠ После оптимизации боковая цепь касается остова (< {cutoff} Å) в конформациях '
+                      f'{folded}: заряды учитывают газофазную водородную связь - проверьте '
+                      f'(conformers/<метка>/optimized.xyz).')
 
     # 2. ESP и двухстадийный RESP (psiresp считает ESP и решает каждую стадию)
     q_all = _fit_two_stage(spec, folder, labels, n_threads, n_parallel, memory, n_processes)

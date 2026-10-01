@@ -147,6 +147,10 @@ def cmd_collect(args):
         except FileNotFoundError as e:
             print(e)
             continue
+        result = json.load(open(os.path.join(job, pt.RESULT_FILE)))
+        folded = [k for k, v in result.get('conformers', {}).items() if v.get('contact_after_opt')]
+        if folded:
+            print(f'⚠ после оптимизации боковая цепь касается остова: {folded}')
         espaloma = os.path.join(ROOT, folder, f'AI_chrges_{mon}.json')
         sets = {'RESP': q}
         if os.path.exists(espaloma):
