@@ -19,7 +19,7 @@ cd notebooks_and_examples
 ## 2. Проверка кластера (около 15 минут)
 ```bash
 conda activate darwin_resp
-python cluster/resp_cluster.py check --cpus 24 --mem 32G          # --partition <имя>, если нужно
+python cluster/resp_cluster.py check          # по умолчанию: 24 ядра, 30G, раздел intbio
 cd RESP_data/cluster_check && sbatch run_check.sbatch
 ```
 Задача замеряет градиент psi4 HF/6-31G* на 1, 6, 12 и 24 потоках и проверяет всю цепочку
@@ -37,7 +37,7 @@ python cluster/resp_cluster.py submit --chain      # по очереди: каж
 python cluster/resp_cluster.py status              # сколько конформаций сошлось
 python cluster/resp_cluster.py collect             # заряды -> RESP_chrges_<имя>.json + сравнение с Espaloma
 ```
-Одна модификация - одна задача SLURM (по умолчанию 24 ядра, 32 ГБ, 8 часов): 6 конформаций
+Одна модификация - одна задача SLURM (по умолчанию 24 ядра, 30 ГБ, 8 часов, раздел intbio): 6 конформаций
 считаются одновременно по 4 потока. Если задачу оборвёт лимит времени, повторный
 `submit` продолжит с сохранённых геометрий (готовые конформации и расчёты ESP не
 пересчитываются).

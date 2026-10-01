@@ -34,7 +34,8 @@ import ResParTools as pt                          # noqa: E402
 from make_charge_notebooks import PARAMS          # noqa: E402
 
 LYSINES = [f for f in PARAMS if f.startswith('Lysine_')]
-SLURM = dict(cpus=24, mem='32G', time_limit='08:00:00', partition=None)
+# кластер intbio: один раздел, узлы от 24 ядер и 31871 МБ (32G не помещается)
+SLURM = dict(cpus=24, mem='30G', time_limit='08:00:00', partition='intbio')
 
 
 def _residue(folder):
