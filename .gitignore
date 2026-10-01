@@ -10,3 +10,6 @@ __pycache__/
 
 # Логи отладки ResParTools (pt.start_log)
 logs/
+
+# Расчёты RESP (psi4/psiresp): большие файлы, в git не хранятся
+RESP_data/

@@ -41,6 +41,8 @@ from .utils import format_time, print_red, _PACKAGE_ROOT
 AMBER_BACKBONE_CONFORMATIONS = {'alphaR': (-60.0, -40.0), 'beta': (-120.0, 130.0)}
 RESP_CONTEXTS = ('capped', 'trimer')
 RESP_RUN_MODES = ('local', 'slurm', 'prepare')
+# активация окружения в задаче SLURM (неинтерактивный bash: conda.sh подключается явно)
+CLUSTER_ENV_SETUP = 'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate darwin_resp'
 SPEC_FILE = 'spec.json'
 # запуск модуля из командной строки (python -m respartools.resp даёт RuntimeWarning, т.к.
 # пакет уже импортирует resp)
@@ -710,7 +712,7 @@ def load_resp_result(folder):
 
 
 def write_slurm_script(folder, cpus=24, mem='32G', time_limit='08:00:00', n_parallel=None,
-                       partition=None, env_setup='conda activate darwin_resp'):
+                       partition=None, env_setup=CLUSTER_ENV_SETUP):
     """
     Пишет <папка задачи>/run_resp.sbatch. Ресурсы делятся между конформациями:
     n_parallel одновременно (по умолчанию - число конформаций, но не больше cpus),
@@ -747,6 +749,65 @@ def write_slurm_script(folder, cpus=24, mem='32G', time_limit='08:00:00', n_para
     return path
 
 
+_BENCH_SCRIPT = """import json, sys, time, glob, os
+import psi4
+spec = json.load(open('cluster_test/spec.json'))
+start = sorted(glob.glob('cluster_test/conformers/*/start.xyz'))[0]
+lines = open(start).read().split('\\n')[2:2 + len(spec['symbols'])]
+geom = '\\n'.join(lines)
+out = open('bench.txt', 'w')
+for n in [int(x) for x in sys.argv[1:]]:
+    psi4.core.clean()
+    psi4.set_num_threads(n)
+    psi4.set_memory('4 GB')
+    psi4.core.set_output_file(f'bench_{n}.out', False)
+    mol = psi4.geometry(f"{spec['total_charge']} 1\\n{geom}\\nsymmetry c1\\nno_com\\nno_reorient")
+    t = time.time()
+    psi4.gradient('hf/6-31g*', molecule=mol)
+    msg = f'градиент HF/6-31G*, {len(spec["symbols"])} атомов, {n} потоков: {time.time() - t:.1f} с'
+    print(msg, flush=True)
+    out.write(msg + '\\n'); out.flush()
+"""
+
+
+@logged
+def prepare_cluster_check(residue_chem, constraints, folder='RESP_data/cluster_check', cpus=24, mem='32G',
+                          time_limit='01:00:00', partition=None, env_setup=CLUSTER_ENV_SETUP):
+    """
+    Готовит проверку кластера: папка с run_check.sbatch, который на узле
+    1) замеряет градиент psi4 HF/6-31G* для кэпированного остатка на 1, cpus/4, cpus/2 и cpus
+       потоках (bench.txt) - видно, ускоряют ли ядра узла расчёт;
+    2) выполняет маленькую задачу RESP целиком (HF/STO-3G, одна конформация) - проверка,
+       что окружение, psi4, psiresp и пакет работают на кластере.
+    Отправка: cd <папка> && sbatch run_check.sbatch. Результат: bench.txt, slurm_*.out,
+    cluster_test/result.json.
+    """
+    folder = os.path.abspath(folder)
+    os.makedirs(folder, exist_ok=True)
+    prepare_resp_job(residue_chem, constraints, 'cluster_test', working_dir=folder,
+                     fix_backbone=[(-60.0, -40.0)], n_sidechain=1, conformer_pool=50, basis='sto-3g')
+    with open(os.path.join(folder, 'bench.py'), 'w') as f:
+        f.write(_BENCH_SCRIPT)
+    threads = sorted({1, max(1, cpus // 4), max(1, cpus // 2), cpus})
+    root = os.path.relpath(_PACKAGE_ROOT, folder)
+    lines = ['#!/bin/bash', '#SBATCH --job-name=resp_check', '#SBATCH --nodes=1', '#SBATCH --ntasks=1',
+             f'#SBATCH --cpus-per-task={cpus}', f'#SBATCH --mem={mem}', f'#SBATCH --time={time_limit}',
+             '#SBATCH --output=slurm_%j.out']
+    if partition:
+        lines.append(f'#SBATCH --partition={partition}')
+    lines += ['', 'cd "$SLURM_SUBMIT_DIR"', env_setup,
+              f'export PYTHONPATH="$SLURM_SUBMIT_DIR/{root}:$PYTHONPATH"',
+              'echo "узел: $(hostname), ядер: $(nproc), python: $(which python)"',
+              f'python bench.py {" ".join(map(str, threads))}',
+              f'python -c "{_WORKER}" cluster_test --threads {cpus} --parallel 1 --memory 8GB', '']
+    path = os.path.join(folder, 'run_check.sbatch')
+    with open(path, 'w') as f:
+        f.write('\n'.join(lines))
+    print(f'Проверка кластера: {path}. Отправка: cd {folder} && sbatch run_check.sbatch '
+          f'(замер {threads} потоков и пробная задача RESP).')
+    return path
+
+
 @logged
 def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP_data',
                  context='capped', context_chem=None, fix_backbone=True, n_sidechain=3,
@@ -770,7 +831,7 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
         n_threads, n_parallel, memory - ресурсы для run='local': потоков на один psi4,
             одновременных расчётов, память на один psi4
         slurm (dict) - для run='slurm': cpus, mem, time_limit, partition, env_setup
-            (по умолчанию 24 ядра, 32G, 8 часов, conda activate darwin_resp)
+            (по умолчанию 24 ядра, 32G, 8 часов, окружение darwin_resp - CLUSTER_ENV_SETUP)
         **qm_options - method='hf', basis='6-31g*', g_convergence='gau', opt_chunk=50,
             max_opt_steps=400, scf_type='df' (opt_chunk - шагов оптимизации между сохранениями геометрии)
     Возвращает:
