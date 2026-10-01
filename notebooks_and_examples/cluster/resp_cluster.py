@@ -49,6 +49,11 @@ def _residue(folder):
     return mon, residue, constraints
 
 
+def _monomer(folder):
+    """Мономер шага 1 - источник стереохимии для RESP (capped_monomer)."""
+    return list(pt.file_opener(os.path.join(ROOT, folder, PARAMS[folder]['monomer_file'])).values())[0]
+
+
 def _job_dir(folder, mon):
     return os.path.join(ROOT, folder, 'RESP_data', f'{mon}_capped')
 
@@ -57,7 +62,7 @@ def cmd_check(args):
     mon, residue, constraints = _residue('Lysine_Formyl')
     folder = os.path.join(ROOT, 'RESP_data', 'cluster_check')
     pt.prepare_cluster_check(residue, constraints, folder=folder, cpus=args.cpus, mem=args.mem,
-                             partition=args.partition)
+                             partition=args.partition, monomer=_monomer('Lysine_Formyl'))
     if args.submit:
         _sbatch(folder, 'run_check.sbatch')
 
@@ -68,7 +73,7 @@ def cmd_prepare(args):
         print(f'\n===== {folder}')
         job = pt.prepare_resp_job(residue, constraints, f'{mon}_capped',
                                   working_dir=os.path.join(ROOT, folder, 'RESP_data'),
-                                  fix_backbone=True, n_sidechain=3)
+                                  fix_backbone=True, n_sidechain=3, monomer=_monomer(folder))
         pt.write_slurm_script(job, cpus=args.cpus, mem=args.mem, partition=args.partition,
                               time_limit=args.time)
 

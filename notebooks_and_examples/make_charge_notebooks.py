@@ -33,8 +33,6 @@ _DYE = dict(parent_residue='C', naming='index', resp_run='slurm')
 PARAMS = {
     'AF_546_cys': dict(PTM_name='C_AF546', base_name='546', monomer_file='molecules/C_AF_546.smiles',
                        trimer_file='molecules/ACA_AF_546.smiles', **_DYE),
-    'AF_546_rec': dict(PTM_name='C_AF546', base_name='C546', monomer_file='molecules/C_AF_546.smiles',
-                       trimer_file='molecules/ACA_AF_546.smiles', **_DYE),
     'AF_647_cys': dict(PTM_name='AF_647', base_name='647', monomer_file='molecules/AF_647.smiles',
                        trimer_file='molecules/ACA_AF_647.smiles', **_DYE),
     'Lysine_1M': dict(PTM_name='Lysine_1M', base_name='K1M', monomer_file='molecules/Lysine_1M.smiles',

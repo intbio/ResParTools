@@ -166,6 +166,172 @@ def map_residue_to_context(residue_chem, context_chem):
 
 
 # -----------------------------------------------------------------------------
+# Стереохимия: кэпированный мономер из исходного SMILES
+# -----------------------------------------------------------------------------
+
+def _plain_graph(mol):
+    """Граф без порядков связей, ароматичности, зарядов и стереохимии - для сопоставления атомов."""
+    rw = Chem.RWMol(mol)
+    for b in rw.GetBonds():
+        b.SetBondType(Chem.BondType.SINGLE)
+        b.SetIsAromatic(False)
+        b.SetStereo(Chem.BondStereo.STEREONONE)
+    for a in rw.GetAtoms():
+        a.SetIsAromatic(False)
+        a.SetFormalCharge(0)
+        a.SetNoImplicit(True)
+        a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+    out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    return out
+
+
+def _resolve_stereo(mol, ca_config='L', stereo_default='R', random_seed=42):
+    """
+    Все стереоцентры получают конфигурацию: CA - ca_config (по протоколу L), уже заданные
+    центры и двойные связи сохраняются, незаданные центры - stereo_default (функция
+    перечисляет их). Конфигурации берутся из 3D-структуры set_mol_coords (с проверкой).
+    """
+    probe = Chem.Mol(mol)
+    set_mol_coords(probe, coords='3D', ca_config=ca_config, stereo_default=stereo_default,
+                   random_seed=random_seed)
+    Chem.AssignStereochemistryFrom3D(probe)
+    probe.RemoveAllConformers()
+    return probe
+
+
+def capped_monomer(monomer, ca_config='L', stereo_default='R', random_seed=42):
+    """
+    Кэпированный мономер ACE-X-NME из SMILES мономера (шаг 1): один водород азота остова
+    заменяется ацетилом, водород / OH / O- на углероде остова - группой NH-CH3.
+    Стереоцентры и стереохимия двойных связей мономера сохраняются; CA - ca_config
+    (по протоколу L, если во входе другая - функция сообщает), незаданные центры -
+    stereo_default (см. _resolve_stereo).
+
+    Аргументы:
+        monomer (Chem.Mol) - мономер (с явными или неявными водородами)
+    Возвращает:
+        Chem.Mol с явными водородами и заданной стереохимией (без координат)
+    """
+    mol = Chem.RemoveHs(Chem.Mol(monomer))
+    patt = Chem.MolFromSmarts('[NX3;!$(N-C=O)]-[CX4]-[CX3](=[OX1])')
+    hits = [h for h in mol.GetSubstructMatches(patt)
+            if mol.GetAtomWithIdx(h[0]).GetTotalNumHs() >= 1 and mol.GetAtomWithIdx(h[1]).GetTotalNumHs() >= 1]
+    if len(hits) != 1:
+        raise ValueError(f'Остов аминокислоты (H-N-CA(H)-C=O) в мономере найден {len(hits)} раз: '
+                         'кэпы не пристраиваются.')
+    n_idx, ca_idx, c_idx, o_idx = hits[0]
+    c_atom = mol.GetAtomWithIdx(c_idx)
+    leaving = [a.GetIdx() for a in c_atom.GetNeighbors() if a.GetIdx() not in (ca_idx, o_idx)]
+    if len(leaving) > 1 or (leaving and mol.GetAtomWithIdx(leaving[0]).GetAtomicNum() != 8):
+        raise ValueError('C-конец мономера не CHO / COOH / COO-: кэп NME не пристраивается.')
+
+    rw = Chem.RWMol(mol)
+
+    def take_h(idx):
+        atom = rw.GetAtomWithIdx(idx)
+        if atom.GetNumExplicitHs() > 0:
+            atom.SetNumExplicitHs(atom.GetNumExplicitHs() - 1)
+        atom.SetNoImplicit(False)
+
+    ace_c = rw.AddAtom(Chem.Atom(6))
+    ace_o = rw.AddAtom(Chem.Atom(8))
+    ace_ch3 = rw.AddAtom(Chem.Atom(6))
+    rw.AddBond(ace_c, ace_o, Chem.BondType.DOUBLE)
+    rw.AddBond(ace_c, ace_ch3, Chem.BondType.SINGLE)
+    take_h(n_idx)
+    rw.AddBond(n_idx, ace_c, Chem.BondType.SINGLE)
+    nme_n = rw.AddAtom(Chem.Atom(7))
+    nme_ch3 = rw.AddAtom(Chem.Atom(6))
+    rw.AddBond(nme_n, nme_ch3, Chem.BondType.SINGLE)
+    if leaving:
+        rw.RemoveBond(c_idx, leaving[0])
+    else:
+        take_h(c_idx)
+    rw.AddBond(c_idx, nme_n, Chem.BondType.SINGLE)
+    if leaving:
+        rw.RemoveAtom(leaving[0])   # O (с его водородом) от COOH / COO-
+    capped = rw.GetMol()
+    Chem.SanitizeMol(capped)
+    capped = Chem.AddHs(capped)
+    return _resolve_stereo(capped, ca_config=ca_config, stereo_default=stereo_default,
+                           random_seed=random_seed)
+
+
+def _with_reference_stereo(capped_res, reference):
+    """
+    Молекула расчёта с порядком атомов и именами кэпированного остатка (cap_residue) и
+    стереохимией reference (capped_monomer): reference перенумеровывается по сопоставлению
+    графов (RenumberAtoms сохраняет стереохимию). Ошибка, если графы или заряды атомов разные.
+    """
+    if reference.GetNumAtoms() != capped_res.GetNumAtoms():
+        raise ValueError(f'Кэпированный мономер ({reference.GetNumAtoms()} атомов) не совпадает '
+                         f'с кэпированным остатком шага 4 ({capped_res.GetNumAtoms()} атомов).')
+    match = _plain_graph(reference).GetSubstructMatch(_plain_graph(capped_res))
+    if not match:
+        raise ValueError('Граф кэпированного мономера не совпадает с остатком шага 4.')
+    mol = Chem.RenumberAtoms(reference, list(match))
+    if Chem.GetFormalCharge(mol) != Chem.GetFormalCharge(capped_res):
+        raise ValueError(f'Заряд кэпированного мономера {Chem.GetFormalCharge(mol):+d} не равен заряду '
+                         f'остатка шага 4 {Chem.GetFormalCharge(capped_res):+d}.')
+    # формальный заряд может стоять на разных равноценных атомах (O- сульфо- и карбоксилатных
+    # групп - резонансные формы); допустимо только внутри класса симметрии графа
+    ranks = list(Chem.CanonicalRankAtoms(_plain_graph(mol), breakTies=False))
+    diff = defaultdict(lambda: [[], []])
+    for i in range(mol.GetNumAtoms()):
+        q_mol, q_res = mol.GetAtomWithIdx(i).GetFormalCharge(), capped_res.GetAtomWithIdx(i).GetFormalCharge()
+        if q_mol != q_res:
+            diff[ranks[i]][0].append(q_mol)
+            diff[ranks[i]][1].append(q_res)
+    bad = [r for r, (a_, b_) in diff.items() if sorted(a_) != sorted(b_)]
+    if bad:
+        raise ValueError('Формальные заряды мономера и остатка шага 4 различаются не только между '
+                         'равноценными атомами.')
+    for atom, src in zip(mol.GetAtoms(), capped_res.GetAtoms()):
+        if src.HasProp('AtomName'):
+            atom.SetProp('AtomName', src.GetProp('AtomName'))
+        if src.GetPDBResidueInfo() is not None:
+            atom.SetMonomerInfo(src.GetPDBResidueInfo())
+    for prop in ('CapAtoms', 'BackboneDihedrals'):
+        mol.SetProp(prop, capped_res.GetProp(prop))
+    return mol
+
+
+def _stereo_labels(mol):
+    """
+    Метки CIP по тегам молекулы (новый алгоритм): {индекс атома: 'R'/'S'} и
+    {('связь', атом1, атом2): 'E'/'Z'} для двойных связей с заданной стереохимией.
+    """
+    from rdkit.Chem import rdCIPLabeler
+    probe = Chem.Mol(mol)
+    rdCIPLabeler.AssignCIPLabels(probe)
+    labels = {a.GetIdx(): a.GetProp('_CIPCode') for a in probe.GetAtoms() if a.HasProp('_CIPCode')}
+    for bond in probe.GetBonds():
+        if bond.HasProp('_CIPCode'):
+            key = ('связь',) + tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
+            labels[key] = bond.GetProp('_CIPCode')
+    return labels
+
+
+def _check_conformer_stereo(mol, conf_ids, reference_labels):
+    """Каждая конформация: R/S всех центров как у reference_labels (по 3D-координатам)."""
+    bad = {}
+    for cid in conf_ids:
+        probe = Chem.Mol(mol)
+        conf = Chem.Conformer(mol.GetConformer(cid))
+        probe.RemoveAllConformers()
+        probe.AddConformer(conf, assignId=True)
+        Chem.AssignStereochemistryFrom3D(probe)
+        got = _stereo_labels(probe)
+        diff = {i: (reference_labels[i], got.get(i)) for i in reference_labels if got.get(i) != reference_labels[i]}
+        if diff:
+            bad[cid] = diff
+    if bad:
+        raise ValueError(f'Стереохимия конформаций не совпала с заданной (конформация: '
+                         f'{{атом: (задано, получено)}}): {bad}')
+
+
+# -----------------------------------------------------------------------------
 # Конформации
 # -----------------------------------------------------------------------------
 
@@ -336,10 +502,12 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
                      context_chem=None, fix_backbone=True, n_sidechain=3, conformer_pool=300,
                      energy_window=10.0, exclude_contacts=True, random_seed=42, method='hf',
                      basis='6-31g*', g_convergence='gau', opt_chunk=50, max_opt_steps=400,
-                     scf_type='df'):
+                     scf_type='df', monomer=None):
     """
     Готовит папку задачи RESP: молекула расчёта, конформации, ограничения, настройки
     (spec.json). Квантовая химия не запускается. Параметры - см. resp_charges.
+    monomer (Chem.Mol) - мономер шага 1: из него берётся стереохимия (capped_monomer);
+        без него (остаток шага 4 - 2D, без стереохимии) CA задаётся L, остальные центры - R.
     Возвращает путь к папке задачи.
     """
     if context not in RESP_CONTEXTS:
@@ -347,7 +515,13 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
     n_res = residue_chem.GetNumAtoms()
     residue_charge = Chem.GetFormalCharge(residue_chem)
     if context == 'capped':
-        mol = cap_residue(residue_chem)
+        capped_res = cap_residue(residue_chem)
+        if monomer is not None:
+            mol = _with_reference_stereo(capped_res, capped_monomer(monomer, random_seed=random_seed))
+        else:
+            print_red('⚠ monomer не передан: стереохимия остатка шага 4 не задана, CA - L, '
+                      'остальные стереоцентры - R (передайте monomer из шага 1).')
+            mol = _with_reference_stereo(capped_res, _resolve_stereo(capped_res, random_seed=random_seed))
         mapping = list(range(n_res))
         dihedrals = json.loads(mol.GetProp('BackboneDihedrals'))
         caps = json.loads(mol.GetProp('CapAtoms'))
@@ -359,7 +533,7 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
     else:
         if context_chem is None:
             raise ValueError("context='trimer': передайте context_chem (тример шага 1).")
-        mol = Chem.Mol(context_chem)
+        mol = _resolve_stereo(Chem.Mol(context_chem), random_seed=random_seed)
         mapping = map_residue_to_context(residue_chem, context_chem)
         dihedrals = context_backbone_dihedrals(context_chem, mapping, residue_chem)
         fixed = {mapping[int(i)]: float(q) for i, q in constraints.items()}
@@ -368,6 +542,12 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
                                           n_sidechain=n_sidechain, pool=conformer_pool,
                                           energy_window=energy_window,
                                           exclude_contacts=exclude_contacts, random_seed=random_seed)
+    labels = _stereo_labels(mol)
+    _check_conformer_stereo(conf_mol, [d['conf_id'] for d in described], labels)
+    n_bonds = sum(1 for k in labels if isinstance(k, tuple))
+    print(f'Стереохимия конформаций проверена: центров {len(labels) - n_bonds} (R/S), двойных связей '
+          f'{n_bonds} (E/Z) - как задано'
+          + (', CA - L' if context == 'capped' else ''))
     ranks = list(Chem.CanonicalRankAtoms(conf_mol, breakTies=False))
     eq = defaultdict(list)
     for idx, rank in enumerate(ranks):
@@ -772,7 +952,7 @@ for n in [int(x) for x in sys.argv[1:]]:
 
 @logged
 def prepare_cluster_check(residue_chem, constraints, folder='RESP_data/cluster_check', cpus=24, mem='32G',
-                          time_limit='01:00:00', partition=None, env_setup=CLUSTER_ENV_SETUP):
+                          time_limit='01:00:00', partition=None, env_setup=CLUSTER_ENV_SETUP, monomer=None):
     """
     Готовит проверку кластера: папка с run_check.sbatch, который на узле
     1) замеряет градиент psi4 HF/6-31G* для кэпированного остатка на 1, cpus/4, cpus/2 и cpus
@@ -785,7 +965,8 @@ def prepare_cluster_check(residue_chem, constraints, folder='RESP_data/cluster_c
     folder = os.path.abspath(folder)
     os.makedirs(folder, exist_ok=True)
     prepare_resp_job(residue_chem, constraints, 'cluster_test', working_dir=folder,
-                     fix_backbone=[(-60.0, -40.0)], n_sidechain=1, conformer_pool=50, basis='sto-3g')
+                     fix_backbone=[(-60.0, -40.0)], n_sidechain=1, conformer_pool=50, basis='sto-3g',
+                     monomer=monomer)
     with open(os.path.join(folder, 'bench.py'), 'w') as f:
         f.write(_BENCH_SCRIPT)
     threads = sorted({1, max(1, cpus // 4), max(1, cpus // 2), cpus})
@@ -856,7 +1037,8 @@ def _run_resp_job_external(folder, python, n_threads, n_parallel, memory):
 def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP_data',
                  context='capped', context_chem=None, fix_backbone=True, n_sidechain=3,
                  conformer_pool=300, energy_window=10.0, exclude_contacts=True, random_seed=42,
-                 n_threads=4, n_parallel=1, memory='4 GB', slurm=None, resp_python=None, **qm_options):
+                 n_threads=4, n_parallel=1, memory='4 GB', slurm=None, resp_python=None, monomer=None,
+                 **qm_options):
     """
     Заряды RESP для остатка шага 4 (шаг 6) - с теми же входными данными, что Espaloma.
 
@@ -874,6 +1056,7 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
             (см. resp_conformers)
         n_threads, n_parallel, memory - ресурсы для run='local': потоков на один psi4,
             одновременных расчётов, память на один psi4
+        monomer (Chem.Mol) - мономер шага 1: источник стереохимии (см. capped_monomer)
         resp_python (str) - Python окружения с psi4/psiresp для run='local'; по умолчанию
             текущее, если в нём есть psiresp, иначе darwin_resp рядом с текущим окружением
         slurm (dict) - для run='slurm': cpus, mem, time_limit, partition, env_setup
@@ -889,7 +1072,7 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
                               context=context, context_chem=context_chem, fix_backbone=fix_backbone,
                               n_sidechain=n_sidechain, conformer_pool=conformer_pool,
                               energy_window=energy_window, exclude_contacts=exclude_contacts,
-                              random_seed=random_seed, **qm_options)
+                              random_seed=random_seed, monomer=monomer, **qm_options)
     if run == 'prepare':
         print("run='prepare': квантовая химия не запускалась.")
         return folder
@@ -935,7 +1118,7 @@ def _main(argv=None):
 
 # Импорт из других модулей пакета - в конце файла (см. CLAUDE.md, правило импортов).
 from .charges import read_rtp_charges  # noqa: E402
-from .residue import find_backbone_match  # noqa: E402
+from .residue import find_backbone_match, set_mol_coords  # noqa: E402
 
 if __name__ == '__main__':
     _main()
