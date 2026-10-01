@@ -808,11 +808,55 @@ def prepare_cluster_check(residue_chem, constraints, folder='RESP_data/cluster_c
     return path
 
 
+def _resp_python(resp_python=None):
+    """
+    Python окружения с psi4 и psiresp. Текущий, если они в нём есть; иначе окружение
+    darwin_resp рядом с текущим (anaconda3/envs/darwin_resp) - так ноутбук может работать
+    в darwin_ec (Espaloma), а RESP считаться в darwin_resp.
+    """
+    if resp_python:
+        return resp_python
+    try:
+        import psiresp  # noqa: F401
+        import psi4  # noqa: F401
+        return sys.executable
+    except ImportError:
+        pass
+    envs = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
+    candidate = os.path.join(envs, 'darwin_resp', 'bin', 'python')
+    if os.path.exists(candidate):
+        return candidate
+    raise ImportError('Нет psi4/psiresp: создайте окружение darwin_resp '
+                      '(conda env create -n darwin_resp -f psiresp_min.yml) или передайте resp_python.')
+
+
+def _run_resp_job_external(folder, python, n_threads, n_parallel, memory):
+    """run_resp_job в другом окружении (python): вывод процесса печатается по мере выполнения."""
+    env = dict(os.environ)
+    env['PATH'] = os.path.dirname(python) + os.pathsep + env.get('PATH', '')
+    env['PYTHONPATH'] = _PACKAGE_ROOT + os.pathsep + env.get('PYTHONPATH', '')
+    env['PYTHONUNBUFFERED'] = '1'
+    print(f'RESP считается в окружении {os.path.basename(os.path.dirname(os.path.dirname(python)))} '
+          f'({python})')
+    cmd = [python, '-c', _WORKER, folder, '--threads', str(n_threads), '--parallel', str(n_parallel),
+           '--memory', memory.replace(' ', '')]
+    noise = ('Warning', 'warn(', 'it/s]', 'forrtl', 'Image ', 'Unknown', 'dgstrf')
+    with subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+        for line in proc.stdout:
+            if not any(n in line for n in noise) and line.strip():
+                print(line.rstrip())
+        proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f'Расчёт RESP завершился ошибкой (код {proc.returncode}): см. вывод выше '
+                           f'и файлы в {folder}. Повторный запуск продолжит с готовых конформаций.')
+    return load_resp_result(folder)
+
+
 @logged
 def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP_data',
                  context='capped', context_chem=None, fix_backbone=True, n_sidechain=3,
                  conformer_pool=300, energy_window=10.0, exclude_contacts=True, random_seed=42,
-                 n_threads=4, n_parallel=1, memory='4 GB', slurm=None, **qm_options):
+                 n_threads=4, n_parallel=1, memory='4 GB', slurm=None, resp_python=None, **qm_options):
     """
     Заряды RESP для остатка шага 4 (шаг 6) - с теми же входными данными, что Espaloma.
 
@@ -830,6 +874,8 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
             (см. resp_conformers)
         n_threads, n_parallel, memory - ресурсы для run='local': потоков на один psi4,
             одновременных расчётов, память на один psi4
+        resp_python (str) - Python окружения с psi4/psiresp для run='local'; по умолчанию
+            текущее, если в нём есть psiresp, иначе darwin_resp рядом с текущим окружением
         slurm (dict) - для run='slurm': cpus, mem, time_limit, partition, env_setup
             (по умолчанию 24 ядра, 32G, 8 часов, окружение darwin_resp - CLUSTER_ENV_SETUP)
         **qm_options - method='hf', basis='6-31g*', g_convergence='gau', opt_chunk=50,
@@ -847,10 +893,29 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
     if run == 'prepare':
         print("run='prepare': квантовая химия не запускалась.")
         return folder
+    return run_resp(folder, run=run, n_threads=n_threads, n_parallel=n_parallel, memory=memory,
+                    slurm=slurm, resp_python=resp_python)
+
+
+@logged
+def run_resp(folder, run='local', n_threads=4, n_parallel=1, memory='4 GB', slurm=None, resp_python=None):
+    """
+    Запуск подготовленной задачи RESP (prepare_resp_job).
+        run='local' - считать на этой машине: в текущем окружении, если в нём есть psiresp,
+            иначе в darwin_resp (отдельный процесс, ход расчёта печатается); возвращает заряды
+        run='slurm' - написать run_resp.sbatch (параметры slurm: cpus, mem, time_limit,
+            partition, env_setup); возвращает путь к папке, заряды потом - load_resp_result
+    Повторный запуск продолжает с готовых конформаций и расчётов ESP.
+    """
     if run == 'slurm':
         write_slurm_script(folder, **(slurm or {}))
         return folder
-    return run_resp_job(folder, n_threads=n_threads, n_parallel=n_parallel, memory=memory)
+    if run != 'local':
+        raise ValueError(f"run='{run}': допустимо 'local' или 'slurm'")
+    python = _resp_python(resp_python)
+    if python == sys.executable:
+        return run_resp_job(folder, n_threads=n_threads, n_parallel=n_parallel, memory=memory)
+    return _run_resp_job_external(os.path.abspath(folder), python, n_threads, n_parallel, memory)
 
 
 def _main(argv=None):

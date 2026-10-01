@@ -119,3 +119,42 @@ def make_substructure_charge_list(pol_name, charge_array, match_dict, ):
         monomer_charge[monomer_index] = charge_array[polymer_index]
     monomer_charge = np.array(monomer_charge).round(4)
     return monomer_charge
+
+def group_charges(mol, charges):
+    """
+    Заряды групп: тяжёлый атом вместе со своими водородами (CH2, NH3 и т.п.). По ним удобно
+    сравнивать схемы зарядов: AM1-BCC и RESP по-разному делят заряд внутри группы.
+    Возвращает {имя тяжёлого атома (или индекс): заряд группы} в порядке атомов.
+    """
+    if len(charges) != mol.GetNumAtoms():
+        raise ValueError(f'Зарядов {len(charges)}, атомов {mol.GetNumAtoms()}')
+    groups = {}
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 1:
+            continue
+        q = float(charges[atom.GetIdx()]) + sum(float(charges[n.GetIdx()]) for n in atom.GetNeighbors()
+                                                 if n.GetAtomicNum() == 1)
+        name = atom.GetProp('AtomName') if atom.HasProp('AtomName') else str(atom.GetIdx())
+        groups[name] = q
+    return groups
+
+
+@logged
+def compare_charges(mol, charge_sets, top=10):
+    """
+    Сравнивает наборы зарядов одного остатка ({'Espaloma': q1, 'RESP': q2, ...}) по группам
+    (group_charges): печатает суммы, среднее и наибольшие расхождения групп между первым
+    и остальными наборами. Возвращает {набор: {группа: заряд}}.
+    """
+    names = list(charge_sets)
+    tables = {n: group_charges(mol, q) for n, q in charge_sets.items()}
+    ref = names[0]
+    for n in names:
+        print(f'{n}: сумма {sum(float(x) for x in charge_sets[n]):+.4f}')
+    for n in names[1:]:
+        diff = {g: tables[n][g] - tables[ref][g] for g in tables[ref]}
+        mean = sum(abs(d) for d in diff.values()) / len(diff)
+        worst = sorted(diff, key=lambda g: -abs(diff[g]))[:top]
+        print(f'{n} - {ref}: среднее |разница групп| {mean:.3f} e; наибольшие: '
+              + ', '.join(f'{g} {tables[ref][g]:+.2f} -> {tables[n][g]:+.2f}' for g in worst))
+    return tables
