@@ -13,3 +13,7 @@ logs/
 
 # Расчёты RESP (psi4/psiresp): большие файлы, в git не хранятся
 RESP_data/
+
+# Служебные файлы psi4
+timer.dat
+psi.*.clean
