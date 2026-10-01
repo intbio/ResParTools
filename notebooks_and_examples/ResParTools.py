@@ -539,28 +539,23 @@ def _logged_call(func, signature, args, kwargs):
 def get_name(path: str, index=0):
     """
     Аргумент: 
-        path - строка с путем к файлу
+        path - строка с путем к файлу или строка SMILES
     Возвращает:
-        Имя для ключа в словаре 
+        Имя для ключа в словаре: для SMILES - index, для пути - имя файла без расширения
     """
-    # Сохраняем текущий stderr
-    original_stderr = sys.stderr
+    from rdkit import rdBase
+    # проверка «это SMILES?» не должна печатать ошибки разбора RDKit для путей к файлам
+    # (RDKit пишет их в C++ stderr, перенаправление sys.stderr их не скрывает)
+    blocker = rdBase.BlockLogs()
     try:
-        sys.stderr = open(os.devnull, 'w')
         mol = Chem.MolFromSmiles(path)
-        if mol:
-            return index
-        else:
-            name_of_file = os.path.basename(path).split('.')[0]
-            return name_of_file
-    except Exception as e:
-        print(f"Ошибка при обработке '{path}': {e}")
-        return None
     finally:
-        # Возвращаем stderr на исходное место
-        sys.stderr = original_stderr
-        
-        
+        del blocker
+    if mol:
+        return index
+    return os.path.basename(path).split('.')[0]
+
+
 ## Дектораторы
 def data_to_dict(funсtion: Callable):
     '''
@@ -1502,7 +1497,6 @@ def match_chem_v6(
         Атом i подструктуры "H" соответствует i-й паре в "Indexes".
         Если сопоставление не найдено, возвращает (None, None).
     """
-    import threading
     import warnings
     from rdkit import Chem
     from rdkit.Chem import rdFMCS
@@ -2994,8 +2988,8 @@ def hdb_generator(mol_chem, resname='MOD', resid=1, segid='A'):
             elif n_hydrogens == 1 and n_heavy_neighbors == 1:
                 geom_n = 2  # sp3 углерод с 1 протоном
             else:
-                print(f"Не учтенный вариант {atom.GetProp('AtomName')}:",
-                     f"{name}, {hyb}, {n_hydrogens}, {n_heavy_neighbors}", sep='\n')
+                print(f"Не учтенный вариант {current_atom_name}:",
+                     f"{hyb}, {n_hydrogens}, {n_heavy_neighbors}", sep='\n')
                 geom_n = '-'
         elif hyb == Chem.HybridizationType.SP2:
             if n_hydrogens == 1 and n_heavy_neighbors == 2:
@@ -3005,8 +2999,8 @@ def hdb_generator(mol_chem, resname='MOD', resid=1, segid='A'):
             elif n_hydrogens == 1 and n_heavy_neighbors == 1:
                 geom_n = 2
             else:
-                print(f"Не учтенный вариант {atom.GetProp('AtomName')}:",
-                     f"{name}, {hyb}, {n_hydrogens}, {n_heavy_neighbors}", sep='\n')
+                print(f"Не учтенный вариант {current_atom_name}:",
+                     f"{hyb}, {n_hydrogens}, {n_heavy_neighbors}", sep='\n')
                 geom_n = '-'
         else:
             if protons:
@@ -3173,7 +3167,7 @@ def smi_to_mol2(smi_input, output_format, file_name=None, addh=True):
 
     # Read SMI string from file or argument
     if smi_input.lower().endswith('.smi') or smi_input.lower().endswith('.smiles') :
-        smi_str = open_smi(smi_input) 
+        smi_str = next(iter(read_file(smi_input).values()))
     else:
         smi_str = smi_input.strip()
         if file_name is None:
@@ -3183,6 +3177,7 @@ def smi_to_mol2(smi_input, output_format, file_name=None, addh=True):
     print(f"Current molecule: {smi_str}")
 
     # Create molecule, add hydrogens, and generate 3D coordinates
+    from openbabel import pybel  # openbabel нужен только этой функции
     mol = pybel.readstring("smi", smi_str)
     if  addh:
         mol.addh()
@@ -3647,3 +3642,25 @@ def add_protons_and_renumber_H(modifie_residue, resname='MOD', resid=1, segid='A
         print_green('Все атомы со стандартной валентностью, водороды не добавлены.')
     log_note('добавленные водороды', added={i: r for i, r in zip(added, report)})
     return H_modifie_residue
+
+
+# =============================================================================
+# УДАЛЁННЫЕ ФУНКЦИИ
+# Вызываются в старых ноутбуках, но их кода нет ни в модуле, ни в истории git.
+# Повторить старое поведение нельзя, поэтому функции сообщают, чем их заменить.
+# =============================================================================
+
+def renumber_amino_acid_atoms(*args, **kwargs):
+    """Удалена. Замена: renumber_residue_atoms(mol, ref_base_name=<родительский остаток>)."""
+    raise NotImplementedError(
+        'renumber_amino_acid_atoms удалена (кода нет в репозитории). Замена: '
+        "pt.renumber_residue_atoms(mol, ref_base_name='K') - перенумерация по шаблону "
+        'родительского остатка, см. шаг 3.1 нового 1_charge_calculation.ipynb.')
+
+
+def save_substructure_mol(*args, **kwargs):
+    """Удалена. Замена: save_chem_to_pdb и save_chem_to_smiles для match_dict['substructure'][имя]."""
+    raise NotImplementedError(
+        'save_substructure_mol удалена (кода нет в репозитории). Замена: '
+        "pt.save_chem_to_pdb(match_dict['substructure'][mon_name], путь) и "
+        "pt.save_chem_to_smiles(..., atom_map=True), см. шаг 2.2 нового 1_charge_calculation.ipynb.")
