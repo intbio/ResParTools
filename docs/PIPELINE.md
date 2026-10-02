@@ -81,4 +81,8 @@ python -m pytest tests -q                 # ~3 мин, вместе с AF546
 ## Пакет `respartools/`
 `log` (лог `start_log`), `utils`, `fileio`, `draw`, `matching`, `residue`, `forcefield`,
 `charges`, `resp`, `legacy` (старые функции для старых ноутбуков). Ноутбуки подключают его
-как раньше: `import ResParTools as pt`. Правило импортов внутри пакета - в `CLAUDE.md`.
+как раньше: `import ResParTools as pt`.
+
+Правило импортов внутри пакета: `log` и `utils` импортируются в начале модуля (декораторы,
+пути), остальные модули пакета - в **конце** модуля, чтобы взаимные ссылки не ломали импорт.
+Код совместим с Python 3.8 (без `match` и аннотаций `X | Y`).

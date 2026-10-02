@@ -1223,7 +1223,7 @@ def _main(argv=None):
     run_resp_job(args.folder, n_threads=args.threads, n_parallel=args.parallel, memory=args.memory)
 
 
-# Импорт из других модулей пакета - в конце файла (см. CLAUDE.md, правило импортов).
+# Импорт из других модулей пакета - в конце файла (см. docs/PIPELINE.md, правило импортов).
 from .charges import read_rtp_charges  # noqa: E402
 from .residue import find_backbone_match, set_mol_coords  # noqa: E402
 from .draw import draw_molecule  # noqa: E402

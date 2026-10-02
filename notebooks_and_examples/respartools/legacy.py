@@ -211,6 +211,6 @@ def resp_calculation(psiresp_dict, constraints, n_processes=None, folder_name='R
     return job, name_of_system
 
 
-# Импорт из других модулей пакета - в конце файла (см. CLAUDE.md, правило импортов).
+# Импорт из других модулей пакета - в конце файла (см. docs/PIPELINE.md, правило импортов).
 from .fileio import save_aa_chem_to_pdb, save_chem_to_smiles  # noqa: E402
 from .residue import renumber_residue_atoms  # noqa: E402

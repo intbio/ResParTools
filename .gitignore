@@ -17,3 +17,6 @@ RESP_data/
 # Служебные файлы psi4
 timer.dat
 psi.*.clean
+
+# Инструкции для Claude Code: только локально
+CLAUDE.md
