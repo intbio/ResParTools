@@ -40,6 +40,27 @@ flowchart TD
 | 5 | заряды Espaloma, остов N H CA HA C O фиксирован (rtp родителя) | `charge_constraints_from_rtp` (charges), `charge` (espaloma-charge_mod) | `../AI_chrges_<имя>.json` |
 | 6 | заряды RESP (альтернатива 5) | `prepare_resp_job`, `run_resp`, `load_resp_result`, `compare_charges` (resp, charges) | `../RESP_data/<имя>_capped/`, `../RESP_chrges_<имя>.json` |
 
+## Путь без словарей: от SMILES до проверенного поля (ветки 2026-10-10, ещё не в main)
+Данные - в свойствах молекулы (`docs/MOL_PROPS.md`), ноутбук -
+`templates/1_charge_calculation_props.ipynb` (`make_charge_notebooks.py --props`).
+
+| Шаг | Функции | Что пишется в молекулу / файлы |
+|---|---|---|
+| 1 | `open_mol` (fileio) | у атомов `SrcIdx`, у молекулы `ModName`, `SourceFile` |
+| 2 | `find_residue` (matching) | `PolymerIdx`; открытая валентность N и C - неявные H |
+| 3 | `renumber_residue_atoms`, `rdkit_pdb_modification` (residue) | `PrevIdx`, `ParentName`, `AtomName`, `Parent`, `Naming` |
+| 4 | `modifie_residue_info`, `check_duplicate_atom_names` | — |
+| 5/6 | `charge_constraints_from_rtp`, `charge`, `set_charges` (charges); RESP - как выше | `Charge<Метод>`, `ChargeFixed`, `ChargeMethod` |
+| сохранение | `save_mol` / `load_mol` (fileio) | один SDF со всеми свойствами |
+| 2 (acpype) | `run_acpype` (forcefield): водороды для acpype добавляются внутри, заряд из молекулы | `AcpypeType`, `AcpypeItp` |
+| 3 (поле) | `write_forcefield` (forcefield): `assign_types`, `residue_rtp`, `hdb_entries` | `AtomType`, `TypeSource`; `<ResName>.rtp`, `<ResName>.hdb`, `residuetypes.dat`, `atomtypes.atp` |
+| проверка | `write_validate_job`, `run_validate`, `validate_report` (gmx) | ACE-X-NME: pdb2gmx -ignh, grompp, минимизация; `md_ns` - МД в воде |
+
+Правила шага 3: тип родителя сохраняется, если окружение атома то же (элемент, число соседей,
+число H), у водорода - если окружение не изменилось и у соседей его атома; явные параметры
+(из itp acpype, единицы GROMACS) - только для связей, углов, диэдралов, которых нет в
+`ffbonded.itp` по типам. Один парсер rtp - `read_rtp` / `write_rtp` (forcefield).
+
 ## Шаг 6 (RESP) подробно
 Протокол как для зарядов amber ff94/ff14SB/ff19SB (Cornell 1995, Cieplak 1995):
 1. **Молекула** - `capped_monomer`: ACE-X-NME из SMILES мономера, стереохимия мономера
@@ -63,7 +84,8 @@ flowchart TD
 |---|---|---|
 | `darwin_ec` | `ResParTools_ec.yml` | ноутбуки, шаги 1-5 (Espaloma), Python 3.12 |
 | `darwin_resp` | `psiresp_min.yml` (снимок `darwin_resp.lock.yml`) | шаг 6: psi4 1.6.1, psiresp 0.4.2, Python 3.9; тесты |
-| `topmol2` | — (локальное) | шаги 2-3: acpype, parmed, Python 3.8 |
+| `topmol2` | — (локальное) | шаги 2-3: acpype, parmed, Python 3.8; `run_acpype` вызывает acpype отсюда |
+| `gmx` | `conda create -n gmx -c conda-forge gromacs` | проверка поля: GROMACS 2026.3 (`run_validate`) |
 
 Общее окружение `darwin_ec` + `darwin_resp` не собирается: psi4 1.6.1 только для Python ≤ 3.10
 со старыми библиотеками, новые psi4 требуют pydantic 2, а psiresp 0.4.2 - pydantic 1.
@@ -80,7 +102,7 @@ python -m pytest tests -q                 # ~3 мин, вместе с AF546
 
 ## Пакет `respartools/`
 `log` (лог `start_log`), `utils`, `fileio`, `draw`, `matching`, `residue`, `forcefield`,
-`charges`, `resp`, `legacy` (старые функции для старых ноутбуков). Ноутбуки подключают его
+`charges`, `resp`, `gmx` (проверка в GROMACS), `legacy` (старые функции для старых ноутбуков). Ноутбуки подключают его
 как раньше: `import ResParTools as pt`.
 
 Правило импортов внутри пакета: `log` и `utils` импортируются в начале модуля (декораторы,
