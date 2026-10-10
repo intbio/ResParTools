@@ -23,3 +23,6 @@ CLAUDE.md
 
 # Настройки Claude Code этого проекта (плагин ponytail): только локально
 .claude/settings.json
+
+# рабочая папка ночных проверок (новое поле, validate, МД, RESP)
+notebooks_and_examples/build/
