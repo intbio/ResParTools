@@ -1,4 +1,4 @@
-"""Файлы силового поля GROMACS: rtp (read_rtp, write_rtp), hdb, atp, r2b, удаление лишних водородов."""
+"""Файлы силового поля GROMACS: rtp (read_rtp, write_rtp), itp (read_itp), acpype (run_acpype), hdb, atp, r2b."""
 import os
 import sys
 import time
@@ -13,6 +13,7 @@ import numpy as np
 import itertools
 import threading
 import subprocess
+import shutil
 
 from decimal import Decimal as D
 
@@ -304,3 +305,95 @@ def write_rtp(path, residues, bondedtypes=RTP_BONDEDTYPES):
     with open(path, 'w') as file:
         file.writelines(lines)
     return path
+
+
+# -----------------------------------------------------------------------------
+# acpype (шаг 2) и чтение itp
+# -----------------------------------------------------------------------------
+ITP_SECTIONS = ('atoms', 'bonds', 'pairs', 'angles', 'dihedrals')
+
+
+def read_itp(path):
+    """
+    Секции молекулы из .itp GROMACS (acpype): {'atoms': [[поля]], 'bonds': ..., 'dihedrals': ...}.
+    Строка - список полей без комментария; номера атомов - как в файле (с 1). Секций
+    [ dihedrals ] в acpype две (собственные функция 9, несобственные функция 4) - они идут
+    в один список, функция - в 5-м поле.
+    """
+    sections, current = {}, None
+    with open(path) as file:
+        for line in file:
+            text = line.split(';')[0].strip()
+            if not text:
+                continue
+            header = re.fullmatch(r'\[\s*(\S+)\s*\]', text)
+            if header:
+                current = header.group(1) if header.group(1) in ITP_SECTIONS else None
+                if current:
+                    sections.setdefault(current, [])
+                continue
+            if current:
+                sections[current].append(text.split())
+    return sections
+
+
+def _acpype_bin(acpype_bin=None):
+    """acpype: переданный путь, из PATH или из окружения topmol2 рядом с текущим."""
+    if acpype_bin:
+        return acpype_bin
+    found = shutil.which('acpype')
+    if found:
+        return found
+    envs = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
+    candidate = os.path.join(envs, 'topmol2', 'bin', 'acpype')
+    if os.path.exists(candidate):
+        return candidate
+    raise FileNotFoundError('Нет acpype: окружение topmol2 (acpype, ambertools) или передайте acpype_bin.')
+
+
+@logged
+def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=None, random_seed=42):
+    """
+    Шаг 2: топология acpype (типы атомов и параметры связей, углов, диэдралов) для остатка
+    с водородами шага 4.1 (AddedH). Вход - MOL-файл прямо из RDKit (порядки связей и
+    3D-координаты из молекулы, без obabel), заряд - формальный заряд молекулы (не руками).
+    Порядок атомов в itp сверяется с молекулой по элементам (по массе атома).
+
+    Записывает в атомы 'AcpypeType', в молекулу 'AcpypeItp' (путь к itp). Заряды acpype
+    (charge_type) не используются: заряды - шаг 5/6. Меняет и возвращает mol.
+    """
+    name = mol.GetProp('ResName') if mol.HasProp('ResName') else \
+        mol.GetAtomWithIdx(0).GetPDBResidueInfo().GetResidueName().strip()
+    os.makedirs(workdir, exist_ok=True)
+    work = Chem.Mol(mol)
+    if not work.GetNumConformers() or not work.GetConformer().Is3D():
+        work = set_mol_coords(work, coords='3D', random_seed=random_seed)
+    mol_path = os.path.join(workdir, f'{name}.mol')
+    Chem.MolToMolFile(work, mol_path)
+    net = Chem.GetFormalCharge(mol)
+    cmd = [_acpype_bin(acpype_bin), '-i', f'{name}.mol', '-c', charge_type, '-a', atom_type,
+           '-n', str(net), '-b', name, '-o', 'gmx']
+    run = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)
+    with open(os.path.join(workdir, 'acpype.log'), 'w') as log:
+        log.write(run.stdout + run.stderr)
+    itp = os.path.join(workdir, f'{name}.acpype', f'{name}_GMX.itp')
+    if run.returncode != 0 or not os.path.exists(itp):
+        tail = (run.stdout + run.stderr).strip().splitlines()[-3:]
+        raise RuntimeError(f'acpype не построил топологию ({os.path.join(workdir, "acpype.log")}): '
+                           + ' | '.join(tail))
+    atoms = read_itp(itp)['atoms']
+    table = Chem.GetPeriodicTable()
+    if len(atoms) != mol.GetNumAtoms():
+        raise ValueError(f'В itp {len(atoms)} атомов, в молекуле {mol.GetNumAtoms()}')
+    wrong = [(a.GetIdx(), a.GetSymbol(), row[7]) for a, row in zip(mol.GetAtoms(), atoms)
+             if abs(table.GetAtomicWeight(a.GetSymbol()) - float(row[7])) > 0.1]
+    if wrong:
+        raise ValueError(f'Порядок атомов itp не совпадает с молекулой (индекс, элемент, масса в itp): {wrong[:5]}')
+    for atom, row in zip(mol.GetAtoms(), atoms):
+        atom.SetProp('AcpypeType', row[1])
+    mol.SetProp('AcpypeItp', os.path.abspath(itp))
+    print(f'acpype ({atom_type}, заряд {net:+d}): {len(atoms)} атомов, типы записаны в AcpypeType; {itp}')
+    return mol
+
+
+from .residue import set_mol_coords  # noqa: E402
