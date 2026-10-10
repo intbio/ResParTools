@@ -216,13 +216,20 @@ def _pdb_atoms(text):
             for line in text.splitlines() if line.startswith(('ATOM', 'HETATM'))]
 
 
+def _gro_atoms(text):
+    """[(остаток, номер, имя, xyz в Å)] атомов .gro."""
+    return [(line[5:10].strip(), int(line[0:5]), line[10:15].strip(),
+             10 * np.array([float(line[20:28]), float(line[28:36]), float(line[36:44])]))
+            for line in text.splitlines()[2:-1]]
+
+
 def validate_report(workdir, bond_tolerance=0.1):
     """
     Итог проверки по файлам папки задачи (локальной или с кластера). Печатает и возвращает
     словарь: пройденные этапы, совпадение атомов после pdb2gmx -ignh, предупреждения
     grompp, сходимость минимизации, для МД - предупреждения LINCS, средние температура,
-    давление, плотность, связи остатка, средняя длина которых отличается от исходной
-    больше bond_tolerance (Å).
+    давление, плотность, связи остатка, средняя длина которых в МД отличается от длины
+    после минимизации в вакууме (em_vac.gro - минимум этого же поля) больше bond_tolerance (Å).
     """
     stages = _read(os.path.join(workdir, 'status.txt')).split()
     rep = {'stages': stages, 'ok': True, 'problems': []}
@@ -274,10 +281,11 @@ def validate_report(workdir, bond_tolerance=0.1):
         if 'density' in rep and not 950 < rep['density'] < 1050:
             problem(f"средняя плотность {rep['density']:.0f} кг/м3")
         frames = [_pdb_atoms(m) for m in _read(os.path.join(workdir, 'md_peptide.pdb')).split('ENDMDL') if 'ATOM' in m]
-        if frames and pdb:
+        ref = _gro_atoms(_read(os.path.join(workdir, 'em_vac.gro')))
+        if frames and pdb and ref:
             mol = Chem.MolFromPDBBlock(pdb, removeHs=False)
             key = [(r, i, n) for r, i, n, _ in start]
-            index = {k: j for j, k in enumerate(key)}
+            ref_pos = {(r, i, n): x for r, i, n, x in ref}
             frame_key = [(r, i, n) for r, i, n, _ in frames[0]]
             if sorted(frame_key) == sorted(key):
                 pos = [{(r, i, n): x for r, i, n, x in fr} for fr in frames]
@@ -286,13 +294,13 @@ def validate_report(workdir, bond_tolerance=0.1):
                     a1, a2 = key[b.GetBeginAtomIdx()], key[b.GetEndAtomIdx()]
                     if a1[1] != 2 and a2[1] != 2:
                         continue
-                    d0 = np.linalg.norm(start[index[a1]][3] - start[index[a2]][3])
+                    d0 = np.linalg.norm(ref_pos[a1] - ref_pos[a2])
                     d = np.mean([np.linalg.norm(p[a1] - p[a2]) for p in pos])
                     if abs(d - d0) > bond_tolerance:
                         drift.append(f'{a1[2]}-{a2[2]} {d0:.2f}->{d:.2f}')
                 rep['bond_drift'] = drift
                 if drift:
-                    problem('связи остатка уходят от исходной геометрии (Å): ' + ', '.join(drift[:8]))
+                    problem('связи остатка в МД уходят от минимума в вакууме (Å): ' + ', '.join(drift[:8]))
     resname = next((r for r, i, _, _ in start if i == 2), os.path.basename(workdir))
     if rep['ok']:
         extra = ''
