@@ -46,7 +46,7 @@
 - [x] б `feature/mol-props` - свойства молекулы по docs/MOL_PROPS.md, save_mol/load_mol;
       отдельный шаблон ноутбука без словарей (старый шаблон не меняется), прогон на эталонных папках
 - [x] г `feature/acpype-step2` - run_acpype(mol) в topmol2, заряд из молекулы, сверка элементов
-- [ ] в `feature/ff-step3` - assign_types / write_forcefield, исправления REVIEW.md 1,3,4 → build/amber14sb_mod.ff
+- [x] в `feature/ff-step3` - assign_types / write_forcefield, исправления REVIEW.md 1,3,4 → build/amber14sb_mod.ff
 - [ ] д `feature/validate-md` - validate: pdb2gmx -ignh, grompp, EM (local + slurm); МД ACE-X-NME в TIP3P 1 нс, 12 лизинов
 - [ ] RESP локально: Formyl, 1M, ACC (по очереди с МД)
 - [ ] `integration/night-2026-10-10` - всё вместе, полный набор тестов (с AF546)

@@ -35,6 +35,7 @@ from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
 from .log import logged
+from .utils import _PACKAGE_ROOT, print_red
 
 
 # Дубликат: ниже в модуле есть второе определение check_duplicate_atom_names, оно и действует
@@ -407,4 +408,273 @@ def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=No
     return mol
 
 
+# -----------------------------------------------------------------------------
+# Шаг 3: остаток для силового поля (типы, rtp, hdb) и запись поля
+# -----------------------------------------------------------------------------
+def _element(name):
+    return 'H' if name[0] == 'H' else name[0]
+
+def hdb_entries(atoms, bonds):
+    """
+    Записи .hdb остатка по его графу (формат read_rtp): atoms [(имя, ...)], bonds [[a, b, ...]],
+    внешние связи - '-C', '+N'. Тип добавления H - по числу водородов и числу соседей атома
+    (правила GROMACS: 1 плоский, 2 OH/SH, 3 плоская NH2, 4 метил, 5 CH sp3, 6 CH2 sp3).
+    Управляющие атомы - соседи в порядке атомов остатка (внешние - первыми).
+    """
+    order = {a[0]: i for i, a in enumerate(atoms)}
+    nbrs = {a[0]: [] for a in atoms}
+    for b in bonds:
+        x, y = b[0], b[1]
+        if x in nbrs:
+            nbrs[x].append(y)
+        if y in nbrs:
+            nbrs[y].append(x)
+    key = lambda n: (0, 0) if n[0] in '+-' else (1, order[n])
+    entries = []
+    for name, *_ in atoms:
+        if _element(name) == 'H':
+            continue
+        hs = [n for n in nbrs[name] if n[0] not in '+-' and _element(n) == 'H']
+        if not hs:
+            continue
+        heavy = sorted([n for n in nbrs[name] if n not in hs], key=key)
+        total = len(hs) + len(heavy)
+        n_h = len(hs)
+        if n_h == 1:
+            hname = hs[0]
+        else:
+            prefixes = {h[:-1] for h in hs}
+            digits = sorted(h[-1] for h in hs)
+            if len(prefixes) != 1 or digits != [str(i) for i in range(1, n_h + 1)]:
+                raise ValueError(f'{name}: водороды {hs} не записать в hdb (нужны имена <префикс>1..{n_h})')
+            hname = prefixes.pop()
+        def second(j):   # сосед соседа j (не сам атом), первый по порядку
+            cand = sorted([n for n in nbrs.get(j, []) if n != name and n[0] not in '+-' and _element(n) != 'H'], key=key)
+            if not cand:
+                raise ValueError(f'{name}: у {j} нет второго соседа для hdb')
+            return cand[0]
+        if n_h == 1 and total == 3:
+            kind, ctrl = 1, heavy[:2]
+        elif n_h == 1 and total == 4:
+            kind, ctrl = 5, heavy[:3]
+        elif n_h == 1 and total == 2:
+            kind, ctrl = 2, [heavy[0], second(heavy[0])]
+        elif n_h == 2 and total == 4:
+            kind, ctrl = 6, heavy[:2]
+        elif n_h == 2 and total == 3:
+            kind, ctrl = 3, [heavy[0], second(heavy[0])]
+        elif n_h == 3 and total == 4:
+            kind, ctrl = 4, [heavy[0], second(heavy[0])]
+        else:
+            raise ValueError(f'{name}: {n_h} H при {total} соседях - нет типа hdb')
+        entries.append([n_h, kind, hname, name] + ctrl)
+    return entries
+
+
+def read_ffbonded(path):
+    """
+    Какие связи, углы и диэдралы описаны в ffbonded.itp по типам атомов:
+    {'bonds': {(t1, t2)}, 'angles': {(t1, t2, t3)}, 'propers': [(t1..t4)], 'impropers': [(t1..t4)]}
+    (связи и углы - в обоих направлениях; в диэдралах возможен шаблон X).
+    """
+    out = {'bonds': set(), 'angles': set(), 'propers': [], 'impropers': []}
+    section = None
+    with open(path) as file:
+        for line in file:
+            text = line.split(';')[0].strip()
+            if not text or text.startswith('#'):
+                continue
+            header = re.fullmatch(r'\[\s*(\S+)\s*\]', text)
+            if header:
+                section = header.group(1)
+                continue
+            p = text.split()
+            if section in ('bondtypes', 'constrainttypes'):
+                out['bonds'].update({tuple(p[:2]), tuple(p[1::-1])})
+            elif section == 'angletypes':
+                out['angles'].update({tuple(p[:3]), tuple(p[2::-1])})
+            elif section == 'dihedraltypes':
+                (out['impropers'] if p[4] == '4' else out['propers']).append(tuple(p[:4]))
+    return out
+
+
+def _dihedral_known(types, table):
+    """Есть ли диэдрал с такими типами (прямо или в обратном порядке, X - любой тип)."""
+    return any(all(x == 'X' or x == y for x, y in zip(t, cand))
+               for t in table for cand in (types, types[::-1]))
+
+
+def _env(atom):
+    """Окружение атома молекулы: (элемент, соседей вместе с неявными H, явных H)."""
+    return (atom.GetSymbol(), atom.GetTotalDegree(), sum(n.GetAtomicNum() == 1 for n in atom.GetNeighbors()))
+
+
+def _rtp_env(res, name):
+    """То же для атома остатка rtp (связь '-C N' - это и связь C со следующим остатком)."""
+    nb = [b[1] if b[0] == name else b[0] for b in res['bonds'] if name in b[:2]]
+    nb += ['+' + b[1] for b in res['bonds'] if b[0][0] == '-' and b[0][1:] == name]
+    return (_element(name), len(nb), sum(_element(n) == 'H' for n in nb if n[0] not in '+-'))
+
+
+@logged
+def assign_types(mol, parent_res):
+    """
+    Шаг 3: тип атома для силового поля (свойство AtomType, источник - TypeSource).
+    Атом родителя (ParentName) сохраняет тип родителя, если его окружение то же
+    (элемент, число соседей, число H); водород - если окружение то же и у его тяжёлого
+    атома, и у всех соседей того атома (иначе это H у изменённой группы, например HE1/HE2
+    при ацилировании NZ: в лизине они HP рядом с N+). Остальные атомы - тип acpype
+    (AcpypeType, run_acpype). Вместо списков исключений и родителя, вписанных руками.
+        parent_res - остаток родителя из read_rtp (например read_rtp(...)[1]['LYS'])
+    Меняет и возвращает mol.
+    """
+    ptype = {n: t for n, t, *_ in parent_res['atoms']}
+    same = {}
+    for a in mol.GetAtoms():
+        pn = a.GetProp('ParentName') if a.HasProp('ParentName') else None
+        same[a.GetIdx()] = pn in ptype and _env(a) == _rtp_env(parent_res, pn)
+    for a in mol.GetAtoms():
+        keep = same[a.GetIdx()]
+        if keep and a.GetAtomicNum() == 1:
+            heavy = a.GetNeighbors()[0]
+            keep = same[heavy.GetIdx()] and all(same[n.GetIdx()] for n in heavy.GetNeighbors())
+        a.SetProp('AtomType', ptype[a.GetProp('ParentName')] if keep else a.GetProp('AcpypeType'))
+        a.SetProp('TypeSource', 'parent' if keep else 'acpype')
+    changed = [f"{a.GetProp('AtomName')} {ptype[a.GetProp('ParentName')]}->{a.GetProp('AtomType')}"
+               for a in mol.GetAtoms() if a.HasProp('ParentName') and a.GetProp('ParentName') in ptype
+               and a.GetProp('TypeSource') == 'acpype']
+    if changed:
+        print('Атомы родителя с изменённым окружением - тип acpype: ' + ', '.join(changed))
+    return mol
+
+
+def residue_rtp(mol, ff_dir):
+    """
+    Остаток для rtp из молекулы (AtomName, AtomType, Charge<ChargeMethod>, AcpypeItp).
+    Связи - все связи остатка и '-C N'. Явные параметры (из itp acpype, уже в единицах
+    GROMACS) пишутся только для связей, углов и диэдралов, которых нет в ffbonded.itp
+    поля по типам атомов; остальное GROMACS берёт из поля (углы и собственные диэдралы
+    pdb2gmx строит сам). Несобственные диэдралы - acpype (центр - третий атом) и два
+    стандартных у остова. Члены с водородами, добавленными только для acpype, отбрасываются.
+    Возвращает (остаток в формате read_rtp, {секция: [типы с явными параметрами]}).
+    """
+    method = mol.GetProp('ChargeMethod')
+    n = mol.GetNumAtoms()
+    names = [a.GetProp('AtomName') for a in mol.GetAtoms()]
+    types = [a.GetProp('AtomType') for a in mol.GetAtoms()]
+    ff = read_ffbonded(os.path.join(ff_dir, 'ffbonded.itp'))
+    itp = read_itp(mol.GetProp('AcpypeItp'))
+    res = {'atoms': [(names[i], types[i], round(a.GetDoubleProp(f'Charge{method}'), 6), i + 1)
+                     for i, a in enumerate(mol.GetAtoms())],
+           'bonds': [], 'angles': [], 'dihedrals': [], 'impropers': []}
+    explicit = defaultdict(set)
+    for row in itp.get('bonds', []) + itp.get('angles', []) + itp.get('dihedrals', []):
+        size = 2 if len(row) == 5 else 3 if len(row) == 6 else 4
+        idx = [int(x) - 1 for x in row[:size]]
+        if any(i >= n for i in idx):
+            continue                     # водород, добавленный только для acpype
+        t = tuple(types[i] for i in idx)
+        nm = [names[i] for i in idx]
+        if size == 2:
+            known = t in ff['bonds']
+            res['bonds'].append(nm if known else nm + row[3:5])
+            section = 'bonds'
+        elif size == 3:
+            known = t in ff['angles']
+            if not known:
+                res['angles'].append(nm + row[4:6])
+            section = 'angles'
+        elif row[4] == '9':
+            known = _dihedral_known(t, ff['propers'])
+            if not known:
+                res['dihedrals'].append(nm + row[5:8])
+            section = 'dihedrals'
+        else:
+            known = _dihedral_known(t, ff['impropers'])
+            res['impropers'].append(nm if known else nm + row[5:8])
+            section = 'impropers'
+        if not known:
+            explicit[section].add(t)
+    res['bonds'].append(['-C', 'N'])
+    res['impropers'] += [['-C', 'CA', 'N', 'H'], ['CA', '+N', 'C', 'O']]
+    res = {k: v for k, v in res.items() if v}
+    return res, {k: sorted(v) for k, v in explicit.items()}
+
+
+DEFAULT_FF = os.path.join(_PACKAGE_ROOT, 'amber14sb_parmbsc1_cufix.ff')
+
+
+def _copy_forcefield(ff_base, ff_out):
+    """
+    Копия поля без файлов, которые не дают pdb2gmx работать: rtp с типами атомов, которых
+    нет в atomtypes.atp (pdb2gmx читает все .rtp папки и останавливается на первом таком),
+    блокноты и копии (*-Copy*). Пропущенные rtp печатаются.
+    """
+    atp = {line.split()[0] for line in open(os.path.join(ff_base, 'atomtypes.atp'))
+           if line.split() and not line.startswith(';')}
+    skipped = {}
+    for path in glob.glob(os.path.join(ff_base, '*.rtp')):
+        unknown = {t for res in read_rtp(path)[1].values() for _, t, _, _ in res.get('atoms', [])} - atp
+        if unknown:
+            skipped[os.path.basename(path)] = sorted(unknown)[:5]
+    shutil.copytree(ff_base, ff_out, ignore=shutil.ignore_patterns('*.ipynb', '*-Copy*', *skipped))
+    if skipped:
+        print_red(f'⚠ Из {ff_base} не скопированы rtp с типами не из atomtypes.atp: {skipped}')
+
+
+def _hdb_line(entry):
+    return '\t'.join(str(x) for x in entry) + '\n'
+
+
+@logged
+def write_forcefield(mol, ff_out, ff_base=DEFAULT_FF):
+    """
+    Шаг 3: добавляет остаток в силовое поле ff_out (если папки нет - копия ff_base).
+    Пишет <ResName>.rtp и <ResName>.hdb отдельными файлами (GROMACS читает все .rtp и .hdb
+    папки поля), строку в residuetypes.dat и недостающие типы в atomtypes.atp.
+    Повторный запуск заменяет запись остатка, а не дописывает её.
+    mol - остаток после шагов 2, 5/6 (AtomName, AcpypeType, AcpypeItp, Charge<Метод>,
+    ChargeMethod, Parent). Типы атомов назначаются здесь (assign_types).
+    Возвращает (путь к rtp, {секция: типы с явными параметрами}).
+    """
+    if not os.path.isdir(ff_out):
+        _copy_forcefield(ff_base, ff_out)
+    resname = mol.GetAtomWithIdx(0).GetPDBResidueInfo().GetResidueName().strip()
+    parent = AMINO_ACIDS[mol.GetProp('Parent')][0].upper()
+    parent_res = read_rtp(os.path.join(ff_base, 'aminoacids.rtp'))[1][parent]
+    assign_types(mol, parent_res)
+    res, explicit = residue_rtp(mol, ff_out)
+    total = sum(q for _, _, q, _ in res['atoms'])
+    if abs(total - round(total)) > 1e-3:
+        print_red(f'⚠ Сумма зарядов {resname} {total:.5f} - не целое число.')
+    rtp_path = write_rtp(os.path.join(ff_out, f'{resname}.rtp'), {resname: res},
+                         read_rtp(os.path.join(ff_base, 'aminoacids.rtp'))[0])
+    hdb = hdb_entries(res['atoms'], res['bonds'])
+    with open(os.path.join(ff_out, f'{resname}.hdb'), 'w') as file:
+        file.write(f'{resname}\t{len(hdb)}\n' + ''.join(_hdb_line(e) for e in hdb))
+    # residuetypes.dat: строка остатка заменяется
+    dat = os.path.join(ff_out, 'residuetypes.dat')
+    lines = [line for line in open(dat) if line.split()[:1] != [resname]] if os.path.exists(dat) else []
+    with open(dat, 'w') as file:
+        file.writelines(lines + [f'{resname}\tProtein\n'])
+    # типы: atomtypes.atp (масса) и наличие параметров Леннард-Джонса в ffnonbonded.itp
+    atp = os.path.join(ff_out, 'atomtypes.atp')
+    known = {line.split()[0] for line in open(atp) if line.split() and not line.startswith(';')}
+    table = Chem.GetPeriodicTable()
+    new = sorted({(a.GetProp('AtomType'), table.GetAtomicWeight(a.GetSymbol())) for a in mol.GetAtoms()
+                  if a.GetProp('AtomType') not in known})
+    if new:
+        with open(atp, 'a') as file:
+            file.writelines(f'{t:<6}{m:16.5f}\n' for t, m in new)
+    nonbonded = {line.split()[0] for line in open(os.path.join(ff_out, 'ffnonbonded.itp'))
+                 if line.split() and line.split()[0][0] not in ';[#'}
+    missing = sorted({a.GetProp('AtomType') for a in mol.GetAtoms()} - nonbonded)
+    if missing:
+        print_red(f'⚠ Нет параметров Леннард-Джонса в ffnonbonded.itp для типов {missing}: grompp не сработает.')
+    print(f'{resname}: {rtp_path}, {resname}.hdb ({len(hdb)} групп H); явные параметры: '
+          + (', '.join(f'{k} {len(v)}' for k, v in explicit.items()) or 'нет'))
+    return rtp_path, explicit
+
+
 from .residue import set_mol_coords, add_protons_and_renumber_H  # noqa: E402
+from .matching import AMINO_ACIDS  # noqa: E402

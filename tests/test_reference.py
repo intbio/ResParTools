@@ -267,3 +267,56 @@ def test_run_acpype(folder, tmp_path):
         assert types['NZ'] == 'N3'
     if folder == 'Lysine_Malonyl':
         assert types['OK1'] == types['OK2'] == 'O2'
+
+
+def _base_hdb():
+    hdb, cur = {}, None
+    for line in open(os.path.join(ROOT, 'amber14sb_parmbsc1_cufix.ff', 'aminoacids.hdb')):
+        p = line.split()
+        if len(p) == 2 and not p[0].isdigit():
+            cur = hdb.setdefault(p[0], [])
+        elif p:
+            cur.append((int(p[0]), int(p[1]), *p[2:]))
+    return hdb
+
+
+def test_hdb_entries_match_base_hdb():
+    """Генератор hdb по графу rtp воспроизводит aminoacids.hdb amber14sb (тип и управляющие атомы)."""
+    _, residues = pt.read_rtp(os.path.join(ROOT, 'amber14sb_parmbsc1_cufix.ff', 'aminoacids.rtp'))
+    base = _base_hdb()
+    c_term_oxygen = (1, 1, 'OC1', 'C', 'CA', 'OC2')     # особая запись C-концов: O как «водород»
+    checked = 0
+    for name, res in residues.items():
+        if name not in base or 'bonds' not in res or name in ('HOH', 'HO4', 'HO5', 'NME', 'NHE', 'NH2'):
+            continue
+        got = set(map(tuple, pt.hdb_entries(res['atoms'], res['bonds'])))
+        want = set(base[name]) - {c_term_oxygen}
+        if name == 'NPRO':          # тот же тип, управляющие атомы в другом порядке
+            want = {(2, 6, 'H', 'N', 'CD', 'CA') if e == (2, 6, 'H', 'N', 'CA', 'CD') else e for e in want}
+        assert got == want, name
+        checked += 1
+    assert checked > 70
+
+
+def test_write_forcefield_formyl(tmp_path):
+    """Шаг 3: типы по окружению, rtp и hdb остатка; повторная запись не дублирует строки."""
+    _, _, residue = props_steps_1_to_4('Lysine_Formyl')
+    residue = Chem.Mol(residue)
+    _quiet(pt.run_acpype, residue, str(tmp_path / 'acpype'))
+    q = json.load(open(os.path.join(ROOT, 'Lysine_Formyl', 'AI_chrges_K_form.json')))
+    pt.set_charges(residue, q, 'Espaloma')
+    ff = str(tmp_path / 'test.ff')
+    for _ in range(2):
+        rtp, explicit = _quiet(pt.write_forcefield, Chem.Mol(residue), ff)
+    _quiet(pt.write_forcefield, residue, ff)
+    types = {a.GetProp('AtomName'): a.GetProp('AtomType') for a in residue.GetAtoms()}
+    lys = dict((n, t) for n, t, *_ in pt.read_rtp(os.path.join(ROOT, 'amber14sb_parmbsc1_cufix.ff', 'aminoacids.rtp'))[1]['LYS']['atoms'])
+    for name in ('N', 'H', 'CA', 'HA', 'CB', 'HB1', 'CD', 'CE', 'C', 'O'):
+        assert types[name] == lys[name], name          # окружение как в лизине - тип лизина
+    assert types['HE1'] == 'H1' and types['NZ'] == 'N'  # у ацилированного NZ: не HP и не N3
+    res = pt.read_rtp(rtp)[1]['KFO']
+    assert [a[0] for a in res['atoms']] == [a.GetProp('AtomName') for a in residue.GetAtoms()]
+    assert abs(sum(a[2] for a in res['atoms'])) < 1e-4
+    assert ('C8', 'N') in explicit['bonds']             # в amber14sb нет связи C8-N амида
+    assert open(os.path.join(ff, 'residuetypes.dat')).read().count('KFO\t') == 1
+    assert open(os.path.join(ff, 'KFO.hdb')).read().startswith('KFO\t8\n')
