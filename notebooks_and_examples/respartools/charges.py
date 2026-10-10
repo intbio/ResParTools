@@ -139,4 +139,22 @@ def compare_charges(mol, charge_sets, top=10):
     return tables
 
 
+def set_charges(mol, charges, method, constraints=None):
+    """
+    Записывает заряды в атомы: свойство Charge<method> (например ChargeEspaloma, ChargeRESP;
+    методов может быть больше), свойство молекулы ChargeMethod = method (заряды, которые пойдут
+    в силовое поле), ChargeFixed = True у атомов из constraints ({индекс: заряд}).
+    Меняет и возвращает mol.
+    """
+    if len(charges) != mol.GetNumAtoms():
+        raise ValueError(f'Зарядов {len(charges)}, атомов {mol.GetNumAtoms()}')
+    key = f'Charge{method}'
+    for atom, q in zip(mol.GetAtoms(), charges):
+        atom.SetDoubleProp(key, float(q))
+        if constraints is not None:
+            atom.SetBoolProp('ChargeFixed', atom.GetIdx() in constraints)
+    mol.SetProp('ChargeMethod', method)
+    return mol
+
+
 from .forcefield import read_rtp  # noqa: E402

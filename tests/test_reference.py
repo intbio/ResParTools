@@ -195,3 +195,57 @@ def test_rtp_roundtrip(tmp_path):
     lys = residues['LYS']
     assert lys['atoms'][0] == ('N', 'N', -0.3479, 1) and ['N', 'H'] in lys['bonds']
     assert pt.read_rtp_charges('LYS')['NZ'] == -0.3854
+
+
+@functools.lru_cache(maxsize=None)
+def props_steps_1_to_4(folder):
+    """Шаги 1-4 без словарей (templates/1_charge_calculation_props.ipynb): всё в памяти, без PDB."""
+    p = PARAMS[folder]
+    cwd = os.getcwd()
+    os.chdir(os.path.join(ROOT, folder))
+    try:
+        monomer = _quiet(pt.open_mol, p['monomer_file'])
+        trimer = _quiet(pt.open_mol, p['trimer_file'])
+        residue = _quiet(pt.find_residue, monomer, trimer, timeout=5)
+        residue = _quiet(pt.renumber_residue_atoms, residue, ref_base_name=p['parent_residue'], timeout=5)
+        parent = [a.GetIdx() for a in residue.GetAtoms() if a.HasProp('ParentName')]
+        residue = _quiet(pt.rdkit_pdb_modification, residue, resname=p['base_name'], resid=2, segid='A',
+                         naming=p['naming'], parent_atoms=parent)
+        return monomer, trimer, residue
+    finally:
+        os.chdir(cwd)
+
+
+# Lysine_lac: SMILES с [NH2] - после вырезания N без неявного H (найдено 2026-10-10)
+@pytest.mark.parametrize('folder', CASES + ['Lysine_lac'])
+def test_props_path_matches_committed(folder):
+    """Свойства молекулы вместо словарей: те же имена, порядок и атомы родителя, что в git."""
+    monomer, trimer, residue = props_steps_1_to_4(folder)
+    mon = _mon_name(folder)
+    names, resnames, _ = _pdb_names(os.path.join(ROOT, folder, 'molecules', 'substructure', f'4_{mon}.pdb'))
+    assert [a.GetProp('AtomName') for a in residue.GetAtoms()] == names
+    assert resnames == {PARAMS[folder]['base_name']}
+    general = json.load(open(os.path.join(ROOT, folder, 'general_atoms.json')))
+    assert [a.GetProp('AtomName') for a in residue.GetAtoms() if a.HasProp('ParentName')] == general
+    # сквозные индексы указывают на тот же элемент в мономере и тримере
+    for a in residue.GetAtoms():
+        assert monomer.GetAtomWithIdx(a.GetIntProp('SrcIdx')).GetSymbol() == a.GetSymbol()
+        assert trimer.GetAtomWithIdx(a.GetIntProp('PolymerIdx')).GetSymbol() == a.GetSymbol()
+    assert residue.GetProp('Parent') == PARAMS[folder]['parent_residue']
+    assert residue.GetProp('Naming') in ('greek', 'index')
+
+
+@pytest.mark.parametrize('folder', ['Lysine_Formyl', 'Lysine_Malonyl'])
+def test_save_load_mol_roundtrip(folder, tmp_path):
+    _, _, residue = props_steps_1_to_4(folder)
+    residue = Chem.Mol(residue)
+    q = [0.001 * i for i in range(residue.GetNumAtoms())]
+    pt.set_charges(residue, q, 'Espaloma', {0: q[0]})
+    back = pt.load_mol(_quiet(pt.save_mol, residue, str(tmp_path / 'r')))
+    assert back.GetNumAtoms() == residue.GetNumAtoms()
+    for a, b in zip(residue.GetAtoms(), back.GetAtoms()):
+        assert (a.GetSymbol(), a.GetFormalCharge(), a.GetNumImplicitHs()) == \
+               (b.GetSymbol(), b.GetFormalCharge(), b.GetNumImplicitHs())
+        assert a.GetPropsAsDict(includePrivate=False) == b.GetPropsAsDict(includePrivate=False)
+        assert b.GetPDBResidueInfo().GetResidueName() == PARAMS[folder]['base_name']
+    assert back.GetProp('ChargeMethod') == 'Espaloma' and back.GetProp('Parent') == 'K'

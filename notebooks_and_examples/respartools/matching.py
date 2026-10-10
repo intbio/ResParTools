@@ -33,7 +33,7 @@ import warnings
 from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
-from .log import logged
+from .log import logged, log_note
 from .utils import _PACKAGE_ROOT, animate, print_red
 
 
@@ -504,6 +504,8 @@ def match_chem_v6(
     # сохраняют исходный порядок, свойства (AtomName, PDB info), заряды и координаты
     keep = set(full_mapping.keys())
     substructure_rw = Chem.RWMol(mol_chem_1)
+    for idx, pol_idx in full_mapping.items():
+        substructure_rw.GetAtomWithIdx(idx).SetIntProp('PolymerIdx', pol_idx)
     for idx in sorted((a.GetIdx() for a in mol_chem_1.GetAtoms() if a.GetIdx() not in keep), reverse=True):
         substructure_rw.RemoveAtom(idx)
     substructure_H = substructure_rw.GetMol()
@@ -602,6 +604,37 @@ def match_mon_to_pol(monomer_dict, polymer_dict, compare_any_bond = False,
         raise e
         # print_red(f'Что-то пошло не так!\n{e}')
         
+def find_residue(monomer, polymer, timeout=5, only_heavy_mapping=True, **kwargs):
+    """
+    Остаток мономера внутри полимера (тримера) - match_mon_to_pol без словарей.
+    Возвращает подструктуру мономера (атомы в порядке мономера, свойства атомов мономера
+    сохраняются) со свойством атома PolymerIdx - индексом этого атома в полимере.
+    """
+    name = monomer.GetProp('ModName') if monomer.HasProp('ModName') else 'monomer'
+    match = match_mon_to_pol({name: monomer}, {'polymer': polymer}, timeout=timeout,
+                             only_heavy_mapping=only_heavy_mapping, **kwargs)
+    if name not in match['substructure']:
+        raise ValueError('Мономер в полимере не найден (см. сообщения выше).')
+    residue = match['substructure'][name]
+    # атомы, потерявшие соседей при вырезании (N и C остова), получают открытую валентность
+    # неявными водородами, как у остатка, прочитанного из PDB: у SMILES с [NH2] RDKit иначе
+    # оставляет N двухвалентным, и шаблон родителя не сопоставляется
+    mon_idx = sorted(match['mon_pol_matches'][name])
+    cut = []
+    for atom, i in zip(residue.GetAtoms(), mon_idx):
+        if atom.GetDegree() < monomer.GetAtomWithIdx(i).GetDegree() and atom.GetNoImplicit():
+            atom.SetNoImplicit(False)
+            atom.SetNumExplicitHs(0)
+            cut.append(atom.GetIdx())
+    residue.UpdatePropertyCache(strict=False)
+    if cut:
+        log_note('открытая валентность после вырезания -> неявные H', atoms=cut)
+    for key in monomer.GetPropNames():
+        if not residue.HasProp(key):
+            residue.SetProp(key, monomer.GetProp(key))
+    return residue
+
+
 # Наборы референсных остатков для поиска канонических атомов.
 # Шаблон - PDB-файл, где референсный остаток стоит в позиции residue_number
 # (для белков - тримеры GXG_H.pdb), порядок его атомов в файле считается каноническим.

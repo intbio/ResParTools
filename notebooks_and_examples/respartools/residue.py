@@ -68,9 +68,11 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
         Chem.Mol - перенумерованная молекула. Свойства: 'RefResidue' - имя шаблона,
         'OldIndices' - JSON-список: на позиции нового индекса стоит старый индекс атома,
         'ParentAtoms' - JSON-список новых индексов атомов, сопоставленных с шаблоном
-        родительского остатка (для подсветки: draw_molecule(highlight_atoms=...)).
+        родительского остатка (для подсветки: draw_molecule(highlight_atoms=...)), 'Parent'.
+        Свойства атомов: 'PrevIdx' - индекс до перенумерации, 'ParentName' - имя атома
+        в шаблоне родителя (у новых атомов свойства нет). Свойства исходной молекулы сохраняются.
     """
-    _, match_data, _ = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
+    ref_dict, match_data, _ = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
                                      ref_base_name=ref_base_name, residue_type=residue_type,
                                      only_heavy_mapping=only_heavy_mapping, timeout=timeout,
                                      strict_parent=strict_parent)
@@ -137,6 +139,16 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
               f'(канонических: {len(canonical)})')
         new_mol = Chem.RenumberAtoms(mol, new_order)
 
+    # RenumberAtoms теряет свойства молекулы - переносим; роль атома - в сам атом
+    for key in mol.GetPropNames():
+        new_mol.SetProp(key, mol.GetProp(key))
+    ref_mol = ref_dict[ref_name]
+    for new, old in enumerate(new_order):
+        atom = new_mol.GetAtomWithIdx(new)
+        atom.SetIntProp('PrevIdx', old)
+        if old in mapping:
+            atom.SetProp('ParentName', ref_mol.GetAtomWithIdx(mapping[old]).GetProp('AtomName'))
+    new_mol.SetProp('Parent', str(ref_base_name))
     new_mol.SetProp('RefResidue', ref_name)
     new_mol.SetProp('OldIndices', json.dumps(new_order))
     new_index = {old: new for new, old in enumerate(new_order)}
@@ -526,6 +538,7 @@ def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
               f"{' '.join(names[i] for i in rule_named)}; "
               f"остальные {rdkit_mol.GetNumAtoms() - len(rule_named)} атомов - элемент + индекс.")
     log_note('имена атомов', method=method, names={i: names[i] for i in sorted(names)})
+    rdkit_mol.SetProp('Naming', method)
     return rdkit_mol
 
 

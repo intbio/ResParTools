@@ -51,11 +51,11 @@
 | Свойство | Тип | Пример | Кто пишет | Что заменяет |
 |---|---|---|---|---|
 | `SrcIdx` | int | `7` | шаг 1: индекс в файле мономера | - (сквозная связь с исходником) |
-| `TrimerIdx` | int | `15` | шаг 2: индекс в тримере (у атомов подструктуры) | `match_dict['mon_pol_matches']` |
+| `PolymerIdx` | int | `15` | шаг 2: индекс в тримере (у атомов подструктуры; `find_residue`, `match_chem_v6`) | `match_dict['mon_pol_matches']` |
 | `PrevIdx` | int | `4` | шаг 3.1: индекс до перенумерации | `OldIndices` |
-| `ParentName` | str | `CB` / пусто | шаг 3.1: имя атома в шаблоне родителя; пусто у новых атомов | `ParentAtoms`, `general_atoms.json` |
+| `ParentName` | str | `CB` | шаг 3.1: имя атома в шаблоне родителя; у новых атомов свойства нет (пустое значение в SDF сдвигает строку) | `ParentAtoms`, `general_atoms.json` |
 | `AtomName` | str | `CB`, `HT21` | шаг 3.2, правка - шаг 4 | (уже есть) |
-| `Added` | bool | `True` у HW | шаг 4.1 | `AddedH`, поиск `'W'` в имени (`remove_extra_H`) |
+| `AddedH` | bool | `True` у HW | шаг 4.1 (свойство уже было) | список `AddedH` у молекулы, поиск `'W'` в имени (`remove_extra_H`) |
 | `ChargeFixed` | bool | `True` у N H CA HA C O | шаг 5/6 (ограничения из rtp) | словарь `constraints` |
 | `ChargeEspaloma` | float | `-0.1165` | шаг 5 | `AI_chrges_<имя>.json` |
 | `ChargeRESP` | float | `-0.0981` | шаг 6 | `RESP_chrges_<имя>.json` |

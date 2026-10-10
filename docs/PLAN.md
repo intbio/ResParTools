@@ -43,7 +43,7 @@
 Ветки локально, каждая от предыдущей; push и слияние в main - только утром с автором.
 Рабочая папка `notebooks_and_examples/build/` (в .gitignore): новое поле, проверки, МД.
 - [x] а `feature/rtp-io` - единый read_rtp / write_rtp (вместо трёх парсеров и aminoacids_dict.json)
-- [ ] б `feature/mol-props` - свойства молекулы по docs/MOL_PROPS.md, save_mol/load_mol;
+- [x] б `feature/mol-props` - свойства молекулы по docs/MOL_PROPS.md, save_mol/load_mol;
       отдельный шаблон ноутбука без словарей (старый шаблон не меняется), прогон на эталонных папках
 - [ ] г `feature/acpype-step2` - run_acpype(mol) в topmol2, заряд из молекулы, сверка элементов
 - [ ] в `feature/ff-step3` - assign_types / write_forcefield, исправления REVIEW.md 1,3,4 → build/amber14sb_mod.ff

@@ -348,7 +348,13 @@ def file_opener(path, **kwargs):
     else:
         raise ValueError(f"Неподдерживаемый формат файла: {extension}. "
                        f"Поддерживаемые: .smi, .smiles, .mol2, .pdb")
-    
+
+    # сквозная связь с исходным файлом (docs/MOL_PROPS.md)
+    for mol in rdkit_mol.values():
+        mol.SetProp('ModName', name)
+        mol.SetProp('SourceFile', str(path))
+        for atom in mol.GetAtoms():
+            atom.SetIntProp('SrcIdx', atom.GetIdx())
     return rdkit_mol
         
 def find_amino_nitrogen(mol):
@@ -656,6 +662,93 @@ def save_charges_json(name: str, charge_list: list, path: str = ".") -> None:
     
     # Выводим информативное сообщение
     print(f"Файл успешно сохранен: \n{absolute_path}")
+
+
+# -----------------------------------------------------------------------------
+# Молекула со свойствами (docs/MOL_PROPS.md): один файл SDF между шагами
+# -----------------------------------------------------------------------------
+_INT_PROPS = ('SrcIdx', 'PolymerIdx', 'PrevIdx')
+_BOOL_PROPS = ('AddedH', 'ChargeFixed')
+_RESIDUE_PROPS = ('ResName', 'ResId', 'Chain')
+
+
+def _typed(key, value):
+    if key in _INT_PROPS:
+        return int(value)
+    if key in _BOOL_PROPS:
+        return value in ('1', 'True', 'true')
+    if key.startswith('Charge') and key != 'ChargeMethod':
+        return float(value)      # Charge<Метод>: заряды любого метода
+    return value
+
+
+@logged
+def save_mol(mol, path):
+    """
+    Сохраняет молекулу со всеми свойствами атомов и молекулы в SDF (координаты - как есть).
+    Параметры остатка PDB (имя, номер, цепь) пишутся свойствами молекулы ResName, ResId, Chain:
+    SDF их не хранит, load_mol восстанавливает. Возвращает путь.
+    """
+    out = Chem.Mol(mol)
+    info = out.GetAtomWithIdx(0).GetPDBResidueInfo() if out.GetNumAtoms() else None
+    if info is not None:
+        out.SetProp('ResName', info.GetResidueName().strip())
+        out.SetProp('ResId', str(info.GetResidueNumber()))
+        out.SetProp('Chain', info.GetChainId().strip())
+    keys = sorted({k for a in out.GetAtoms() for k in a.GetPropNames() if not k.startswith('_')})
+    # в SDF значения свойства всех атомов - одна строка через пробел: пустое значение или
+    # пробел внутри сдвинули бы значения соседних атомов
+    bad = [(a.GetIdx(), k, a.GetProp(k)) for a in out.GetAtoms() for k in keys
+           if a.HasProp(k) and (not a.GetProp(k).strip() or len(a.GetProp(k).split()) != 1)]
+    if bad:
+        raise ValueError(f'Свойства атомов с пустыми значениями или пробелами (индекс, свойство, '
+                         f'значение): {bad[:5]} - в SDF их не записать без сдвига значений.')
+    for key in keys:
+        Chem.CreateAtomStringPropertyList(out, key)
+    path = str(path) if str(path).endswith('.sdf') else f'{path}.sdf'
+    writer = Chem.SDWriter(path)
+    writer.SetKekulize(False)
+    writer.write(out)
+    writer.close()
+    return path
+
+
+@logged
+def load_mol(path):
+    """
+    Читает молекулу save_mol: свойства атомов и молекулы приводятся к своим типам
+    (целые индексы, флаги, заряды Charge<Метод>), параметры остатка PDB восстанавливаются
+    из AtomName, ResName, ResId, Chain. Водороды и формальные заряды - как в файле.
+    """
+    mol = next(Chem.ForwardSDMolSupplier(str(path), removeHs=False, sanitize=False))
+    if mol is None:
+        raise ValueError(f'Не удалось прочитать {path}')
+    mol.UpdatePropertyCache(strict=False)
+    for atom in mol.GetAtoms():
+        for key in list(atom.GetPropNames()):
+            if key.startswith('_'):
+                continue
+            value = _typed(key, atom.GetProp(key))
+            if isinstance(value, bool):
+                atom.SetBoolProp(key, value)
+            elif isinstance(value, int):
+                atom.SetIntProp(key, value)
+            elif isinstance(value, float):
+                atom.SetDoubleProp(key, value)
+        if atom.HasProp('AtomName') and mol.HasProp('ResName'):
+            set_PDB_residue_info(atom, atom.GetProp('AtomName'), mol.GetProp('ResName'),
+                                 int(mol.GetProp('ResId')), mol.GetProp('Chain'))
+    for key in list(mol.GetPropNames()):
+        if key.startswith('atom.'):
+            mol.ClearProp(key)
+    return mol
+
+
+def open_mol(path, **kwargs):
+    """Одна молекула из файла (file_opener без словаря): .smiles, .pdb, .mol2, .sdf (save_mol)."""
+    if str(path).lower().endswith('.sdf'):
+        return load_mol(path)
+    return next(iter(file_opener(path, **kwargs).values()))
 
 
 # Импорт из других модулей пакета - в конце файла: функции этого модуля уже

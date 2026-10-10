@@ -13,6 +13,8 @@
     python make_charge_notebooks.py                 # все папки из PARAMS
     python make_charge_notebooks.py Lysine_Formyl   # одна папка
     python make_charge_notebooks.py --template      # пересобрать шаблон из AF_546_cys
+    python make_charge_notebooks.py --props [папки] # версия без словарей: 1_charge_calculation_props.ipynb
+        (шаблон templates/1_charge_calculation_props.ipynb, перезаписывается всегда)
 """
 import argparse
 import copy
@@ -25,6 +27,8 @@ TEMPLATE = os.path.join(ROOT, 'templates', '1_charge_calculation.ipynb')
 SOURCE = os.path.join(ROOT, 'AF_546_cys', '1_charge_calculation.ipynb')
 NOTEBOOK = '1_charge_calculation.ipynb'
 OLD_NOTEBOOK = '1_charge_calculation_old.ipynb'
+PROPS_TEMPLATE = os.path.join(ROOT, 'templates', '1_charge_calculation_props.ipynb')
+PROPS_NOTEBOOK = '1_charge_calculation_props.ipynb'
 
 # Параметры модификаций. naming: 'greek' - буквенные имена (лизины), 'index' - для больших
 # меток. resp_run: где считать RESP на шаге 6 ('local' - эта машина, 'slurm' - кластер).
@@ -161,10 +165,28 @@ def make_notebook(folder, overwrite=False):
     return path
 
 
+def make_props_notebook(folder):
+    """<папка>/1_charge_calculation_props.ipynb - версия без словарей (docs/MOL_PROPS.md)."""
+    nb = copy.deepcopy(json.load(open(PROPS_TEMPLATE)))
+    cell = _cell(nb, 'params')
+    lines = _src(cell).split('\n')
+    keys = ('PTM_name', 'base_name', 'parent_residue', 'monomer_file', 'trimer_file', 'naming', 'resp_run')
+    _set_src(cell, '\n'.join(f'{line.split(" =")[0]} = {PARAMS[folder][line.split(" =")[0]]!r}'
+                              if line.split(' =')[0] in keys else line for line in lines))
+    nb['metadata']['respartools'] = {'template': 'templates/1_charge_calculation_props.ipynb',
+                                     'params': PARAMS[folder]}
+    path = os.path.join(ROOT, folder, PROPS_NOTEBOOK)
+    json.dump(nb, open(path, 'w'), ensure_ascii=False, indent=1)
+    open(path, 'a').write('\n')
+    print(f'{folder}: {PROPS_NOTEBOOK} собран из шаблона')
+    return path
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('folders', nargs='*', help='папки модификаций (по умолчанию все из PARAMS)')
     parser.add_argument('--template', action='store_true', help='пересобрать шаблон из AF_546_cys')
+    parser.add_argument('--props', action='store_true', help='версия без словарей (1_charge_calculation_props.ipynb)')
     parser.add_argument('--overwrite', action='store_true', help='пересобрать ноутбуки, уже собранные из шаблона')
     args = parser.parse_args(argv)
     if args.template:
@@ -173,6 +195,10 @@ def main(argv=None):
     unknown = [f for f in args.folders if f not in PARAMS]
     if unknown:
         sys.exit(f'Нет параметров для {unknown}: добавьте их в PARAMS')
+    if args.props:
+        for folder in args.folders or list(PARAMS):
+            make_props_notebook(folder)
+        return
     for folder in args.folders or [f for f in PARAMS if f != 'AF_546_cys']:
         make_notebook(folder, overwrite=args.overwrite)
 
