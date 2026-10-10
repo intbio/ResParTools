@@ -42,7 +42,7 @@
 ## Ночь 2026-10-10 → 11 (автор разрешил; утром - разбор и перенос в основную часть)
 Ветки локально, каждая от предыдущей; push и слияние в main - только утром с автором.
 Рабочая папка `notebooks_and_examples/build/` (в .gitignore): новое поле, проверки, МД.
-- [ ] а `feature/rtp-io` - единый read_rtp / write_rtp (вместо трёх парсеров и aminoacids_dict.json)
+- [x] а `feature/rtp-io` - единый read_rtp / write_rtp (вместо трёх парсеров и aminoacids_dict.json)
 - [ ] б `feature/mol-props` - свойства молекулы по docs/MOL_PROPS.md, save_mol/load_mol;
       отдельный шаблон ноутбука без словарей (старый шаблон не меняется), прогон на эталонных папках
 - [ ] г `feature/acpype-step2` - run_acpype(mol) в topmol2, заряд из молекулы, сверка элементов

@@ -46,31 +46,10 @@ def read_rtp_charges(resname, rtp_path=DEFAULT_RTP):
     Заряды атомов остатка из секции [ atoms ] файла .rtp (GROMACS).
     Возвращает {имя атома: заряд} в порядке файла.
     """
-    charges, in_residue, in_atoms = {}, False, False
-    with open(rtp_path) as file:
-        for line in file:
-            text = line.split(';')[0].strip()
-            if not text:
-                continue
-            header = re.fullmatch(r'\[\s*(\S+)\s*\]', text)
-            if header:
-                name = header.group(1)
-                if in_residue and name not in ('atoms',):
-                    if name in ('bonds', 'impropers', 'dihedrals', 'angles', 'exclusions', 'cmap'):
-                        in_atoms = False
-                        continue
-                    break  # следующий остаток
-                if name == resname:
-                    in_residue = True
-                elif in_residue and name == 'atoms':
-                    in_atoms = True
-                continue
-            if in_residue and in_atoms:
-                parts = text.split()
-                charges[parts[0]] = float(parts[2])
-    if not charges:
+    residues = read_rtp(rtp_path)[1]
+    if resname not in residues or not residues[resname].get('atoms'):
         raise ValueError(f'Остаток {resname} не найден в {rtp_path}')
-    return charges
+    return {name: q for name, _, q, _ in residues[resname]['atoms']}
 
 
 @logged
@@ -158,3 +137,6 @@ def compare_charges(mol, charge_sets, top=10):
         print(f'{n} - {ref}: среднее |разница групп| {mean:.3f} e; наибольшие: '
               + ', '.join(f'{g} {tables[ref][g]:+.2f} -> {tables[n][g]:+.2f}' for g in worst))
     return tables
+
+
+from .forcefield import read_rtp  # noqa: E402

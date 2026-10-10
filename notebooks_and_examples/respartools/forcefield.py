@@ -1,4 +1,4 @@
-"""Файлы силового поля GROMACS: hdb, atp, r2b, удаление лишних водородов."""
+"""Файлы силового поля GROMACS: rtp (read_rtp, write_rtp), hdb, atp, r2b, удаление лишних водородов."""
 import os
 import sys
 import time
@@ -238,3 +238,69 @@ def make_r2b(path_to_r2b = '', reference_aa = '', add_aa_name = '', param_folder
     with open(save_path, 'w') as f:
         f.writelines(r2b_list)
     print(f'Save in  {save_path}')
+
+
+# -----------------------------------------------------------------------------
+# rtp: один парсер и один писатель на весь пакет
+# -----------------------------------------------------------------------------
+RTP_SECTIONS = ('atoms', 'bonds', 'angles', 'dihedrals', 'impropers', 'exclusions', 'cmap')
+RTP_BONDEDTYPES = [1, 1, 9, 4, 1, 3, 1, 0]   # amber14sb: bonds angles dihedrals impropers all_dihedrals nrexcl HH14 RemoveDih
+
+
+def read_rtp(path):
+    """
+    Файл .rtp GROMACS. Комментарии (после ;) отбрасываются.
+    Возвращает (bondedtypes - список чисел или None,
+                {остаток: {'atoms': [(имя, тип, заряд, группа)], 'bonds': [[поля]], 'angles': ..., ...}})
+    В секциях кроме atoms строка хранится списком полей как есть (имена атомов, затем параметры).
+    """
+    bondedtypes, residues, current, section = None, {}, None, None
+    with open(path) as file:
+        for line in file:
+            text = line.split(';')[0].strip()
+            if not text:
+                continue
+            header = re.fullmatch(r'\[\s*(\S+)\s*\]', text)
+            if header:
+                name = header.group(1)
+                if name == 'bondedtypes':
+                    current, section = None, 'bondedtypes'
+                elif name in RTP_SECTIONS:
+                    if current is None:
+                        raise ValueError(f'{path}: секция [ {name} ] вне остатка')
+                    section = name
+                    current.setdefault(name, [])
+                else:
+                    current, section = residues.setdefault(name, {}), None
+                continue
+            parts = text.split()
+            if section == 'bondedtypes':
+                bondedtypes = [int(x) for x in parts]
+            elif section == 'atoms':
+                current['atoms'].append((parts[0], parts[1], float(parts[2]), int(parts[3])))
+            elif section is not None:
+                current[section].append(parts)
+    return bondedtypes, residues
+
+
+def write_rtp(path, residues, bondedtypes=RTP_BONDEDTYPES):
+    """
+    Пишет .rtp: заголовок [ bondedtypes ] и остатки {имя: {'atoms': [(имя, тип, заряд, группа)], ...}}
+    (формат read_rtp). Заряды пишутся без округления.
+    """
+    lines = ['[ bondedtypes ]\n',
+             '; bonds  angles  dihedrals  impropers all_dihedrals nrexcl HH14 RemoveDih\n',
+             ' ' + ' '.join(f'{x:6d}' for x in bondedtypes) + '\n']
+    for resname, res in residues.items():
+        lines.append(f'\n[ {resname} ]\n')
+        for section in RTP_SECTIONS:
+            if section not in res:
+                continue
+            lines.append(f' [ {section} ]\n')
+            if section == 'atoms':
+                lines += [f'{n:>6} {t:>6} {q!r:>12} {g:5d}\n' for n, t, q, g in res['atoms']]
+            else:
+                lines += [''.join(f'{x:>6} ' for x in row).rstrip() + '\n' for row in res[section]]
+    with open(path, 'w') as file:
+        file.writelines(lines)
+    return path

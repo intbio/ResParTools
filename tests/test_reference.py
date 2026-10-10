@@ -182,3 +182,16 @@ def test_independent_constraints_drop_redundant():
     # 3 атома, полный заряд задаёт psiresp; фиксация всех трёх - одно ограничение лишнее
     fixed, sums, pairs, dropped = pt.resp._independent_constraints(3, {0: 0.1, 1: -0.2, 2: 0.1}, [], [[1, 2]])
     assert len(fixed) == 2 and dropped == 2
+
+
+def test_rtp_roundtrip(tmp_path):
+    """read_rtp -> write_rtp -> read_rtp не меняет ни одного остатка базового поля (заряды без округления)."""
+    path = os.path.join(ROOT, 'amber14sb_parmbsc1_cufix.ff', 'aminoacids.rtp')
+    bondedtypes, residues = pt.read_rtp(path)
+    assert bondedtypes == pt.RTP_BONDEDTYPES
+    assert {'LYS', 'CYS', 'ACE', 'NME'} <= set(residues)
+    out = pt.write_rtp(str(tmp_path / 'copy.rtp'), residues, bondedtypes)
+    assert pt.read_rtp(out) == (bondedtypes, residues)
+    lys = residues['LYS']
+    assert lys['atoms'][0] == ('N', 'N', -0.3479, 1) and ['N', 'H'] in lys['bonds']
+    assert pt.read_rtp_charges('LYS')['NZ'] == -0.3854
