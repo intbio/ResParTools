@@ -20,3 +20,6 @@ psi.*.clean
 
 # Инструкции для Claude Code: только локально
 CLAUDE.md
+
+# Настройки Claude Code этого проекта (плагин ponytail): только локально
+.claude/settings.json
