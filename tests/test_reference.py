@@ -249,3 +249,21 @@ def test_save_load_mol_roundtrip(folder, tmp_path):
         assert a.GetPropsAsDict(includePrivate=False) == b.GetPropsAsDict(includePrivate=False)
         assert b.GetPDBResidueInfo().GetResidueName() == PARAMS[folder]['base_name']
     assert back.GetProp('ChargeMethod') == 'Espaloma' and back.GetProp('Parent') == 'K'
+
+
+@pytest.mark.parametrize('folder', ['Lysine_Formyl', 'Lysine_Malonyl', 'Lysine_3M'])
+def test_run_acpype(folder, tmp_path):
+    """Шаг 2: заряд для acpype - из молекулы (Malonyl -1, 3M +1), типы в атомах, порядок сверен."""
+    _, _, residue = props_steps_1_to_4(folder)
+    residue = Chem.Mol(residue)
+    _quiet(pt.run_acpype, residue, str(tmp_path))
+    types = {a.GetProp('AtomName'): a.GetProp('AcpypeType') for a in residue.GetAtoms()}
+    assert len(types) == residue.GetNumAtoms()
+    assert types['CA'] == 'CT' and types['O'] == 'O' and types['HB1'] == 'HC'
+    itp = pt.read_itp(residue.GetProp('AcpypeItp'))
+    assert len(itp['atoms']) == residue.GetNumAtoms() + 2          # + два водорода только для acpype
+    assert abs(sum(float(r[6]) for r in itp['atoms']) - Chem.GetFormalCharge(residue)) < 1e-3
+    if folder == 'Lysine_3M':
+        assert types['NZ'] == 'N3'
+    if folder == 'Lysine_Malonyl':
+        assert types['OK1'] == types['OK2'] == 'O2'

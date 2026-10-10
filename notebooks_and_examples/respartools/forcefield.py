@@ -354,18 +354,27 @@ def _acpype_bin(acpype_bin=None):
 @logged
 def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=None, random_seed=42):
     """
-    Шаг 2: топология acpype (типы атомов и параметры связей, углов, диэдралов) для остатка
-    с водородами шага 4.1 (AddedH). Вход - MOL-файл прямо из RDKit (порядки связей и
-    3D-координаты из молекулы, без obabel), заряд - формальный заряд молекулы (не руками).
-    Порядок атомов в itp сверяется с молекулой по элементам (по массе атома).
+    Шаг 2: топология acpype (типы атомов и параметры связей, углов, диэдралов) для остатка.
+    acpype не принимает атомы с оборванной валентностью, поэтому, если в mol ещё нет
+    водородов шага 4.1 (свойство атома AddedH), они добавляются здесь
+    (add_protons_and_renumber_H) - только для acpype, в mol их нет. Вход acpype - MOL-файл
+    прямо из RDKit (порядки связей и 3D-координаты, без obabel), заряд - формальный заряд
+    молекулы (не руками). Порядок атомов itp сверяется с молекулой по элементам (по массе).
 
-    Записывает в атомы 'AcpypeType', в молекулу 'AcpypeItp' (путь к itp). Заряды acpype
-    (charge_type) не используются: заряды - шаг 5/6. Меняет и возвращает mol.
+    Записывает в атомы mol 'AcpypeType', в молекулу 'AcpypeItp' (путь к itp; атомы itp с
+    номером больше числа атомов остатка - добавленные водороды). Заряды acpype (charge_type)
+    не используются: заряды - шаг 5/6. Меняет и возвращает mol.
     """
     name = mol.GetProp('ResName') if mol.HasProp('ResName') else \
         mol.GetAtomWithIdx(0).GetPDBResidueInfo().GetResidueName().strip()
     os.makedirs(workdir, exist_ok=True)
-    work = Chem.Mol(mol)
+    has_added = any(a.HasProp('AddedH') and a.GetBoolProp('AddedH') for a in mol.GetAtoms())
+    if has_added:
+        work = Chem.Mol(mol)
+    else:
+        info = mol.GetAtomWithIdx(0).GetPDBResidueInfo()
+        work = add_protons_and_renumber_H(mol, resname=name, resid=info.GetResidueNumber() if info else 1,
+                                          segid=info.GetChainId() if info else 'A')
     if not work.GetNumConformers() or not work.GetConformer().Is3D():
         work = set_mol_coords(work, coords='3D', random_seed=random_seed)
     mol_path = os.path.join(workdir, f'{name}.mol')
@@ -383,17 +392,19 @@ def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=No
                            + ' | '.join(tail))
     atoms = read_itp(itp)['atoms']
     table = Chem.GetPeriodicTable()
-    if len(atoms) != mol.GetNumAtoms():
-        raise ValueError(f'В itp {len(atoms)} атомов, в молекуле {mol.GetNumAtoms()}')
-    wrong = [(a.GetIdx(), a.GetSymbol(), row[7]) for a, row in zip(mol.GetAtoms(), atoms)
+    if len(atoms) != work.GetNumAtoms():
+        raise ValueError(f'В itp {len(atoms)} атомов, во входе acpype {work.GetNumAtoms()}')
+    wrong = [(a.GetIdx(), a.GetSymbol(), row[7]) for a, row in zip(work.GetAtoms(), atoms)
              if abs(table.GetAtomicWeight(a.GetSymbol()) - float(row[7])) > 0.1]
     if wrong:
         raise ValueError(f'Порядок атомов itp не совпадает с молекулой (индекс, элемент, масса в itp): {wrong[:5]}')
     for atom, row in zip(mol.GetAtoms(), atoms):
         atom.SetProp('AcpypeType', row[1])
     mol.SetProp('AcpypeItp', os.path.abspath(itp))
-    print(f'acpype ({atom_type}, заряд {net:+d}): {len(atoms)} атомов, типы записаны в AcpypeType; {itp}')
+    print(f'acpype ({atom_type}, заряд {net:+d}): {len(atoms)} атомов'
+          + ('' if has_added else f' (из них {len(atoms) - mol.GetNumAtoms()} водорода только для acpype)')
+          + f', типы записаны в AcpypeType; {itp}')
     return mol
 
 
-from .residue import set_mol_coords  # noqa: E402
+from .residue import set_mol_coords, add_protons_and_renumber_H  # noqa: E402
