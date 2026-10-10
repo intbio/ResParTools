@@ -320,3 +320,21 @@ def test_write_forcefield_formyl(tmp_path):
     assert ('C8', 'N') in explicit['bonds']             # в amber14sb нет связи C8-N амида
     assert open(os.path.join(ff, 'residuetypes.dat')).read().count('KFO\t') == 1
     assert open(os.path.join(ff, 'KFO.hdb')).read().startswith('KFO\t8\n')
+
+
+def test_validate_vacuum_formyl(tmp_path):
+    """Проверка в GROMACS: pdb2gmx -ignh (водороды по hdb), grompp без предупреждений, минимизация."""
+    try:
+        pt.gmx._gmx_bin()
+    except FileNotFoundError:
+        pytest.skip('нет GROMACS (окружение gmx)')
+    monomer, _, residue = props_steps_1_to_4('Lysine_Formyl')
+    residue = Chem.Mol(residue)
+    _quiet(pt.run_acpype, residue, str(tmp_path / 'acpype'))
+    pt.set_charges(residue, json.load(open(os.path.join(ROOT, 'Lysine_Formyl', 'AI_chrges_K_form.json'))), 'Espaloma')
+    ff = str(tmp_path / 'amber14sb_test.ff')
+    _quiet(pt.write_forcefield, residue, ff)
+    work = _quiet(pt.write_validate_job, residue, monomer, ff, str(tmp_path / 'validate'))
+    rep = _quiet(pt.run_validate, work, n_threads=1)
+    assert rep['ok'], rep['problems']
+    assert rep['stages'] == ['pdb2gmx', 'grompp', 'em_vac'] and rep['atoms_match']
