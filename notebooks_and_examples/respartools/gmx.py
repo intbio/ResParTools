@@ -87,7 +87,8 @@ echo em_vac >> status.txt
 _SCRIPT_MD = """cp topol.top topol_vacuum.top
 $G editconf -f em_vac.gro -o box.gro -c -d 1.0 -bt dodecahedron > editconf.log 2>&1
 $G solvate -cp box.gro -cs spc216.gro -o solv.gro -p topol.top > solvate.log 2>&1
-$G grompp -f ions.mdp -c solv.gro -p topol.top -o ions.tpr -maxwarn 0 > grompp_ions.log 2>&1
+# до genion система может быть заряжена (предупреждение о PME и заряде) - ионы это и исправляют
+$G grompp -f ions.mdp -c solv.gro -p topol.top -o ions.tpr -maxwarn 1 > grompp_ions.log 2>&1
 echo SOL | $G genion -s ions.tpr -o ions.gro -p topol.top -pname NA -nname CL -neutral > genion.log 2>&1
 $G grompp -f em.mdp -c ions.gro -p topol.top -o em.tpr -maxwarn 0 > grompp_em.log 2>&1
 $G mdrun -deffnm em -nt $NT > mdrun_em.log 2>&1
