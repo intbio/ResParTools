@@ -48,9 +48,9 @@
 - [x] г `feature/acpype-step2` - run_acpype(mol) в topmol2, заряд из молекулы, сверка элементов
 - [x] в `feature/ff-step3` - assign_types / write_forcefield, исправления REVIEW.md 1,3,4 → build/amber14sb_mod.ff
 - [x] д `feature/validate-md` - validate: pdb2gmx -ignh, grompp, EM (local + slurm); МД ACE-X-NME в TIP3P 1 нс, 12 лизинов - все 12 ✓
-- [ ] RESP локально: Formyl, 1M, ACC (по очереди с МД) - Formyl готов; 1M: alphaR_2 не сошлась (повтор после ACC)
+- [ ] RESP локально: Formyl, 1M, ACC - Formyl готов; 1M, ACC: beta_2 (оба) и alphaR_2 (ACC) не сходятся - вопрос утром
 - [x] `integration/night-2026-10-10` - всё вместе, полный набор тестов (с AF546) - 46/46
-- [ ] утренний отчёт: docs/NIGHT_REPORT.md
+- [x] утренний отчёт: docs/NIGHT_REPORT.md
 
 ## Дальше (в порядке приоритета)
 1. **Сверка базового силового поля**: `amber14sb_parmbsc1_cufix.ff` (наша модифицированная
