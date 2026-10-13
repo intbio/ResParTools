@@ -177,6 +177,23 @@ def test_resp_prepare(folder, tmp_dir):
         assert {'OK1', 'OK2'} in groups, 'кислороды карбоксилата должны быть эквивалентны'
 
 
+def test_resp_job_folder(tmp_path):
+    """Повторный prepare: та же задача - та же папка (прогресс сохраняется), другая - новая папка."""
+    spec = {'name': 'x', 'qm': {'max_opt_steps': 400}}
+    starts = {'alphaR_1': np.zeros((2, 3))}
+    folder = str(tmp_path / 'job')
+    assert pt._job_folder(folder, spec, starts) == folder
+    os.makedirs(os.path.join(folder, 'conformers', 'alphaR_1'))
+    with open(os.path.join(folder, pt.SPEC_FILE), 'w') as f:
+        json.dump(spec, f)
+    with open(os.path.join(folder, 'conformers', 'alphaR_1', 'start.xyz'), 'w') as f:
+        f.write(pt._xyz_block(['C', 'H'], starts['alphaR_1'], 0))
+    assert pt._job_folder(folder, spec, starts) == folder
+    moved = {'alphaR_1': starts['alphaR_1'] + 0.1}
+    assert _quiet(pt._job_folder, folder, spec, moved) == folder + '_01'
+    assert _quiet(pt._job_folder, folder, dict(spec, qm={'max_opt_steps': 100}), starts) == folder + '_01'
+
+
 def test_independent_constraints_drop_redundant():
     """Линейно зависимые ограничения отбрасываются (иначе матрица psiresp вырождена)."""
     # 3 атома, полный заряд задаёт psiresp; фиксация всех трёх - одно ограничение лишнее

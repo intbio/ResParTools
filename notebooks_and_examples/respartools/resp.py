@@ -35,7 +35,7 @@ from rdkit.Chem import AllChem, rdMolAlign
 from rdkit.Chem import rdMolTransforms
 
 from .log import logged, log_note
-from .utils import format_time, print_red, _PACKAGE_ROOT
+from .utils import format_time, print_red, rename_folder, _PACKAGE_ROOT
 
 # пары (phi, psi) остова в градусах: области alphaR и beta карты Рамачандрана
 AMBER_BACKBONE_CONFORMATIONS = {'alphaR': (-60.0, -40.0), 'beta': (-120.0, 130.0)}
@@ -514,19 +514,50 @@ def _read_xyz(path):
     return np.array([[float(v) for v in line.split()[1:4]] for line in lines[2:2 + n]])
 
 
+def _job_folder(folder, spec, starts, atol=1e-4):
+    """
+    Папка для задачи RESP. Если в folder уже есть задача и она та же (spec.json и стартовые
+    геометрии конформаций совпадают), возвращается folder - повторный запуск продолжит расчёт.
+    Если другая - folder_01, folder_02... (первая свободная или с той же задачей); старая не меняется.
+    """
+    spec = json.loads(json.dumps(spec))
+    candidate = folder
+    while os.path.exists(os.path.join(candidate, SPEC_FILE)):
+        with open(os.path.join(candidate, SPEC_FILE)) as f:
+            same = json.load(f) == spec
+        for label, coords in starts.items():
+            path = os.path.join(candidate, 'conformers', label, 'start.xyz')
+            same = same and os.path.exists(path) and np.allclose(_read_xyz(path), coords, atol=atol)
+        if same:
+            break
+        candidate = rename_folder(candidate)
+    if candidate != folder:
+        print_red(f'⚠ В {folder} уже другая задача RESP (конформации или настройки отличаются) - '
+                  f'она не тронута; задача пишется в {candidate}.')
+    return candidate
+
+
 @logged
 def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', context='capped',
                      context_chem=None, fix_backbone=True, n_sidechain=3, conformer_pool=300,
                      energy_window=10.0, exclude_contacts=True, random_seed=42, method='hf',
-                     basis='6-31g*', g_convergence='gau', opt_chunk=50, max_opt_steps=400,
+                     basis='6-31g*', g_convergence='gau', opt_chunk=None, max_opt_steps=400,
                      scf_type='df', monomer=None):
     """
     Готовит папку задачи RESP: молекула расчёта, конформации, ограничения, настройки
     (spec.json). Квантовая химия не запускается. Параметры - см. resp_charges.
     monomer (Chem.Mol) - мономер шага 1: из него берётся стереохимия (capped_monomer);
         без него (остаток шага 4 - 2D, без стереохимии) CA задаётся L, остальные центры - R.
+    Если в папке <working_dir>/<name> уже есть другая задача (другие конформации или
+    настройки), новая пишется в <name>_01, <name>_02...: прогресс старой не смешивается с
+    новой. Та же задача (повторный запуск) остаётся в своей папке, прогресс сохраняется.
+    opt_chunk - устаревший параметр (оптимизация порциями), не используется.
     Возвращает путь к папке задачи.
     """
+    if opt_chunk is not None:
+        print_red(f'⚠ opt_chunk={opt_chunk} устарел и не используется: конформация оптимизируется '
+                  f'одним расчётом psi4 до max_opt_steps={max_opt_steps} шагов (при порциях psi4 '
+                  'терял гессиан и давал PSIO_ERROR).')
     if context not in RESP_CONTEXTS:
         raise ValueError(f"context='{context}': допустимо {RESP_CONTEXTS}")
     n_res = residue_chem.GetNumAtoms()
@@ -575,8 +606,6 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
             eq[rank].append(idx)
     groups = [g for g in eq.values() if len(g) > 1]
 
-    folder = os.path.abspath(os.path.join(working_dir, name))
-    os.makedirs(folder, exist_ok=True)
     symbols = [a.GetSymbol() for a in conf_mol.GetAtoms()]
     res_names = {mapping[i]: residue_chem.GetAtomWithIdx(i).GetProp('AtomName')
                  for i in range(n_res) if residue_chem.GetAtomWithIdx(i).HasProp('AtomName')}
@@ -593,18 +622,11 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
             atom_names.append(f'{atom.GetSymbol()}{atom.GetIdx()}')
             atom_residues.append('сосед')
     frozen = [] if _backbone_pairs(fix_backbone) is None else [dihedrals['phi'], dihedrals['psi']]
-    conformers = []
-    for d in described:
-        cdir = os.path.join(folder, 'conformers', d['label'])
-        os.makedirs(cdir, exist_ok=True)
-        coords = conf_mol.GetConformer(d['conf_id']).GetPositions()
-        with open(os.path.join(cdir, 'start.xyz'), 'w') as f:
-            f.write(_xyz_block(symbols, coords, 0, d['label']))
-        conformers.append({k: v for k, v in d.items() if k != 'conf_id'})
+    starts = {d['label']: conf_mol.GetConformer(d['conf_id']).GetPositions() for d in described}
+    conformers = [{k: v for k, v in d.items() if k != 'conf_id'} for d in described]
     first = Chem.Mol(conf_mol)
     first.RemoveAllConformers()
     first.AddConformer(Chem.Conformer(conf_mol.GetConformer(described[0]['conf_id'])), assignId=True)
-    Chem.MolToPDBFile(first, os.path.join(folder, 'molecule.pdb'))
     spec = {
         'name': name, 'context': context, 'molblock': Chem.MolToMolBlock(first),
         'symbols': symbols, 'total_charge': Chem.GetFormalCharge(conf_mol), 'multiplicity': 1,
@@ -616,8 +638,15 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
         'stereo': {(f'{atom_names[k[1]]}={atom_names[k[2]]}' if isinstance(k, tuple) else atom_names[k]): v
                    for k, v in labels.items()},
         'qm': {'method': method, 'basis': basis, 'g_convergence': g_convergence, 'scf_type': scf_type,
-               'opt_chunk': opt_chunk, 'max_opt_steps': max_opt_steps},
+               'max_opt_steps': max_opt_steps},
     }
+    folder = _job_folder(os.path.abspath(os.path.join(working_dir, name)), spec, starts)
+    for label, coords in starts.items():
+        cdir = os.path.join(folder, 'conformers', label)
+        os.makedirs(cdir, exist_ok=True)
+        with open(os.path.join(cdir, 'start.xyz'), 'w') as f:
+            f.write(_xyz_block(symbols, coords, 0, label))
+    Chem.MolToPDBFile(first, os.path.join(folder, 'molecule.pdb'))
     with open(os.path.join(folder, SPEC_FILE), 'w') as f:
         json.dump(spec, f, indent=1)
     print(f'Задача RESP: {folder} | молекула {len(symbols)} атомов (заряд {spec["total_charge"]:+d}, '
@@ -680,13 +709,18 @@ def review_resp_job(folder, image=True):
 
 
 def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
-    """Оптимизирует одну конформацию в psi4 порциями (вызывается в отдельном процессе)."""
+    """
+    Оптимизирует одну конформацию в psi4 одним расчётом до max_opt_steps шагов (вызывается
+    в отдельном процессе): гессиан optking не теряется между шагами. Не сошлось за
+    max_opt_steps - последняя геометрия в current.xyz, повторный запуск начинает с неё;
+    psi4 упал (например, SCF) - геометрия в failed.xyz (для разбора). Причина - в status.json.
+    """
     import psi4
     spec = json.load(open(os.path.join(folder, SPEC_FILE)))
     qm = spec['qm']
     cdir = os.path.join(folder, 'conformers', label)
     status_path = os.path.join(cdir, 'status.json')
-    status = json.load(open(status_path)) if os.path.exists(status_path) else {'steps': 0}
+    status = json.load(open(status_path)) if os.path.exists(status_path) else {}
     if status.get('converged'):
         return status
     current = os.path.join(cdir, 'current.xyz')
@@ -697,43 +731,30 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     psi4.core.set_output_file(os.path.join(cdir, 'opt.out'), True)
     psi4.set_num_threads(n_threads)
     psi4.set_memory(memory)
-    options = {'geom_maxiter': qm['opt_chunk'], 'g_convergence': qm['g_convergence'],
+    options = {'geom_maxiter': qm['max_opt_steps'], 'g_convergence': qm['g_convergence'],
                'scf_type': qm['scf_type']}
     if spec['frozen']:
         options['frozen_dihedral'] = ' '.join(str(i + 1) for quad in spec['frozen'] for i in quad)
     psi4.set_options(options)
-
-    def geometry(xyz):
-        body = '\n'.join(f'{s} {x:.8f} {y:.8f} {z:.8f}' for s, (x, y, z) in zip(spec['symbols'], xyz))
-        return psi4.geometry(f"{spec['total_charge']} {spec['multiplicity']}\n{body}\n"
-                             'units angstrom\nsymmetry c1\nno_com\nno_reorient\n')
-
-    method = f"{qm['method']}/{qm['basis']}"
-    while status['steps'] < qm['max_opt_steps']:
-        mol = geometry(coords)
-        try:
-            energy = psi4.optimize(method, molecule=mol)
-            coords = mol.geometry().np * psi4.constants.bohr2angstroms
-            status.update(converged=True, energy=float(energy))
-            status['steps'] += qm['opt_chunk']   # верхняя оценка: последняя порция могла быть короче
-            with open(os.path.join(cdir, 'optimized.xyz'), 'w') as f:
-                f.write(_xyz_block(spec['symbols'], coords, spec['total_charge'], label))
-            break
-        except psi4.OptimizationConvergenceError as e:
-            last = e.wfn.molecule()
-            coords = last.geometry().np * psi4.constants.bohr2angstroms
-            status['steps'] += qm['opt_chunk']
-            with open(current, 'w') as f:
-                f.write(_xyz_block(spec['symbols'], coords, spec['total_charge'], label))
-            # очистка перед следующей порцией: без opt_clean optking даёт PSIO_ERROR,
-            # а до первой оптимизации opt_clean вызывать нельзя (segfault psi4 1.6)
-            psi4.core.clean()
-            psi4.core.opt_clean()
-        finally:
-            with open(status_path, 'w') as f:
-                json.dump(status, f)
-    else:
-        status['converged'] = False
+    body = '\n'.join(f'{s} {x:.8f} {y:.8f} {z:.8f}' for s, (x, y, z) in zip(spec['symbols'], coords))
+    mol = psi4.geometry(f"{spec['total_charge']} {spec['multiplicity']}\n{body}\n"
+                        'units angstrom\nsymmetry c1\nno_com\nno_reorient\n')
+    status = {'runs': status.get('runs', 0) + 1, 'converged': False}
+    try:
+        energy = psi4.optimize(f"{qm['method']}/{qm['basis']}", molecule=mol)
+        status.update(converged=True, energy=float(energy))
+        last, out = mol, 'optimized.xyz'
+    except psi4.OptimizationConvergenceError as e:
+        status['error'] = f"не сошлось за {qm['max_opt_steps']} шагов"
+        last, out = e.wfn.molecule(), 'current.xyz'
+    except Exception as e:
+        # SCF и др.: геометрия, на которой упал psi4, - для разбора (failed.xyz); повторный
+        # запуск начнёт с прежней current.xyz / start.xyz, а не с неё
+        status['error'] = f'{type(e).__name__}: {e}'.strip().splitlines()[0]
+        last, out = psi4.core.get_legacy_molecule(), 'failed.xyz'
+    coords = last.geometry().np * psi4.constants.bohr2angstroms
+    with open(os.path.join(cdir, out), 'w') as f:
+        f.write(_xyz_block(spec['symbols'], coords, spec['total_charge'], label))
     with open(status_path, 'w') as f:
         json.dump(status, f)
     shutil.rmtree(scratch, ignore_errors=True)
@@ -802,8 +823,9 @@ def run_resp_job(folder, n_threads=4, n_parallel=1, memory='4 GB', n_processes=N
                 for label in labels}
     bad = [label for label, s in statuses.items() if not s.get('converged')]
     if bad:
-        raise RuntimeError(f'Не сошлись за {spec["qm"]["max_opt_steps"]} шагов: {bad}. '
-                           'Повторный запуск продолжит с последней геометрии (увеличьте max_opt_steps).')
+        raise RuntimeError('Оптимизация не сошлась: '
+                           + '; '.join(f"{label} - {statuses[label].get('error', '?')}" for label in bad)
+                           + '. Повторный запуск продолжит с current.xyz (если есть), иначе с start.xyz.')
 
     # проверка: не свернулась ли боковая цепь к остову при оптимизации (артефакт газовой фазы)
     if spec.get('contact_atoms'):
@@ -1168,8 +1190,8 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
             текущее, если в нём есть psiresp, иначе darwin_resp рядом с текущим окружением
         slurm (dict) - для run='slurm': cpus, mem, time_limit, partition, env_setup
             (по умолчанию 24 ядра, 32G, 8 часов, окружение darwin_resp - CLUSTER_ENV_SETUP)
-        **qm_options - method='hf', basis='6-31g*', g_convergence='gau', opt_chunk=50,
-            max_opt_steps=400, scf_type='df' (opt_chunk - шагов оптимизации между сохранениями геометрии)
+        **qm_options - method='hf', basis='6-31g*', g_convergence='gau', max_opt_steps=400,
+            scf_type='df' (opt_chunk устарел: оптимизация - одним расчётом psi4)
     Возвращает:
         np.ndarray - заряды атомов остатка (run='local'), иначе путь к папке задачи
     """
