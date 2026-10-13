@@ -96,7 +96,7 @@ def test_general_atoms_match_committed(folder, tmp_dir):
     """general_atoms.json (атомы родительского остатка для 3_edd_topology) - как в git."""
     _, residue, parent, _, _ = steps_1_to_4(folder, tmp_dir)
     names = [residue.GetAtomWithIdx(i).GetProp('AtomName') for i in parent]
-    with open(os.path.join(ROOT, folder, 'general_atoms.json')) as f:
+    with open(os.path.join(ROOT, folder, 'data', 'general_atoms.json')) as f:
         assert names == json.load(f)
 
 
@@ -242,7 +242,7 @@ def test_props_path_matches_committed(folder):
     names, resnames, _ = _pdb_names(os.path.join(ROOT, folder, 'molecules', 'substructure', f'4_{mon}.pdb'))
     assert [a.GetProp('AtomName') for a in residue.GetAtoms()] == names
     assert resnames == {PARAMS[folder]['base_name']}
-    general = json.load(open(os.path.join(ROOT, folder, 'general_atoms.json')))
+    general = json.load(open(os.path.join(ROOT, folder, 'data', 'general_atoms.json')))
     assert [a.GetProp('AtomName') for a in residue.GetAtoms() if a.HasProp('ParentName')] == general
     # сквозные индексы указывают на тот же элемент в мономере и тримере
     for a in residue.GetAtoms():
@@ -320,7 +320,7 @@ def test_write_forcefield_formyl(tmp_path):
     _, _, residue = props_steps_1_to_4('Lysine_Formyl')
     residue = Chem.Mol(residue)
     _quiet(pt.run_acpype, residue, str(tmp_path / 'acpype'))
-    q = json.load(open(os.path.join(ROOT, 'Lysine_Formyl', 'AI_chrges_K_form.json')))
+    q = json.load(open(os.path.join(ROOT, 'Lysine_Formyl', 'data', 'AI_chrges_K_form.json')))
     pt.set_charges(residue, q, 'Espaloma')
     ff = str(tmp_path / 'test.ff')
     for _ in range(2):
@@ -375,7 +375,7 @@ def test_validate_vacuum_formyl(tmp_path):
     monomer, _, residue = props_steps_1_to_4('Lysine_Formyl')
     residue = Chem.Mol(residue)
     _quiet(pt.run_acpype, residue, str(tmp_path / 'acpype'))
-    pt.set_charges(residue, json.load(open(os.path.join(ROOT, 'Lysine_Formyl', 'AI_chrges_K_form.json'))), 'Espaloma')
+    pt.set_charges(residue, json.load(open(os.path.join(ROOT, 'Lysine_Formyl', 'data', 'AI_chrges_K_form.json'))), 'Espaloma')
     ff = str(tmp_path / 'amber14sb_test.ff')
     _quiet(pt.write_forcefield, residue, ff)
     work = _quiet(pt.write_validate_job, residue, monomer, ff, str(tmp_path / 'validate'))

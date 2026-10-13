@@ -162,7 +162,7 @@ def cmd_collect(args):
         if folded:
             print(f'⚠ после оптимизации боковая цепь касается остова: {folded}')
         names = [a.GetProp('AtomName') for a in residue.GetAtoms()]
-        espaloma = os.path.join(ROOT, folder, f'AI_chrges_{mon}.json')
+        espaloma = os.path.join(ROOT, folder, 'data', f'AI_chrges_{mon}.json')
         sets = {'RESP': q}
         if os.path.exists(espaloma):
             sets = {'Espaloma': pt.load_charges_json(espaloma, names), 'RESP': q}
@@ -170,7 +170,7 @@ def cmd_collect(args):
         cwd = os.getcwd()
         os.chdir(os.path.join(ROOT, folder))
         try:
-            pt.save_charges_json(name=f'RESP_chrges_{mon}', charge_list=[float(x) for x in q], atom_names=names)
+            pt.save_charges_json(name=f'RESP_chrges_{mon}', charge_list=[float(x) for x in q], path='data', atom_names=names)
         finally:
             os.chdir(cwd)
 
