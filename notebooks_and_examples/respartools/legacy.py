@@ -2,39 +2,17 @@
 import os
 import sys
 import time
-import re
-import glob
-import json
-from pathlib import Path
-from collections import Counter
-from collections import defaultdict, deque
-import numpy as np
 
-import itertools
 import threading
 import subprocess
 
-from decimal import Decimal as D
 
-from rdkit.Chem.Draw import IPythonConsole
 from rdkit import Chem
-from rdkit.Chem import AllChem, Draw, rdFMCS
-from rdkit.Chem import rdDepictor
-from rdkit.Geometry import Point3D
-from typing import Callable
+from rdkit.Chem import AllChem
 
-import datetime
-import functools
-import hashlib
-import inspect
-import platform
-import traceback
-import warnings
-from rdkit.Chem import rdMolDescriptors
-from rdkit.Chem.Draw import rdMolDraw2D
 
 from .log import logged
-from .utils import (animate, format_time, get_unique_folder_name, print_green, print_red,
+from .utils import (animate, format_time, get_unique_folder_name, path_parser, print_green, print_red,
                     show_list_of_conf)
 
 
@@ -65,16 +43,146 @@ def save_substructure_mol(match_dict, path, names, resname='MOD', resid=1, segid
     """
     Старое сохранение подструктур из match_mon_to_pol. Кода старой версии нет в репозитории;
     для каждого имени из names подструктура match_dict['substructure'][имя] сохраняется
-    в <path>/<имя>.pdb (с именами атомов и параметрами остатка, save_aa_chem_to_pdb)
+    в <path>/<имя>.pdb (с именами атомов и параметрами остатка, save_chem_to_pdb)
     и <path>/<имя>.smiles (с номерами атомов).
     Замена: шаги 2.2 и 3 нового 1_charge_calculation.ipynb.
     """
     print_red('⚠ save_substructure_mol устарела: подструктуры сохраняются через '
-              'save_aa_chem_to_pdb и save_chem_to_smiles (см. шаги 2.2 и 3 нового ноутбука).')
+              'save_chem_to_pdb(..., no_H=True) и save_chem_to_smiles (см. шаги 2.2 и 3 нового ноутбука).')
     for name in names:
         substructure = match_dict['substructure'][name]
-        save_aa_chem_to_pdb(substructure, f'{path}/{name}', resname=resname, resid=resid, segid=segid)
+        save_chem_to_pdb(substructure, f'{path}/{name}', resname=resname, resid=resid, segid=segid, no_H=True)
         save_chem_to_smiles(substructure, f'{path}/{name}', canonical=False, atom_map=True)
+
+
+# =============================================================================
+# УСТАРЕВШЕЕ ИЗ fileio: перестановка атомов через SMILES (make_N_root, rootedAtAtom),
+# старые функции сохранения. Работают, как раньше, с предупреждением.
+# Замена: порядок атомов остатка - renumber_residue_atoms; сохранение - save_chem_to_pdb,
+# save_chem_to_smiles(atom_map=True), save_mol.
+# =============================================================================
+
+def find_amino_nitrogen(mol):
+    """
+    Находит индекс атома азота в составе аминокислоты.
+    Предполагается, что любая а.к. имеет вид основу [H][N]CC=O.
+    """
+    aa_base = '[H][N]CC=O'
+    sub_base = mol.GetSubstructMatch(Chem.MolFromSmarts(aa_base))
+    if sub_base:
+        print(f"atom number: {sub_base[1]} became the root atom: 0")
+        return sub_base[1]
+    return -1
+
+
+def _reroot_via_smiles(rdkit_mol, rootedAtAtom, func_name, sanitize):
+    """
+    Старое поведение rootedAtAtom в save_chem_to_pdb / save_chem_to_mol: молекула
+    переписывается через SMILES с корнем в атоме rootedAtAtom. Индексы атомов меняются,
+    имена атомов, параметры остатка, свойства молекулы и координаты теряются.
+    """
+    print_red(f'⚠ {func_name}(rootedAtAtom={rootedAtAtom}) устарел: атомы переставляются через '
+              'SMILES, индексы меняются, имена атомов и параметры остатка теряются. '
+              'Для порядка атомов остатка используйте renumber_residue_atoms.')
+    smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True,
+                                     allHsExplicit=True, rootedAtAtom=rootedAtAtom)
+    return Chem.MolFromSmiles(smiles_string, sanitize=sanitize)
+
+
+def _make_N_root(rdkit_mol, func_name):
+    """
+    Старое make_N_root=True в smi_to_chem: молекула переписывается через SMILES с корнем в
+    азоте аминогруппы, затем тяжёлые атомы ставятся перед водородами.
+    """
+    print_red(f'⚠ {func_name}(make_N_root=True) устарел: атомы переставляются через SMILES. '
+              'Для порядка атомов остатка используйте renumber_residue_atoms.')
+    root_idx = find_amino_nitrogen(rdkit_mol)
+    if root_idx != -1:
+        smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True, allHsExplicit=True, rootedAtAtom=root_idx)
+        rdkit_mol = Chem.MolFromSmiles(smiles_string, sanitize=False)
+        if rdkit_mol is None:
+            raise ValueError("Ошибка при создании молекулы после перенумерации атомов")
+    else:
+        print("Азот аминогруппы не найден. Корень не изменён.")
+    Chem.SanitizeMol(rdkit_mol)
+    atom_order = [atom.GetIdx() for atom in rdkit_mol.GetAtoms() if atom.GetSymbol() != 'H']
+    atom_order += [atom.GetIdx() for atom in rdkit_mol.GetAtoms() if atom.GetSymbol() == 'H']
+    return Chem.RenumberAtoms(rdkit_mol, atom_order)
+
+
+@logged
+def save_aa_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, make_N_root=False,
+                           atom_map=False):
+    """
+    Старое имя save_chem_to_smiles (параметры те же, порядок позиционных аргументов прежний).
+    make_N_root=True - строка начинается с азота аминогруппы (find_amino_nitrogen);
+    меняется только текст строки, не молекула.
+    """
+    print_red('⚠ save_aa_chem_to_smiles устарела: используйте save_chem_to_smiles '
+              '(для порядка атомов - atom_map=True).')
+    rootedAtAtom = find_amino_nitrogen(rdkit_mol) if make_N_root else -1
+    save_chem_to_smiles(rdkit_mol, path, canonical=canonical, allHsExplicit=allHsExplicit,
+                        rootedAtAtom=rootedAtAtom, atom_map=atom_map)
+
+
+@logged
+def save_aa_chem_to_pdb(rdkit_mol, path, resname='MOD', resid=1, segid='A', make_N_root=False,
+                        atom_names_list=None, naming='greek', parent_atoms=None, coords='2D',
+                        stereo=None, ca_config='L', stereo_default='R', random_seed=42):
+    """
+    Старое сохранение остатка в PDB: теперь save_chem_to_pdb(..., resname=..., no_H=True).
+    Пишет <path>.pdb и <path>_no_H.pdb. make_N_root - устаревший параметр (перестановка атомов
+    через SMILES с корнем в аминогруппе); atom_names_list не используется.
+    """
+    print_red('⚠ save_aa_chem_to_pdb устарела: используйте save_chem_to_pdb(mol, path, resname=..., '
+              'resid=..., segid=..., naming=..., parent_atoms=..., no_H=True).')
+    if make_N_root and parent_atoms is not None:
+        raise ValueError('make_N_root переставляет атомы, и индексы parent_atoms перестают им '
+                         'соответствовать: используйте что-то одно.')
+    if make_N_root:
+        root_idx = find_amino_nitrogen(rdkit_mol)
+        if root_idx != -1:
+            rdkit_mol = _reroot_via_smiles(rdkit_mol, root_idx, 'save_aa_chem_to_pdb', sanitize=False)
+            if rdkit_mol is None:
+                raise ValueError("Ошибка при создании молекулы после перенумерации атомов")
+    save_chem_to_pdb(rdkit_mol, path, coords=coords, stereo=stereo, ca_config=ca_config,
+                     stereo_default=stereo_default, random_seed=random_seed, resname=resname,
+                     resid=resid, segid=segid, naming=naming, parent_atoms=parent_atoms, no_H=True)
+
+
+def write_modified_molecule(mol, output_path):
+    """
+    Записывает измененную молекулу в PDB-файл.
+    """
+    print_red('⚠ write_modified_molecule устарела: используйте save_chem_to_pdb.')
+    writer = Chem.PDBWriter(output_path)
+    for atom in mol.GetAtoms():
+        atom.SetMonomerType(atom.GetProp('AtomName'))
+    writer.write(mol)
+    writer.close()
+
+
+@logged
+def save_molecule_as_pdb(molecule, filename, format_coord='3D'):
+    """
+    Сохраняет молекулу в формате PDB (<filename>_<format_coord>.pdb). Меняет координаты
+    переданной молекулы; 3D - со случайной стереохимией.
+    """
+    print_red("⚠ save_molecule_as_pdb устарела: используйте save_chem_to_pdb(mol, path, coords='3D') - "
+              'молекула не меняется, стереохимия задаётся.')
+    if format_coord == '2D':
+        AllChem.Compute2DCoords(molecule)
+    elif format_coord == '3D':
+        Chem.SanitizeMol(molecule)
+        AllChem.EmbedMolecule(molecule)
+        AllChem.UFFOptimizeMolecule(molecule)
+    else:
+        raise ValueError("Недопустимый формат. Выберите '2D' или '3D'.")
+    path_to_file, file_name = path_parser(filename, ['pdb'])
+    save_path = f'{path_to_file}/{file_name}_{format_coord}.pdb'
+    with open(save_path, 'w') as pdb_file:
+        pdb_file.write(Chem.MolToPDBBlock(molecule))
+    print(f"Молекула успешно сохранена в файле {save_path} в формате {format_coord}.")
 
 
 # =============================================================================
@@ -117,29 +225,6 @@ def add_constraint(RESP_mol, symmetric_list: list, charge_dict: dict, loc_charge
         for index, charge in charge_dict.items():
             constraints.add_charge_sum_constraint_for_molecule(RESP_mol, charge=charge, indices=index)
     return constraints
-
-
-def prepere_constraints(mol_name, mol_chem_dict, match_dict, constraint_dict, optimize_geometry=True,
-                        charge=0, conformer_generation_options=None, symmetric_atoms_are_equivalent=True):
-    """Старая подготовка молекулы psiresp и ограничений по constraint_dict (см. add_constraint)."""
-    import psiresp
-    if conformer_generation_options is None:
-        conformer_generation_options = dict(n_conformer_pool=1000, n_max_conformers=3,
-                                            energy_window=100, keep_original_conformer=False)
-    psiresp_dict = {}
-    RESP_mol = psiresp.Molecule.from_rdkit(mol_chem_dict[mol_name],
-                                           optimize_geometry=optimize_geometry, charge=charge,
-                                           conformer_generation_options=conformer_generation_options)
-    psiresp_dict[mol_name] = RESP_mol
-    constraints = psiresp.ChargeConstraintOptions(
-        symmetric_atoms_are_equivalent=symmetric_atoms_are_equivalent)
-    constraints = add_constraint(RESP_mol,
-                                 constraint_dict[mol_name]['symmetric_list'],
-                                 constraint_dict[mol_name]['charge_atom_dict'],
-                                 constraint_dict[mol_name]['charge_of_monomer'],
-                                 list(match_dict['mon_pol_matches'][mol_name].values()),
-                                 constraints=constraints)
-    return psiresp_dict, constraints
 
 
 def run_job(RESP_mol, name_of_system, constraints, n_processes=None, resp_options=None):
@@ -212,5 +297,5 @@ def resp_calculation(psiresp_dict, constraints, n_processes=None, folder_name='R
 
 
 # Импорт из других модулей пакета - в конце файла (см. docs/PIPELINE.md, правило импортов).
-from .fileio import save_aa_chem_to_pdb, save_chem_to_smiles  # noqa: E402
+from .fileio import save_chem_to_pdb, save_chem_to_smiles  # noqa: E402
 from .residue import renumber_residue_atoms  # noqa: E402

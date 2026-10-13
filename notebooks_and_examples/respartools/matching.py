@@ -1,37 +1,14 @@
 """Сопоставление подструктур (MCS), шаблоны родительских остатков, find_ref_residue."""
 import os
-import sys
-import time
-import re
 import glob
-import json
-from pathlib import Path
-from collections import Counter
-from collections import defaultdict, deque
-import numpy as np
 
-import itertools
 import threading
-import subprocess
 
-from decimal import Decimal as D
 
-from rdkit.Chem.Draw import IPythonConsole
 from rdkit import Chem
-from rdkit.Chem import AllChem, Draw, rdFMCS
-from rdkit.Chem import rdDepictor
-from rdkit.Geometry import Point3D
-from typing import Callable
+from rdkit.Chem import rdFMCS
 
-import datetime
-import functools
-import hashlib
-import inspect
-import platform
-import traceback
 import warnings
-from rdkit.Chem import rdMolDescriptors
-from rdkit.Chem.Draw import rdMolDraw2D
 
 from .log import logged, log_note
 from .utils import _PACKAGE_ROOT, animate, print_red
@@ -195,157 +172,6 @@ def remove_hydrogens_preserve_indices(mol):
     # Возвращаем молекулу и mapping
     return mol_noH, heavy_idx_map
 
-
-def match_chem_v3(mol_chem_1, mol_chem_2,
-                  compare_any_bond=False,
-                  match_residue_number=None,
-                  match_type='heavy',  # 'heavy' или 'all'
-                  timeout=3):
-    """
-    Находит максимальную общую подструктуру между мономером и полимером.
-    
-    Args:
-        mol_chem_1 (Chem.Mol) - мономер
-        mol_chem_2 (Chem.Mol) - полимер
-        compare_any_bond (bool) - сравнивать любые связи
-        match_residue_number (int) - номер остатка для фильтрации
-        match_type (str) - 'heavy' (только тяжелые атомы) или 'all' (все атомы)
-        timeout (int) - таймаут поиска MCS
-    
-    Returns:
-        substructure (Chem.Mol) - подструктура с протонами
-        dict_matches (dict) - соответствие индексов и имен атомов
-    """
-    # --- 1. Предупреждение для match_type='all' ---
-    if match_type == 'all':
-        print("ВНИМАНИЕ: Сопоставление по всем атомам (включая водороды)")
-        print("Это может занять очень много времени для больших молекул!")
-    
-    # --- 2. Фильтрация по номеру остатка ---
-    def filter_atoms_by_residue_number(mol, residue_number):
-        """Возвращает новую молекулу, содержащую только атомы с заданным номером остатка"""
-        indices_to_keep = []
-        for atom in mol.GetAtoms():
-            monomer_info = atom.GetMonomerInfo()
-            if monomer_info and monomer_info.GetResidueNumber() == residue_number:
-                indices_to_keep.append(atom.GetIdx())
-        
-        if not indices_to_keep:
-            print(f"Предупреждение: Остаток с номером {residue_number} не найден")
-            return mol
-        
-        print(f"Фильтрация по остатку {residue_number}: оставлено {len(indices_to_keep)} атомов")
-        return Chem.PathToSubmol(mol, indices_to_keep)
-    
-    if match_residue_number is not None:
-        print(f'Поиск MCS только для остатка с номером {match_residue_number}')
-        filtered_mol_chem_2 = filter_atoms_by_residue_number(mol_chem_2, match_residue_number)
-    else:
-        filtered_mol_chem_2 = mol_chem_2
-    
-    # --- 3. Подготовка молекул в зависимости от match_type ---
-    if match_type == 'heavy':
-        print("Сопоставление по тяжелым атомам (водороды исключены)")
-        mol_1_processed = Chem.RemoveHs(mol_chem_1)
-        mol_2_processed = Chem.RemoveHs(filtered_mol_chem_2)
-    else:  # 'all'
-        print("Сопоставление по всем атомам (включая водороды)")
-        mol_1_processed = mol_chem_1
-        mol_2_processed = filtered_mol_chem_2
-    
-    # --- 4. Настройка параметров MCS ---
-    mcs_params = rdFMCS.MCSParameters()
-    mcs_params.Timeout = timeout
-    mcs_params.Maximize = True
-    mcs_params.CompareAnyBond = compare_any_bond
-    
-    if match_type == 'heavy':
-        mcs_params.AtomCompare = rdFMCS.AtomCompare.CompareElementsAndCharge
-        mcs_params.MatchValences = False
-    else:
-        mcs_params.AtomCompare = rdFMCS.AtomCompare.CompareElements
-        mcs_params.MatchValences = True
-    
-    mcs_params.BondCompare = rdFMCS.BondCompare.CompareOrder
-    mcs_params.RingMatchesRingOnly = False
-    mcs_params.CompleteRingsOnly = False
-    
-    # --- 5. Поиск MCS ---
-    print("Поиск максимальной общей подструктуры...")
-    mcs_result = rdFMCS.FindMCS([mol_1_processed, mol_2_processed], mcs_params)
-    
-    if not mcs_result or mcs_result.numAtoms == 0:
-        raise ValueError("Общая подструктура не найдена!")
-    
-    print(f"Найдена общая подструктура из {mcs_result.numAtoms} атомов")
-    
-    # --- 6. Получение сопоставлений ---
-    query = Chem.MolFromSmarts(mcs_result.smartsString)
-    matches_1 = mol_1_processed.GetSubstructMatches(query, uniquify=False)
-    matches_2 = mol_2_processed.GetSubstructMatches(query, uniquify=False)
-    
-    # --- 7. Выбор лучшего сопоставления (максимум атомов) ---
-    # best_match_1 = None
-    # best_match_2 = None
-    max_size = 0
-    
-    for match_1 in matches_1:
-        for match_2 in matches_2:
-            size = len(match_1)  # количество сопоставленных атомов
-            if size > max_size:
-                max_size = size
-                best_match_1 = match_1
-                best_match_2 = match_2
-    
-    if best_match_1 is None:
-        best_match_1 = matches_1[0]
-        best_match_2 = matches_2[0]
-    
-    print(f"Выбрано сопоставление с {max_size} атомами")
-    
-    # --- 8. Создание словаря соответствий ---
-    dict_matches = {}
-    
-    # Сохраняем индексы (без сортировки!)
-    dict_matches['Indexes'] = dict(zip(best_match_1, best_match_2))
-    
-    # Добавляем имена атомов, если они есть
-    if mol_chem_1.HasProp('AtomNames') and mol_chem_2.HasProp('AtomNames'):
-        try:
-            mol1_atoms_name = [mol_chem_1.GetAtomWithIdx(idx).GetProp('AtomName') 
-                               for idx in best_match_1]
-            mol2_atoms_name = [mol_chem_2.GetAtomWithIdx(idx).GetProp('AtomName') 
-                               for idx in best_match_2]
-            dict_matches['Names'] = dict(zip(mol1_atoms_name, mol2_atoms_name))
-        except Exception as e:
-            print(f"Предупреждение: Не удалось получить имена атомов - {e}")
-    
-    # --- 9. Построение подструктуры с протонами ---
-    # Берем атомы из исходной молекулы-полимера (с водородами)
-    # Используем best_match_2 как есть, без сортировки
-    
-    # Добавляем водороды, связанные с сопоставленными атомами
-    all_indices = list(best_match_2)  # копируем список
-    
-    for idx in best_match_2:
-        atom = mol_chem_2.GetAtomWithIdx(idx)
-        for neighbor in atom.GetNeighbors():
-            if neighbor.GetAtomicNum() == 1:  # Водород
-                if neighbor.GetIdx() not in all_indices:
-                    all_indices.append(neighbor.GetIdx())
-    
-    # Не сортируем индексы, сохраняем порядок
-    substructure = Chem.PathToSubmol(mol_chem_2, all_indices)
-    
-    # Заряды копируются автоматически через PathToSubmol
-    # Дополнительно проверяем и восстанавливаем если нужно
-    for i, old_idx in enumerate(all_indices):
-        old_atom = mol_chem_2.GetAtomWithIdx(old_idx)
-        new_atom = substructure.GetAtomWithIdx(i)
-        if old_atom.GetFormalCharge() != 0:
-            new_atom.SetFormalCharge(old_atom.GetFormalCharge())
-    
-    return substructure, dict_matches
 
 @logged
 def match_chem_v6(

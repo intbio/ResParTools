@@ -64,8 +64,8 @@ def steps_1_to_4(folder, tmp_dir):
         pdb = _quiet(pt.file_opener, os.path.join(tmp_dir, f'3_{mon}.pdb'))[f'3_{mon}']
         renum = _quiet(pt.renumber_residue_atoms, pdb, ref_base_name=p['parent_residue'], timeout=5)
         parent = json.loads(renum.GetProp('ParentAtoms'))
-        _quiet(pt.save_aa_chem_to_pdb, renum, os.path.join(tmp_dir, f'3_2_{mon}'), resname=p['base_name'],
-               resid=2, segid='A', naming=p['naming'], parent_atoms=parent)
+        _quiet(pt.save_chem_to_pdb, renum, os.path.join(tmp_dir, f'3_2_{mon}'), resname=p['base_name'],
+               resid=2, segid='A', naming=p['naming'], parent_atoms=parent, no_H=True)
         residue = _quiet(pt.file_opener, os.path.join(tmp_dir, f'3_2_{mon}.pdb'))[f'3_2_{mon}']
         return mon, residue, tuple(parent), monomer[mon], sub.GetNumAtoms()
     finally:

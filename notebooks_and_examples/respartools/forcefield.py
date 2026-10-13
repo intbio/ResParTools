@@ -1,38 +1,16 @@
 """Файлы силового поля GROMACS: rtp (read_rtp, write_rtp), itp (read_itp), acpype (run_acpype), hdb, atp, r2b."""
 import os
 import sys
-import time
 import re
 import glob
-import json
-from pathlib import Path
-from collections import Counter
-from collections import defaultdict, deque
-import numpy as np
+from collections import defaultdict
 
-import itertools
-import threading
 import subprocess
 import shutil
 
-from decimal import Decimal as D
 
-from rdkit.Chem.Draw import IPythonConsole
 from rdkit import Chem
-from rdkit.Chem import AllChem, Draw, rdFMCS
-from rdkit.Chem import rdDepictor
-from rdkit.Geometry import Point3D
-from typing import Callable
 
-import datetime
-import functools
-import hashlib
-import inspect
-import platform
-import traceback
-import warnings
-from rdkit.Chem import rdMolDescriptors
-from rdkit.Chem.Draw import rdMolDraw2D
 
 from .log import logged
 from .utils import _PACKAGE_ROOT, print_red

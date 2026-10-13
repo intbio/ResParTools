@@ -274,7 +274,7 @@ pt.run_validate(job, run='local')                                  # прове�
   свойства `ModName`, `SourceFile`, у атомов `SrcIdx` [ветки].
 - `open_mol(path)` [ветки] - то же для одного файла, без словаря; `.sdf` читается через `load_mol`.
 - `read_file(path)` - первая строка файла (SMILES).
-- `smi_to_chem(str_smi, sanitize, addH, make_N_root, format_coord='2D')` - SMILES → молекула
+- `smi_to_chem(str_smi, sanitize, addH, format_coord='2D')` - SMILES → молекула
   с водородами и 2D-координатами. Понимает SMILES с номерами атомов (`_mol_from_mapped_smiles`:
   порядок атомов из номеров, водороды как в строке - так сохраняется порядок атомов остатка).
 - `pdb_to_chem(path, removeHs, sanitize, format_coord='2D')` - PDB → молекула; имена атомов
@@ -284,14 +284,13 @@ pt.run_validate(job, run='local')                                  # прове�
 - `_finalize_read_mol` - общий конец чтения: sanitize, удаление H, координаты.
 
 **Запись**
-- `save_chem_to_smiles(mol, path, canonical, allHsExplicit, rootedAtAtom, atom_map=False)` -
+- `save_chem_to_smiles(mol, path, canonical, allHsExplicit, atom_map=False)` -
   SMILES; `atom_map=True` пишет номер каждого атома, чтобы при чтении восстановить порядок.
-- `save_aa_chem_to_smiles(...)` - старое имя; `make_N_root=True` - строка начинается с N
-  аминогруппы (`find_amino_nitrogen`).
-- `save_chem_to_pdb(mol, path, coords='2D', stereo, ca_config='L', ...)` - PDB с порядком
-  атомов молекулы; `coords='3D'` строит 3D с нужной стереохимией (`set_mol_coords`).
-- `save_aa_chem_to_pdb(mol, path, resname, resid, segid, naming, parent_atoms)` - остаток в PDB
-  с именами атомов (вызывает `rdkit_pdb_modification` на копии); пишет `<path>.pdb` и `<path>_no_H.pdb`.
+- `save_chem_to_pdb(mol, path, coords='2D', stereo, ca_config='L', ..., resname=None, resid, segid,
+  naming, parent_atoms, no_H=False)` - PDB с порядком атомов молекулы; `coords='3D'` строит 3D с
+  нужной стереохимией (`set_mol_coords`). С `resname` атомы именуются на копии
+  (`rdkit_pdb_modification`); `no_H=True` пишет ещё `<path>_no_H.pdb` (так раньше делала
+  `save_aa_chem_to_pdb`).
 - `save_chem_to_mol(mol, path)` - формат MOL.
 - `save_charges_json(name, charges, path)` - список зарядов в JSON (`AI_chrges_*.json`).
 - `save_mol(mol, path)` [ветки] - SDF со **всеми** свойствами атомов и молекулы; проверяет,
@@ -299,9 +298,8 @@ pt.run_validate(job, run='local')                                  # прове�
 - `load_mol(path)` [ветки] - чтение `save_mol`: типы свойств восстанавливаются
   (`_INT_PROPS`, `_BOOL_PROPS`, `Charge*` → float), PDB-информация остатка - из `AtomName`,
   `ResName`, `ResId`, `Chain`.
-- Устаревшие, оставлены для старых ноутбуков: `smi_to_mol2` (через obabel, не вызывается),
-  `write_modified_molecule`, `save_molecule_as_pdb`; `_reroot_via_smiles` - старое поведение
-  `rootedAtAtom` с предупреждением.
+- Устаревшие параметры (старый вызов - предупреждение и старое поведение из `legacy`):
+  `make_N_root` (`smi_to_chem`, `pdb_to_chem`), `rootedAtAtom` (`save_chem_to_pdb`, `_mol`, `_smiles`).
 
 ### 6.2 `matching` - мономер в тримере, родительский остаток
 - `match_mon_to_pol(monomer_dict, polymer_dict, timeout, only_heavy_mapping, ...)` - шаг 2:
@@ -313,8 +311,7 @@ pt.run_validate(job, run='local')                                  # прове�
   разрыва (N и C, потерявшим связь с концевыми группами) возвращает неявные H - иначе RDKit
   оставлял N двухвалентным (так было у Benzoyl и lac).
 - `match_chem_v6(mol1, mol2, only_heavy_mapping=True, timeout=30)` - рабочая версия MCS:
-  сначала тяжёлые атомы, водороды сопоставляются по ним. `match_chem` и `match_chem_v3` -
-  ранние версии (`match_chem_v3` не вызывается). `remove_hydrogens_preserve_indices` -
+  сначала тяжёлые атомы, водороды сопоставляются по ним. `match_chem` - ранняя версия. `remove_hydrogens_preserve_indices` -
   молекула без H с картой индексов.
 - `REF_TEMPLATES` - где лежат шаблоны родителей (`molecules/aminoacids_template/*_H.pdb`,
   остаток №2, атомы остова N CA C O).
@@ -354,7 +351,6 @@ pt.run_validate(job, run='local')                                  # прове�
 - `set_mol_coords(mol, coords='2D'|'3D', ca_config='L', stereo_default='R', random_seed)` -
   координаты: 2D однозначна; 3D строится с заданной стереохимией (CA - L по ориентированному
   объёму `_ca_volume`, не по R/S, т. к. L-цистеин - это R).
-- Устаревшие: `generate_atom_names_by_ref_aa` (не вызывается), `rdkit_pdb_modification_old`.
 
 ### 6.4 `charges` - заряды
 - `read_rtp_charges(resname, rtp_path)` - заряды остатка из rtp `{имя: заряд}` (через `read_rtp`).
@@ -476,13 +472,18 @@ charge(mol, constraints=...)` (`espaloma-charge_mod`, слой `ChargeEquilibriu
 `print_red`, `animate` и `format_time` (анимация долгих процессов), `rename_folder` /
 `get_unique_folder_name`, `show_list_of_conf`, `increment_name`, `calculate_true_sum`,
 `save_json`, `_PACKAGE_ROOT` (путь `notebooks_and_examples/`, от него строятся пути к данным).
-`do_fun_for_2d_list` не вызывается.
 
 ### 6.11 `legacy` - совместимость со старыми ноутбуками
 `renumber_amino_acid_atoms`, `save_substructure_mol` (кода старых версий нет - вызов
 передаётся в новые функции с предупреждением); старый RESP через psiresp без оптимизации
-геометрии: `add_constraint`, `prepere_constraints` (не вызывается), `run_job`, `do_sh`,
-`resp_calculation` - с предупреждением `_OLD_RESP_WARNING`.
+геометрии: `add_constraint`, `run_job`, `do_sh`,
+`resp_calculation` - с предупреждением `_OLD_RESP_WARNING`. Устаревшее из `fileio` (работает
+по-старому с предупреждением): `save_aa_chem_to_pdb` (→ `save_chem_to_pdb(..., no_H=True)`),
+`save_aa_chem_to_smiles`, `write_modified_molecule`, `save_molecule_as_pdb`, `find_amino_nitrogen`,
+`_make_N_root`, `_reroot_via_smiles`. Удалены (не вызывались нигде, даже в старых ноутбуках):
+`smi_to_mol2`, `generate_atom_names_by_ref_aa`, `rdkit_pdb_modification_old`, `match_chem_v3`,
+`do_fun_for_2d_list`, `prepere_constraints`. Импорты: каждый модуль импортирует только то, что
+использует; `IPythonConsole` - только в `draw`.
 
 ---
 

@@ -1,37 +1,14 @@
 """Чтение и запись молекул: SMILES, PDB, mol2, MOL, JSON."""
 import os
-import sys
-import time
 import re
-import glob
 import json
 from pathlib import Path
-from collections import Counter
-from collections import defaultdict, deque
-import numpy as np
 
-import itertools
-import threading
-import subprocess
 
-from decimal import Decimal as D
 
-from rdkit.Chem.Draw import IPythonConsole
 from rdkit import Chem
-from rdkit.Chem import AllChem, Draw, rdFMCS
-from rdkit.Chem import rdDepictor
-from rdkit.Geometry import Point3D
-from typing import Callable
+from rdkit.Chem import AllChem
 
-import datetime
-import functools
-import hashlib
-import inspect
-import platform
-import traceback
-import warnings
-from rdkit.Chem import rdMolDescriptors
-from rdkit.Chem.Draw import rdMolDraw2D
 
 from .log import logged
 from .utils import data_to_dict, path_parser, print_red
@@ -80,6 +57,8 @@ def _mol_from_mapped_smiles(str_smi, sanitize=True):
 def smi_to_chem(str_smi: str, sanitize=True, addH=True, make_N_root=False,format_coord='2D'):
     """
     Преобразует SMILES-строку в объект молекулы RDKit и добавляет атомы водорода.
+    make_N_root - устаревший параметр (перестановка атомов через SMILES с корнем в азоте
+    аминогруппы, см. legacy): функция предупреждает и делает, как раньше.
     """
     rdkit_mol = _mol_from_mapped_smiles(str_smi, sanitize)
     if rdkit_mol is None:
@@ -97,39 +76,9 @@ def smi_to_chem(str_smi: str, sanitize=True, addH=True, make_N_root=False,format
         AllChem.UFFOptimizeMolecule(rdkit_mol)
     else:
         raise ValueError("Недопустимый формат. Выберите '2D' или '3D'.")
-    # Перенумерация атомов, деля аминогруппу началом молекулы
     if make_N_root:
-        # Находим индекс азота из аминогруппы
-        root_idx = find_amino_nitrogen(rdkit_mol)
-        if root_idx != -1:
-            # Получаем SMILES с корневым атомом
-            smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True, allHsExplicit=True, rootedAtAtom=root_idx)
-            # Создаем новую молекулу из SMILES
-            rdkit_mol = Chem.MolFromSmiles(smiles_string, sanitize=False)
-            if rdkit_mol is None:
-                raise ValueError("Ошибка при создании молекулы после перенумерации атомов")
-        else:
-            print("Азот аминогруппы не найден. Корень не изменён.")
-        # Chem.SanitizeMol(rdkit_mol, sanitizeOps=Chem.SANITIZE_ALL ^ Chem.SANITIZE_KEKULIZE, catchErrors=True)
-        Chem.SanitizeMol(rdkit_mol)
-        
-    # Сортируем атомы, чтобы тяжелые атомы шли первыми, а водороды позже
-        atom_order = [atom.GetIdx() for atom in rdkit_mol.GetAtoms() if atom.GetSymbol() != 'H']  # тяжелые атомы
-        atom_order += [atom.GetIdx() for atom in rdkit_mol.GetAtoms() if atom.GetSymbol() == 'H']  # водороды
-    
-    # Перенумерация атомов согласно новому порядку
-        new_rdkit_mol = Chem.RenumberAtoms(rdkit_mol, atom_order)
-        # Пересчитываем валентности
-        return new_rdkit_mol
-    else:
-        return rdkit_mol
-    # if make_N_root:
-    #     root_idx = find_amino_nitrogen(rdkit_mol)
-    #     if root_idx != -1:
-        #     smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True, 
-        #                                      allHsExplicit=True, rootedAtAtom=root_idx)
-        #     rdkit_mol = Chem.MolFromSmiles(smiles_string, sanitize=True)
-        # return rdkit_mol
+        return _make_N_root(rdkit_mol, 'smi_to_chem')
+    return rdkit_mol
 
 
 def _finalize_read_mol(rdkit_mol, path, sanitize, removeHs, format_coord):
@@ -168,7 +117,7 @@ def pdb_to_chem(path_to_pdb, removeHs=False, make_N_root=False, sanitize=True, f
     Аргументы:
         path_to_pdb (str): Путь к файлу PDB.
         removeHs (bool): Удалять ли водороды. По умолчанию False.
-        make_N_root (bool): Не используется, оставлен для совместимости вызовов.
+        make_N_root (bool): Устарел и не используется (предупреждение, если True).
         sanitize (bool): Проверка валентностей и распознавание ароматичности.
             Нужна, чтобы ароматические связи отличались от двойных так же, как в SMILES.
         format_coord (str): '2D' - пересчитать координаты для рисования,
@@ -181,6 +130,9 @@ def pdb_to_chem(path_to_pdb, removeHs=False, make_N_root=False, sanitize=True, f
     Возвращает:
         Chem.Mol: Молекула RDKit с сохраненными именами атомов (AtomName).
     """
+    if make_N_root:
+        print_red('⚠ pdb_to_chem(make_N_root=True): параметр устарел и не используется - '
+                  'порядок атомов остаётся как в файле.')
     with open(path_to_pdb, "r") as pdb_file:
         has_conect = any(line.startswith("CONECT") for line in pdb_file)
 
@@ -357,38 +309,12 @@ def file_opener(path, **kwargs):
             atom.SetIntProp('SrcIdx', atom.GetIdx())
     return rdkit_mol
         
-def find_amino_nitrogen(mol):
-    """
-    Находит индекс атома азота в составе аминокислоты.
-    Предполагается, что любая а.к. имеет вид основу [H][N]CC=O.
-    """
-    aa_base = '[H][N]CC=O'
-    sub_base = mol.GetSubstructMatch(Chem.MolFromSmarts(aa_base))
-    if sub_base:
-        print(f"atom number: {sub_base[1]} became the root atom: 0")
-        return sub_base[1]
-    return -1
-
 def _with_atom_map(mol):
     """Копия молекулы, в которой номер атома в SMILES = индекс + 1 (0 в SMILES - «без номера»)."""
     mapped = Chem.Mol(mol)
     for atom in mapped.GetAtoms():
         atom.SetAtomMapNum(atom.GetIdx() + 1)
     return mapped
-
-
-def _reroot_via_smiles(rdkit_mol, rootedAtAtom, func_name, sanitize):
-    """
-    Старое поведение rootedAtAtom в save_chem_to_pdb / save_chem_to_mol: молекула
-    переписывается через SMILES с корнем в атоме rootedAtAtom. Индексы атомов меняются,
-    имена атомов, параметры остатка, свойства молекулы и координаты теряются.
-    """
-    print_red(f'⚠ {func_name}(rootedAtAtom={rootedAtAtom}) устарел: атомы переставляются через '
-              'SMILES, индексы меняются, имена атомов и параметры остатка теряются. '
-              'Для порядка атомов остатка используйте renumber_residue_atoms.')
-    smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True,
-                                     allHsExplicit=True, rootedAtAtom=rootedAtAtom)
-    return Chem.MolFromSmiles(smiles_string, sanitize=sanitize)
 
 
 @logged
@@ -402,11 +328,14 @@ def save_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, roo
         path (str) - путь к файлу; расширение .smi/.smiles можно не писать
         canonical (bool) - канонический порядок обхода графа (True) или порядок индексов (False)
         allHsExplicit (bool) - писать водороды в квадратных скобках у каждого атома
-        rootedAtAtom (int) - атом, с которого начинается запись строки (-1 - по умолчанию).
-            Меняет только текст строки, не молекулу
+        rootedAtAtom (int) - устаревший параметр: атом, с которого начинается строка; меняет
+            только текст строки (предупреждение; порядок атомов сохраняет atom_map=True)
         atom_map (bool) - записать у каждого атома его номер (индекс + 1, т.к. 0 в SMILES -
             «без номера»); smi_to_chem по этим номерам восстановит исходные индексы
     """
+    if rootedAtAtom != -1:
+        print_red(f'⚠ save_chem_to_smiles(rootedAtAtom={rootedAtAtom}) устарел: для порядка атомов '
+                  'используйте atom_map=True.')
     path_to_file, file_name = path_parser(path, ['smi', 'smiles'])
     smiles_string = Chem.MolToSmiles(_with_atom_map(rdkit_mol) if atom_map else rdkit_mol,
                                      canonical=canonical,
@@ -419,23 +348,10 @@ def save_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, roo
 
 
 @logged
-def save_aa_chem_to_smiles(rdkit_mol, path, canonical=True, allHsExplicit=True, make_N_root=False,
-                           atom_map=False):
-    """
-    Старое имя save_chem_to_smiles (параметры те же, порядок позиционных аргументов прежний).
-    make_N_root=True - строка начинается с азота аминогруппы (find_amino_nitrogen);
-    меняется только текст строки, не молекула.
-    """
-    rootedAtAtom = find_amino_nitrogen(rdkit_mol) if make_N_root else -1
-    save_chem_to_smiles(rdkit_mol, path, canonical=canonical, allHsExplicit=allHsExplicit,
-                        rootedAtAtom=rootedAtAtom, atom_map=atom_map)
-
-
-@logged
 def save_chem_to_mol(rdkit_mol, path, rootedAtAtom=-1):
     """
     Сохраняет молекулу в формате MOL (<path>.mol).
-    rootedAtAtom - устаревший параметр (см. _reroot_via_smiles): функция предупреждает
+    rootedAtAtom - устаревший параметр (см. legacy._reroot_via_smiles): функция предупреждает
     и переставляет атомы, как раньше.
     """
     if rootedAtAtom != -1:
@@ -450,21 +366,32 @@ def save_chem_to_mol(rdkit_mol, path, rootedAtAtom=-1):
 
 @logged
 def save_chem_to_pdb(rdkit_mol, path, rootedAtAtom=-1, coords='2D', stereo=None, ca_config='L',
-                     stereo_default='R', random_seed=42):
+                     stereo_default='R', random_seed=42, resname=None, resid=1, segid='A',
+                     naming='greek', parent_atoms=None, no_H=False):
     """
-    Сохраняет молекулу в PDB (<path>.pdb) с её индексацией атомов. Если у атомов есть
-    PDB-информация (имена атомов, остаток - после rdkit_pdb_modification или из PDB-файла),
-    она записывается; иначе RDKit пишет свои имена (элемент + номер), остаток UNL, HETATM.
-    Переданная молекула не меняется (координаты задаются на копии).
+    Сохраняет молекулу в PDB (<path>.pdb) с её индексацией атомов. Переданная молекула не
+    меняется (всё делается на копии).
+
+    Имена атомов и остаток:
+    - resname задан - атомы именуются на копии (rdkit_pdb_modification: naming, parent_atoms),
+      остаток resname/resid/segid (так раньше делала save_aa_chem_to_pdb);
+    - resname не задан - пишется PDB-информация, которая уже есть у атомов (после
+      rdkit_pdb_modification или из PDB-файла); если её нет, RDKit пишет свои имена
+      (элемент + номер), остаток UNL, HETATM.
 
     Аргументы:
         rdkit_mol (Chem.Mol) - молекула
-        path (str) - путь без расширения
-        rootedAtAtom (int) - устаревший параметр (см. _reroot_via_smiles): функция
+        path (str) - путь; расширение .pdb можно не писать
+        rootedAtAtom (int) - устаревший параметр (см. legacy._reroot_via_smiles): функция
             предупреждает и переставляет атомы, как раньше
         coords (str) - '2D' (по умолчанию) или '3D'; stereo, ca_config, stereo_default,
             random_seed - параметры 3D-структуры и стереохимии, см. set_mol_coords.
             До 2026-09 функция всегда строила 3D-структуру со случайной стереохимией.
+        resname, resid, segid - имя остатка (до 3 символов), номер, цепь
+        naming - способ именования атомов: 'greek' (по умолчанию) или 'index'
+        parent_atoms - индексы атомов родительского остатка для naming='index'
+        no_H (bool) - записать ещё <path>_no_H.pdb без водородов ('_H' в имени файла
+            заменяется на '_no_H')
     """
     rdkit_mol = Chem.Mol(rdkit_mol)
     if rootedAtAtom != -1:
@@ -472,172 +399,29 @@ def save_chem_to_pdb(rdkit_mol, path, rootedAtAtom=-1, coords='2D', stereo=None,
     failed = Chem.SanitizeMol(rdkit_mol, sanitizeOps=Chem.SANITIZE_ALL, catchErrors=True)
     if failed != Chem.SanitizeFlags.SANITIZE_NONE:
         print_red(f'⚠ Санитизация не прошла ({failed}): молекула сохраняется как есть.')
-    path_dir = path.rsplit('/', 1)
-    if len(path_dir) > 1:
-        os.makedirs(path_dir[0], exist_ok=True)
-    set_mol_coords(rdkit_mol, coords=coords, stereo=stereo, ca_config=ca_config,
-                   stereo_default=stereo_default, random_seed=random_seed)
-    pdb_block = Chem.MolToPDBBlock(rdkit_mol)
-    with open(f"{path}.pdb", "w") as file:
-        file.write(pdb_block)
-        
-@logged
-def save_aa_chem_to_pdb(rdkit_mol, path, resname = 'MOD', resid = 1, segid = 'A', make_N_root=False,
-                        atom_names_list=None, naming='greek', parent_atoms=None, coords='2D',
-                        stereo=None, ca_config='L', stereo_default='R', random_seed=42):
-    """
-    Сохраняет остаток в PDB: имена атомов (rdkit_pdb_modification), имя, номер и цепь остатка.
-    Пишутся два файла: <path>.pdb и <path>_no_H.pdb. Переданная молекула не меняется
-    (всё делается на копии), поэтому повторный запуск ячейки даёт тот же результат.
-
-    Аргументы:
-        rdkit_mol - RDKit.Chem молекула с явными водородами
-        path - строка с путем к файлу и его именем для сохранения
-        resname, resid, segid - имя остатка (до 3 символов), номер, цепь
-        make_N_root - устаревший параметр: переставить атомы через SMILES с корнем в аминогруппе
-        atom_names_list - не используется, оставлен для совместимости вызовов
-        naming - способ именования атомов: 'greek' (по умолчанию) или 'index'
-        parent_atoms - индексы атомов родительского остатка для naming='index'
-        coords - '2D' (по умолчанию) или '3D'; stereo, ca_config, stereo_default,
-            random_seed - параметры 3D-структуры и стереохимии, см. set_mol_coords.
-            До 2026-09 функция всегда строила 3D-структуру со случайной стереохимией.
-    """
-    rdkit_mol = Chem.Mol(rdkit_mol)
-    if make_N_root and parent_atoms is not None:
-        raise ValueError('make_N_root переставляет атомы, и индексы parent_atoms перестают им '
-                         'соответствовать: используйте что-то одно.')
-    if make_N_root:
-        root_idx = find_amino_nitrogen(rdkit_mol)
-        if root_idx != -1:
-            smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True, allHsExplicit=True, rootedAtAtom=root_idx)
-
-            rdkit_mol = Chem.MolFromSmiles(smiles_string, sanitize=False)
-            if rdkit_mol is None:
-                raise ValueError("Ошибка при создании молекулы после перенумерации атомов")
-    try:
-        # Chem.SanitizeMol(rdkit_mol, sanitizeOps=Chem.SANITIZE_ALL ^ Chem.SANITIZE_KEKULIZE, catchErrors=True)
-        Chem.SanitizeMol(rdkit_mol)
-    except ValueError as e:
-        print("Ошибка санации:", e)
-        
-    # Получение пути и имени файла
     path_to_file, file_name = path_parser(path, ['pdb'])
-    
     set_mol_coords(rdkit_mol, coords=coords, stereo=stereo, ca_config=ca_config,
                    stereo_default=stereo_default, random_seed=random_seed)
+    if resname is not None:
+        if len(resname) > 3:
+            print_red(f"⚠ Имя остатка '{resname}' длиннее 3 символов: RDKit запишет в PDB только "
+                      f"'{resname[:3]}'.")
+        rdkit_mol = rdkit_pdb_modification(rdkit_mol, resname=resname, resid=resid, segid=segid,
+                                           naming=naming, parent_atoms=parent_atoms)
+    files = [(file_name, rdkit_mol)]
+    if no_H:
+        # RemoveHs с пересчётом валентностей: иначе у ароматических атомов, потерявших явные H,
+        # не определено число водородов, кольцо не кекулизуется и PDB не записывается
+        name_no_H = file_name.replace('_H', '_no_H') if '_H' in file_name else file_name + '_no_H'
+        files.append((name_no_H, Chem.RemoveHs(rdkit_mol)))
+    for name, mol in files:
+        # текст PDB формируется до открытия файла: при ошибке старый файл не затирается пустым
+        pdb_block = Chem.MolToPDBBlock(mol)
+        output_path = os.path.join(path_to_file, f'{name}.pdb')
+        with open(output_path, 'w') as file:
+            file.write(pdb_block)
+        print(f'Сохранено: {output_path}')
 
-    if len(resname) > 3:
-        print_red(f"⚠ Имя остатка '{resname}' длиннее 3 символов: RDKit запишет в PDB только "
-                  f"'{resname[:3]}'.")
-    rdkit_mol = rdkit_pdb_modification(rdkit_mol, resname=resname, resid=resid, segid=segid,
-                                       naming=naming, parent_atoms=parent_atoms)
-    # RemoveHs с пересчётом валентностей: иначе у ароматических атомов, потерявших явные H,
-    # не определено число водородов, кольцо не кекулизуется и PDB не записывается
-    # (так было при удалении H через RemoveAtom и при RemoveHs(sanitize=False))
-    rdkit_mol_no_H = Chem.RemoveHs(rdkit_mol)
-
-    # Запись в файл: текст PDB формируется до открытия файла, чтобы при ошибке
-    # не оставить на месте старого файла пустой
-
-    output_path = f"{path_to_file}/{file_name}.pdb" if path_to_file else f"{file_name}.pdb"
-    pdb_block = Chem.MolToPDBBlock(rdkit_mol)
-    with open(output_path, "w") as file:
-        file.write(pdb_block)
-    print(f'{file_name}.pdb saved to {path_to_file or "current directory"}')
-
-    if '_H'in file_name:
-        file_name = file_name.replace('_H', '_no_H')
-    else:
-        file_name = file_name + '_no_H'
-    output_path = f"{path_to_file}/{file_name}.pdb" if path_to_file else f"{file_name}.pdb"
-    pdb_block = Chem.MolToPDBBlock(rdkit_mol_no_H)
-    with open(output_path, "w") as file:
-        file.write(pdb_block)
-    print(f'{file_name}.pdb saved to {path_to_file or "current directory"}')
-
-def smi_to_mol2(smi_input, output_format, file_name=None, addh=True):
-    """
-    Converts an SMI string or file to a molecule file format (mol2, mol, mdl).
-
-    Args:
-      smi_input: The SMI string or path to an SMI file.
-      output_format: The desired output format (mol2, mol, mdl).
-      file_name (optional): The desired output file name (excluding extension).
-
-    Returns:
-      None. Raises an error for invalid input or format.
-    """
-
-    valid_formats = ['mol2', 'mol', 'mdl']
-    if output_format not in valid_formats:
-        raise ValueError(f"Invalid output format: {output_format}")
-        
-    # Check if SMI is a string
-    if not isinstance(smi_input, str):
-        raise TypeError("Input must be a string")
-
-    # Read SMI string from file or argument
-    if smi_input.lower().endswith('.smi') or smi_input.lower().endswith('.smiles') :
-        smi_str = next(iter(read_file(smi_input).values()))
-    else:
-        smi_str = smi_input.strip()
-        if file_name is None:
-            file_name = 'convert_mol' 
-
-    # Print current molecule
-    print(f"Current molecule: {smi_str}")
-
-    # Create molecule, add hydrogens, and generate 3D coordinates
-    from openbabel import pybel  # openbabel нужен только этой функции
-    mol = pybel.readstring("smi", smi_str)
-    if  addh:
-        mol.addh()
-    mol.make3D()
-
-    # Construct output path based on input and arguments
-    output_path = file_name + '.' + output_format if file_name else smi_input.split('.')[0] + '.'+output_format
-
-    # Write molecule to file
-    mol.write(output_format, output_path, overwrite=True)
-    print('output path:',output_path)
-    return mol
-
-def write_modified_molecule(mol, output_path):
-    """
-    Записывает измененную молекулу в PDB-файл.
-    """
-    writer = Chem.PDBWriter(output_path)
-    for atom in mol.GetAtoms():
-        atom.SetMonomerType(atom.GetProp('AtomName'))
-    writer.write(mol)
-    writer.close()
-    
-@logged
-def save_molecule_as_pdb(molecule, filename, format_coord='3D'):
-    """
-    Сохраняет молекулу в формате PDB.
-
-    :param molecule: Молекула в формате RDKit Mol.
-    :param filename: Имя файла для сохранения.
-    :param format: Формат представления ('2D' или '3D'). По умолчанию '3D'.
-    """
-    if format_coord == '2D':
-        # Рассчитываем 2D координаты
-        AllChem.Compute2DCoords(molecule)
-    elif format_coord == '3D':
-        # Рассчитываем 3D координаты (если еще не рассчитаны)
-        Chem.SanitizeMol(molecule)
-        AllChem.EmbedMolecule(molecule)
-        AllChem.UFFOptimizeMolecule(molecule)
-    else:
-        raise ValueError("Недопустимый формат. Выберите '2D' или '3D'.")
-    
-    path_to_file, file_name = path_parser(filename, ['pdb'])
-    save_path = f'{path_to_file}/{file_name}_{format_coord}.pdb'
-    # Сохраняем молекулу в PDB формате
-    with open(save_path, 'w') as pdb_file:
-        pdb_file.write(Chem.MolToPDBBlock(molecule))
-    print(f"Молекула успешно сохранена в файле {save_path} в формате {format_coord}.")
 
 @logged
 def save_charges_json(name: str, charge_list: list, path: str = ".") -> None:
@@ -754,3 +538,4 @@ def open_mol(path, **kwargs):
 # Импорт из других модулей пакета - в конце файла: функции этого модуля уже
 # определены, поэтому взаимные ссылки модулей друг на друга не мешают импорту.
 from .residue import rdkit_pdb_modification, set_PDB_residue_info, set_mol_coords  # noqa: E402
+from .legacy import _make_N_root, _reroot_via_smiles  # noqa: E402

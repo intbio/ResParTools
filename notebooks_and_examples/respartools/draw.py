@@ -1,36 +1,16 @@
 """Рисование молекул: draw_molecule, draw_mol_grid, draw_mon_pol_match."""
 import os
-import sys
-import time
-import re
-import glob
-import json
-from pathlib import Path
-from collections import Counter
-from collections import defaultdict, deque
 import numpy as np
 
 import itertools
-import threading
-import subprocess
 
-from decimal import Decimal as D
 
 from rdkit.Chem.Draw import IPythonConsole
 from rdkit import Chem
-from rdkit.Chem import AllChem, Draw, rdFMCS
+from rdkit.Chem import Draw
 from rdkit.Chem import rdDepictor
 from rdkit.Geometry import Point3D
-from typing import Callable
 
-import datetime
-import functools
-import hashlib
-import inspect
-import platform
-import traceback
-import warnings
-from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
 from .utils import print_red

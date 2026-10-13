@@ -1,37 +1,15 @@
 """Остаток: перенумерация, имена атомов, остов, координаты и стереохимия, параметры остатка, протонирование."""
-import os
-import sys
-import time
-import re
-import glob
 import json
-from pathlib import Path
 from collections import Counter
 from collections import defaultdict, deque
 import numpy as np
 
-import itertools
-import threading
-import subprocess
 
-from decimal import Decimal as D
 
-from rdkit.Chem.Draw import IPythonConsole
 from rdkit import Chem
-from rdkit.Chem import AllChem, Draw, rdFMCS
+from rdkit.Chem import AllChem
 from rdkit.Chem import rdDepictor
-from rdkit.Geometry import Point3D
-from typing import Callable
 
-import datetime
-import functools
-import hashlib
-import inspect
-import platform
-import traceback
-import warnings
-from rdkit.Chem import rdMolDescriptors
-from rdkit.Chem.Draw import rdMolDraw2D
 
 from .log import log_note, logged
 from .utils import increment_name, print_green, print_red
@@ -155,169 +133,10 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
     new_mol.SetProp('ParentAtoms', json.dumps(sorted(new_index[idx] for idx in canonical)))
     return new_mol
 
-@logged
-def generate_atom_names_by_ref_aa(mod_aa_mol, ref_aa_mol, dict_match, output_path):
-    """
-    Переименовывает атомы в модифицированной аминокислоте на основе референсной.
-    
-    Аргументы:
-        mod_aa_mol: RDKit объект Chem.Mol для модифицированной молекулы.
-        ref_aa_mol: RDKit объект Chem.Mol для референсной молекулы.
-        dict_match: Словарь сопоставления индексов атомов (модифицированные -> референсные).
-        output_path: Путь для сохранения модифицированного PDB файла.
-    """
-    # Получаем текущие имена атомов модифицированной молекулы
-    all_mod_atom_names = [str(atom.GetProp("AtomName")) if atom.HasProp("AtomName") else "" for atom in mod_aa_mol.GetAtoms()]
-    all_ref_atom_names = [str(atom.GetProp("AtomName")) if atom.HasProp("AtomName") else "" for atom in ref_aa_mol.GetAtoms()]
-    print(all_mod_atom_names)
-
-    for mod_indx, ref_indx in dict_match.items():
-        mod_atom_name = all_mod_atom_names[mod_indx]
-        ref_atom_name = all_ref_atom_names[ref_indx]
-
-        # Если имя из референсной молекулы уже есть в модифицированной
-        if ref_atom_name in all_mod_atom_names:
-            new_name = ref_atom_name
-            counter = 1
-            while new_name in all_mod_atom_names:
-                # Изменяем только числовую часть имени
-                match = re.match(r"(\D+)(\d*)", ref_atom_name)
-                if match:
-                    prefix = match.group(1)  # Буквенная часть
-                    suffix = match.group(2)  # Числовая часть (может быть пустой)
-                    new_name = f"{prefix}{int(suffix) + counter if suffix else counter}"
-                else:
-                    # Если имя не содержит числовой части, добавляем ее
-                    new_name = f"{ref_atom_name}{counter}"
-                counter += 1
-
-            print(f'Переименовываем {mod_indx}:{ref_atom_name} -> {mod_indx}:{new_name}')
-            index_rename_mod_atom = all_mod_atom_names.index(ref_atom_name)
-            all_mod_atom_names[index_rename_mod_atom] = new_name
-            all_mod_atom_names[mod_indx] = ref_atom_name
-        else:
-            # Если имени нет в модифицированной молекуле, обновляем напрямую
-            all_mod_atom_names[mod_indx] = ref_atom_name
-
-
-        print(f'({mod_indx}:{mod_atom_name}) -> ({ref_indx}:{ref_atom_name})')
-
-    # Проверяем, что все имена уникальны
-    name_counts = Counter(all_mod_atom_names)
-    duplicates = [name for name, count in name_counts.items() if count > 1]
-
-    if duplicates:
-        print("Обнаружены повторяющиеся имена атомов в модифицированной молекуле:")
-        for name in duplicates:
-            print(f"Имя: {name}, количество повторений: {name_counts[name]}")
-        raise ValueError("Есть повторяющиеся имена атомов. Проверьте логи.")
-    else:
-        print("Все имена атомов уникальны.")
-
-    return all_mod_atom_names        
-
-
-def rdkit_pdb_modification_old(rdkit_mol, resname='MOD', resid=1, segid='A'):
-    """
-    Модифицирует имена атомов в молекуле по правилам аминокислот:
-    - N, H, CA, C, O имеют стандартные имена
-    - Боковые атомы получают буквенные метки по греческому алфавиту
-    - Протоны наследуют имя родительского атома и получают числовой суффикс
-    """
-    greek_alphabet = {0: 'B', 1: 'G', 2: 'D', 3: 'E', 4: 'Z', 5: 'H', 
-                      6: 'T', 7: 'I', 8: 'K', 9: 'L', 10: 'M', 11: 'N', 
-                      12: 'X', 13: 'O', 14: 'P', 15: 'R', 16: 'S'}
-
-    # Найдём индекс CA (альфа-углерода)
-    submatch = rdkit_mol.GetSubstructMatch(Chem.MolFromSmarts('[H][N]C([H])C=O'))
-    if not submatch:
-        raise ValueError("Не удалось найти структуру аминокислоты [H][N]CC=O")
-    idx_H, idx_N, idx_CA, idx_HA ,idx_C, idx_O = submatch[0], submatch[1], submatch[2], submatch[3], submatch[4], submatch[5] 
-
-    # Префиксы по индексам атомов
-    atom_names = {idx_H: {'atom_symbol': 'H','atom_letter':''}, idx_N: {'atom_symbol': 'N','atom_letter':''}, 
-                  idx_CA: {'atom_symbol': 'C','atom_letter':'A'}, idx_HA: {'atom_symbol': 'H','atom_letter':'A'},
-                  idx_C: {'atom_symbol': 'C','atom_letter':''}, idx_O: {'atom_symbol': 'O','atom_letter':''}}
-    # Старт нумерации с атомов, следующих за CA
-    # visited = set(atom_names.keys())
-    # atom_names = {}
-    greek_counter = 0
-    hydrogen_counts = {}
-
-    queue = [idx_CA]
-    while queue:
-        current_idx = queue.pop(0)
-        current_atom = rdkit_mol.GetAtomWithIdx(current_idx)
-        neighbors = defaultdict(int)
-
-        for atom in current_atom.GetNeighbors():
-            if atom.GetIdx() not in atom_names:
-                neighbors[atom.GetAtomicNum()] += 1
-
-        
-        count_hidrogen = neighbors[1] 
-        count_heavy = sum(neighbors.values()) - neighbors.get(1, 0) 
-
-        hidrogen_index = 1 if count_hidrogen > 1 else None
-        heavy_index = 1 if count_heavy > 1 else None
-            
-        for neighbor in current_atom.GetNeighbors():
-            nbr_idx = neighbor.GetIdx()
-            if nbr_idx in atom_names.keys():
-                continue
-                
-            if neighbor.GetAtomicNum() != 1:
-                # Тяжёлый атом
-                symbol = neighbor.GetSymbol()
-                if heavy_index and count_heavy > 1:
-                    greek_index = greek_alphabet.get(greek_counter, f"Y{greek_counter}") + str(count_heavy)
-                    atom_names[nbr_idx] = {'atom_symbol': symbol,'atom_letter': greek_index}
-                    count_heavy -= 1
-                    queue.append(nbr_idx)
-                elif heavy_index and count_heavy == 1:
-                    greek_index = greek_alphabet.get(greek_counter, f"Y{greek_counter}") + str(count_heavy)
-                    atom_names[nbr_idx] = {'atom_symbol': symbol,'atom_letter': greek_index}
-                    greek_counter += 1
-                    queue.append(nbr_idx)
-                else:
-                    greek_index = greek_alphabet.get(greek_counter, f"Y{greek_counter}")
-                    atom_names[nbr_idx] = {'atom_symbol': symbol,'atom_letter': greek_index}
-                    greek_counter += 1
-                    queue.append(nbr_idx)
-            else :
-                # Это водород — имя зависит от родителя
-                parent_letter = atom_names[current_idx]['atom_letter']
-                if hidrogen_index and count_hidrogen > 1:
-                    greek_index = parent_letter + str(count_hidrogen)
-                    atom_names[nbr_idx] = {'atom_symbol': 'H','atom_letter': greek_index}
-                    count_hidrogen -= 1
-                elif hidrogen_index and count_hidrogen == 1:
-                    greek_index = parent_letter + str(count_hidrogen)
-                    atom_names[nbr_idx] = {'atom_symbol': 'H','atom_letter': greek_index}
-                    count_hidrogen -= 1
-                else:
-                    atom_names[nbr_idx] = {'atom_symbol': 'H','atom_letter': parent_letter} #f"H{parent_name}{hydrogen_counts[parent_name]}"
-
-    # Объединяем всё
-    for atom in rdkit_mol.GetAtoms():
-        idx = atom.GetIdx()
-        name = atom_names[idx]['atom_symbol']+atom_names[idx]['atom_letter']
-        name = name[:4].ljust(4)  # PDB формат требует длину 4 символа
-
-        info = Chem.AtomPDBResidueInfo()
-        info.SetName(name)
-        info.SetResidueName(resname)
-        info.SetResidueNumber(resid)
-        info.SetChainId(segid)
-        atom.SetProp("AtomName", name.strip())
-        atom.SetMonomerInfo(info)
-
-    return rdkit_mol  
-
 def find_backbone_match(rdkit_mol, C_terminal=False):
     """
     Находит атомы остова аминокислотного остатка по шаблону H-N-CA(H)-C(=O)
-    (тот же, что в rdkit_pdb_modification_old). Водороды должны быть явными атомами.
+    (тот же, что в прежней rdkit_pdb_modification_old). Водороды должны быть явными атомами.
 
     Аргументы:
         rdkit_mol (Chem.Mol) - остаток
@@ -410,7 +229,7 @@ def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
                            force_numeric=False, C_terminal=False, naming='greek', parent_atoms=None):
     """
     Назначает атомам остатка PDB-имена и параметры остатка (имя, номер, цепь).
-    Меняет и возвращает переданную молекулу (save_aa_chem_to_pdb передаёт сюда копию).
+    Меняет и возвращает переданную молекулу (save_chem_to_pdb передаёт сюда копию).
     Имена строятся только по графу молекулы и индексам атомов; старые имена не используются,
     поэтому повторный вызов на той же молекуле даёт те же имена.
 

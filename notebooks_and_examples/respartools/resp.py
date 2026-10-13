@@ -799,7 +799,6 @@ def run_resp_job(folder, n_threads=4, n_parallel=1, memory='4 GB', n_processes=N
     Повторный запуск продолжает: готовые конформации и расчёты ESP не пересчитываются.
     Возвращает np.ndarray - заряды атомов остатка в порядке остатка шага 4.
     """
-    import psiresp
     folder = os.path.abspath(folder)
     spec = json.load(open(os.path.join(folder, SPEC_FILE)))
     labels = [c['label'] for c in spec['conformers']]

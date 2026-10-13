@@ -3,35 +3,15 @@ import os
 import sys
 import time
 import re
-import glob
 import json
-from pathlib import Path
-from collections import Counter
-from collections import defaultdict, deque
-import numpy as np
 
 import itertools
-import threading
-import subprocess
 
 from decimal import Decimal as D
 
-from rdkit.Chem.Draw import IPythonConsole
 from rdkit import Chem
-from rdkit.Chem import AllChem, Draw, rdFMCS
-from rdkit.Chem import rdDepictor
-from rdkit.Geometry import Point3D
 from typing import Callable
 
-import datetime
-import functools
-import hashlib
-import inspect
-import platform
-import traceback
-import warnings
-from rdkit.Chem import rdMolDescriptors
-from rdkit.Chem.Draw import rdMolDraw2D
 
 from .log import _LOG, logged
 
@@ -83,22 +63,6 @@ def data_to_dict(funсtion: Callable):
         else:
             print('Некорректный тип данных ввода', file=sys.stderr)
             return None
-    return wrapper
-
-def do_fun_for_2d_list(function: Callable):
-    '''
-    Декоратор для применения функции к каждому элементу двумерного списка (матрицы).
-    '''
-    def wrapper(lst: list):
-        result = []
-        for element in lst:
-            if isinstance(element, list):
-                # Рекурсивно применяем декоратор к вложенному списку
-                result.append(wrapper(element))
-            else:
-                # Применяем функцию к элементу
-                result.append(function(element))
-        return result
     return wrapper
 
 def path_parser(path: str, file_types: list):
