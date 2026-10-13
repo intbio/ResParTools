@@ -29,3 +29,7 @@ notebooks_and_examples/build/
 
 # вывод review с кластера (разовый)
 notebooks_and_examples/review.txt
+
+# внутренние отчёты (только локально)
+docs/NIGHT_REPORT.md
+docs/REVIEW.md
