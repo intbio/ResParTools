@@ -33,3 +33,7 @@ notebooks_and_examples/review.txt
 # внутренние отчёты (только локально)
 docs/NIGHT_REPORT.md
 docs/REVIEW.md
+
+# описание файлов меток и строки GAFF из базового поля - только локально
+notebooks_and_examples/dyes_wip/README.md
+notebooks_and_examples/dyes_wip/ffnonbonded_gaff_from_base.itp
