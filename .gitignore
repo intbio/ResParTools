@@ -26,3 +26,6 @@ CLAUDE.md
 
 # рабочая папка ночных проверок (новое поле, validate, МД, RESP)
 notebooks_and_examples/build/
+
+# вывод review с кластера (разовый)
+notebooks_and_examples/review.txt
