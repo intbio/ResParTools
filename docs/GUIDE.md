@@ -292,7 +292,10 @@ pt.run_validate(job, run='local')                                  # прове�
   (`rdkit_pdb_modification`); `no_H=True` пишет ещё `<path>_no_H.pdb` (так раньше делала
   `save_aa_chem_to_pdb`).
 - `save_chem_to_mol(mol, path)` - формат MOL.
-- `save_charges_json(name, charges, path)` - список зарядов в JSON (`AI_chrges_*.json`).
+- `save_charges_json(name, charges, path, atom_names=None)` - заряды в JSON (`AI_chrges_*.json`); с
+  `atom_names` - словарь `{atom_names, charges}`, без них - список (старый формат).
+- `load_charges_json(path, atom_names=None)` - чтение: имена в файле должны совпасть с `atom_names` по
+  порядку (иначе ошибка); у старого формата проверяется только число атомов (с предупреждением).
 - `save_mol(mol, path)` [ветки] - SDF со **всеми** свойствами атомов и молекулы; проверяет,
   что значения не пустые и без пробелов.
 - `load_mol(path)` [ветки] - чтение `save_mol`: типы свойств восстанавливаются
@@ -408,16 +411,19 @@ charge(mol, constraints=...)` (`espaloma-charge_mod`, слой `ChargeEquilibriu
 - `read_ffbonded(path)` [ветки] - какие связи, углы, диэдралы есть в `ffbonded.itp` по типам (с шаблоном `X`).
 
 **Шаг 2*: acpype**
-- `run_acpype(mol, workdir, atom_type='amber', charge_type='gas')` [ветки] - топология acpype:
+- `run_acpype(mol, workdir, atom_type='amber', charge_type='gas', net_charge=None)` [ветки] - топология acpype:
   вход - MOL прямо из RDKit (порядки связей, 3D; obabel не нужен), заряд - `GetFormalCharge`
   молекулы (раньше вписывался руками и местами неверно), водороды HW добавляются внутри,
   если их нет; порядок атомов itp сверяется с молекулой по элементам. Пишет `AcpypeType`, `AcpypeItp`.
+  `net_charge` - заряд вручную на всякий случай: не совпал с формальным - предупреждение.
 
 **Шаг 3*: типы, rtp, hdb, поле**
-- `assign_types(mol, parent_res)` [ветки] - тип атома: атом родителя сохраняет тип родителя,
-  если его окружение то же (элемент, число соседей, число H; `_env`, `_rtp_env`); водород - если
+- `assign_types(mol, parent_res, parent_name=None)` [ветки] - тип атома: атом родителя сохраняет тип
+  родителя, если его окружение то же (элемент, число соседей, число H; `_env`, `_rtp_env`; гибридизация
+  и ароматичность: у родителя - из шаблона `_template_hybridization`, у остатка - в ACE-X-NME
+  `_hybridization`, т. к. N вырезанного остатка выглядит sp3); водород - если
   не изменилось окружение и его атома, и соседей; иначе - тип acpype. Заменяет зашитые
-  `aminoacid='LYS'` и `exclusion_atoms=['HE1','HE2']` старого шага 3.
+  `aminoacid='LYS'` и `exclusion_atoms=['HE1','HE2']` старого шага 3. Типы acpype у новых атомов не меняются.
 - `residue_rtp(mol, ff_dir)` [ветки] - запись остатка для rtp: атомы с типами и зарядами
   `Charge<ChargeMethod>`, все связи + `-C N`, импроперы остова; **явные параметры** (из itp
   acpype, уже в единицах GROMACS) - только для связей, углов, диэдралов, которых нет в
@@ -528,9 +534,10 @@ charge(mol, constraints=...)` (`espaloma-charge_mod`, слой `ChargeEquilibriu
 
 ## 10. Силовые поля в репозитории
 - `amber14sb_parmbsc1_cufix.ff/` - базовое поле (amber14sb + parmbsc1 для ДНК + CUFIX).
-  **Не править.** В нём же лежат посторонние файлы: rtp меток `CY3_*`, `CY5_*`, `Cy3_syn.rtp`
-  (типы GAFF, которых нет в `atomtypes.atp`), `*-Copy1*`, `Untitled.ipynb` - из-за rtp меток
-  `pdb2gmx` с этим полем не работает (вопрос 3 раздела 12).
+  **Не править.** rtp меток `CY3_*`, `CY5_*`, `Cy3_syn.rtp` (типы GAFF, которых нет в `atomtypes.atp`;
+  из-за них `pdb2gmx` с полем не работал), `*-Copy1*`, `atomtypes_flu.atp`, `Untitled.ipynb` перенесены
+  в `notebooks_and_examples/dyes_wip/` (2026-10-13, см. README там). В `ffnonbonded.itp` при этом есть
+  строки типов GAFF (`ns`, `os`...) - разобрать при сверке поля.
 - `amber14sb_mod.ff/` - поле с модификациями старого пути: `<Mod>.rtp` (RESP/вручную) и
   `<Mod>_ai.rtp` (Espaloma). Старые rtp содержат известные ошибки (`PLAN.md`).
 - `build/amber14sb_mod.ff/` [ветки, вне git] - новое поле: 12 лизинов, заряды Espaloma,

@@ -6,6 +6,9 @@ import glob
 from collections import defaultdict
 
 import subprocess
+import contextlib
+import functools
+import io
 import shutil
 
 
@@ -331,7 +334,8 @@ def _acpype_bin(acpype_bin=None):
 
 
 @logged
-def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=None, random_seed=42):
+def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=None, random_seed=42,
+               net_charge=None):
     """
     Шаг 2: топология acpype (типы атомов и параметры связей, углов, диэдралов) для остатка.
     acpype не принимает атомы с оборванной валентностью, поэтому, если в mol ещё нет
@@ -339,6 +343,8 @@ def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=No
     (add_protons_and_renumber_H) - только для acpype, в mol их нет. Вход acpype - MOL-файл
     прямо из RDKit (порядки связей и 3D-координаты, без obabel), заряд - формальный заряд
     молекулы (не руками). Порядок атомов itp сверяется с молекулой по элементам (по массе).
+    net_charge - заряд для acpype вручную (на всякий случай); если он не совпадает с
+    формальным зарядом молекулы, выводится предупреждение и берётся net_charge.
 
     Записывает в атомы mol 'AcpypeType', в молекулу 'AcpypeItp' (путь к itp; атомы itp с
     номером больше числа атомов остатка - добавленные водороды). Заряды acpype (charge_type)
@@ -359,6 +365,11 @@ def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=No
     mol_path = os.path.join(workdir, f'{name}.mol')
     Chem.MolToMolFile(work, mol_path)
     net = Chem.GetFormalCharge(mol)
+    if net_charge is not None and int(net_charge) != net:
+        print_red(f'⚠ net_charge={int(net_charge):+d} не совпадает с формальным зарядом молекулы '
+                  f'{net:+d}: acpype получит {int(net_charge):+d}.')
+    if net_charge is not None:
+        net = int(net_charge)
     cmd = [_acpype_bin(acpype_bin), '-i', f'{name}.mol', '-c', charge_type, '-a', atom_type,
            '-n', str(net), '-b', name, '-o', 'gmx']
     run = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)
@@ -494,23 +505,58 @@ def _rtp_env(res, name):
     return (_element(name), len(nb), sum(_element(n) == 'H' for n in nb if n[0] not in '+-'))
 
 
+@functools.lru_cache(maxsize=None)
+def _template_hybridization(resname, residue_type='protein'):
+    """
+    {имя атома: (гибридизация, ароматичность)} родителя resname (LYS, CYS...) из шаблона
+    REF_TEMPLATES[residue_type] (остаток residue_number: у его N и C есть настоящие соседи).
+    """
+    template = REF_TEMPLATES[residue_type]
+    for path in sorted(glob.glob(os.path.join(template['dir'], template['pattern']))):
+        with contextlib.redirect_stdout(io.StringIO()):
+            ref = pdb_to_chem(path, format_coord='3D')[os.path.splitext(os.path.basename(path))[0]]
+        atoms = [a for a in ref.GetAtoms()
+                 if a.GetPDBResidueInfo().GetResidueNumber() == template['residue_number']]
+        if atoms and atoms[0].GetPDBResidueInfo().GetResidueName().strip() == resname:
+            return {a.GetProp('AtomName'): (str(a.GetHybridization()), a.GetIsAromatic()) for a in atoms}
+    raise ValueError(f'Нет шаблона остатка {resname} в {template["dir"]}')
+
+
+def _hybridization(mol):
+    """
+    Гибридизация и ароматичность атомов остатка в кэпированной молекуле ACE-X-NME: у N и C
+    остова там настоящие амидные соседи (в вырезанном остатке N выглядел бы как sp3).
+    """
+    capped = Chem.Mol(cap_residue(mol))
+    Chem.SanitizeMol(capped)
+    return [(str(capped.GetAtomWithIdx(i).GetHybridization()), capped.GetAtomWithIdx(i).GetIsAromatic())
+            for i in range(mol.GetNumAtoms())]
+
+
 @logged
-def assign_types(mol, parent_res):
+def assign_types(mol, parent_res, parent_name=None):
     """
     Шаг 3: тип атома для силового поля (свойство AtomType, источник - TypeSource).
     Атом родителя (ParentName) сохраняет тип родителя, если его окружение то же
-    (элемент, число соседей, число H); водород - если окружение то же и у его тяжёлого
-    атома, и у всех соседей того атома (иначе это H у изменённой группы, например HE1/HE2
-    при ацилировании NZ: в лизине они HP рядом с N+). Остальные атомы - тип acpype
-    (AcpypeType, run_acpype). Вместо списков исключений и родителя, вписанных руками.
+    (элемент, число соседей, число H, гибридизация и ароматичность); водород - если
+    окружение то же и у его тяжёлого атома, и у всех соседей того атома (иначе это H у
+    изменённой группы, например HE1/HE2 при ацилировании NZ: в лизине они HP рядом с N+).
+    Остальные атомы - тип acpype (AcpypeType, run_acpype) без изменений.
+    Гибридизация родителя - из шаблона REF_TEMPLATES, остатка - из ACE-X-NME (cap_residue).
         parent_res - остаток родителя из read_rtp (например read_rtp(...)[1]['LYS'])
+        parent_name - имя родителя в rtp ('LYS'); по умолчанию из свойства молекулы Parent
     Меняет и возвращает mol.
     """
+    if parent_name is None:
+        parent_name = AMINO_ACIDS[mol.GetProp('Parent')][0].upper()
     ptype = {n: t for n, t, *_ in parent_res['atoms']}
+    phyb = _template_hybridization(parent_name)
+    hyb = _hybridization(mol)
     same = {}
     for a in mol.GetAtoms():
         pn = a.GetProp('ParentName') if a.HasProp('ParentName') else None
-        same[a.GetIdx()] = pn in ptype and _env(a) == _rtp_env(parent_res, pn)
+        same[a.GetIdx()] = (pn in ptype and _env(a) == _rtp_env(parent_res, pn)
+                            and phyb.get(pn) == hyb[a.GetIdx()])
     for a in mol.GetAtoms():
         keep = same[a.GetIdx()]
         if keep and a.GetAtomicNum() == 1:
@@ -620,7 +666,7 @@ def write_forcefield(mol, ff_out, ff_base=DEFAULT_FF):
     resname = mol.GetAtomWithIdx(0).GetPDBResidueInfo().GetResidueName().strip()
     parent = AMINO_ACIDS[mol.GetProp('Parent')][0].upper()
     parent_res = read_rtp(os.path.join(ff_base, 'aminoacids.rtp'))[1][parent]
-    assign_types(mol, parent_res)
+    assign_types(mol, parent_res, parent)
     res, explicit = residue_rtp(mol, ff_out)
     total = sum(q for _, _, q, _ in res['atoms'])
     if abs(total - round(total)) > 1e-3:
@@ -655,4 +701,6 @@ def write_forcefield(mol, ff_out, ff_base=DEFAULT_FF):
 
 
 from .residue import set_mol_coords, add_protons_and_renumber_H  # noqa: E402
-from .matching import AMINO_ACIDS  # noqa: E402
+from .matching import AMINO_ACIDS, REF_TEMPLATES  # noqa: E402
+from .fileio import pdb_to_chem  # noqa: E402
+from .resp import cap_residue  # noqa: E402

@@ -424,28 +424,58 @@ def save_chem_to_pdb(rdkit_mol, path, rootedAtAtom=-1, coords='2D', stereo=None,
 
 
 @logged
-def save_charges_json(name: str, charge_list: list, path: str = ".") -> None:
+def save_charges_json(name: str, charge_list: list, path: str = ".", atom_names=None) -> None:
     """
-    Сохраняет список зарядов в JSON-файл с указанием абсолютного пути
-    
+    Сохраняет заряды в JSON (<path>/<name>.json).
+
     Параметры:
     name (str): Название файла (без расширения)
-    charge_list (list): Список зарядов для сохранения
+    charge_list (list): Список зарядов в порядке атомов остатка
     path (str): Путь для сохранения (по умолчанию текущая директория)
+    atom_names (list): имена атомов в том же порядке. С ними файл - словарь
+        {"atom_names": [...], "charges": [...]}, и load_charges_json сверяет порядок атомов;
+        без них - просто список зарядов (старый формат, порядок не проверяется)
     """
-    # Создаем директорию, если она не существует
+    charge_list = [float(q) for q in charge_list]
+    data = charge_list
+    if atom_names is not None:
+        atom_names = list(atom_names)
+        if len(atom_names) != len(charge_list):
+            raise ValueError(f'Имён атомов {len(atom_names)}, зарядов {len(charge_list)}')
+        data = {'atom_names': atom_names, 'charges': charge_list}
     os.makedirs(path, exist_ok=True)
-    
-    # Формируем полный путь к файлу
     file_path = os.path.join(path, f"{name}.json")
-    absolute_path = os.path.abspath(file_path)
-    
-    # Сохраняем данные
     with open(file_path, 'w') as convert_file:
-        json.dump(charge_list, convert_file, indent=4)
-    
-    # Выводим информативное сообщение
-    print(f"Файл успешно сохранен: \n{absolute_path}")
+        json.dump(data, convert_file, indent=4)
+    print(f"Файл успешно сохранен: \n{os.path.abspath(file_path)}")
+
+
+def load_charges_json(path, atom_names=None):
+    """
+    Читает заряды из JSON (save_charges_json) и возвращает список зарядов.
+    atom_names - имена атомов, к которым заряды будут приписаны (из молекулы или itp):
+    - файл с именами - имена должны совпасть по порядку, иначе ошибка (заряды достались бы
+      не тем атомам);
+    - файл старого формата (только список) - проверяется только число атомов, о том, что
+      порядок не проверен, выводится предупреждение.
+    """
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        names, charges = data['atom_names'], data['charges']
+    else:
+        names, charges = None, data
+    if atom_names is None:
+        return charges
+    atom_names = list(atom_names)
+    if len(atom_names) != len(charges):
+        raise ValueError(f'{path}: зарядов {len(charges)}, атомов {len(atom_names)}')
+    if names is None:
+        print_red(f'⚠ {path}: в файле нет имён атомов (старый формат) - порядок атомов не проверен.')
+    elif names != atom_names:
+        diff = [(i, a, b) for i, (a, b) in enumerate(zip(names, atom_names)) if a != b]
+        raise ValueError(f'{path}: порядок атомов не совпадает (индекс, в файле, ожидается): {diff[:5]}')
+    return charges
 
 
 # -----------------------------------------------------------------------------

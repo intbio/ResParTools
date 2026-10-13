@@ -59,7 +59,15 @@ def _monomer(folder):
 
 
 def _job_dir(folder, mon):
-    return os.path.join(ROOT, folder, 'RESP_data', f'{mon}_capped')
+    """
+    Папка задачи RESP. prepare с другими конформациями или настройками пишет новую задачу
+    в <имя>_01, _02... (старая не трогается); какая из них текущая - в <имя>.current.
+    """
+    base = os.path.join(ROOT, folder, 'RESP_data', f'{mon}_capped')
+    pointer = base + '.current'
+    if os.path.exists(pointer):
+        return os.path.join(os.path.dirname(base), open(pointer).read().strip())
+    return base
 
 
 def cmd_check(args):
@@ -80,6 +88,8 @@ def cmd_prepare(args):
                                   fix_backbone=True, n_sidechain=3, monomer=_monomer(folder))
         pt.write_slurm_script(job, cpus=args.cpus, mem=args.mem, partition=args.partition,
                               time_limit=args.time)
+        with open(os.path.join(os.path.dirname(job), f'{mon}_capped.current'), 'w') as f:
+            f.write(os.path.basename(job))
 
 
 def _sbatch(folder, script, dependency=None):
@@ -151,15 +161,16 @@ def cmd_collect(args):
         folded = [k for k, v in result.get('conformers', {}).items() if v.get('contact_after_opt')]
         if folded:
             print(f'⚠ после оптимизации боковая цепь касается остова: {folded}')
+        names = [a.GetProp('AtomName') for a in residue.GetAtoms()]
         espaloma = os.path.join(ROOT, folder, f'AI_chrges_{mon}.json')
         sets = {'RESP': q}
         if os.path.exists(espaloma):
-            sets = {'Espaloma': json.load(open(espaloma)), 'RESP': q}
+            sets = {'Espaloma': pt.load_charges_json(espaloma, names), 'RESP': q}
         pt.compare_charges(residue, sets)
         cwd = os.getcwd()
         os.chdir(os.path.join(ROOT, folder))
         try:
-            pt.save_charges_json(name=f'RESP_chrges_{mon}', charge_list=[float(x) for x in q])
+            pt.save_charges_json(name=f'RESP_chrges_{mon}', charge_list=[float(x) for x in q], atom_names=names)
         finally:
             os.chdir(cwd)
 

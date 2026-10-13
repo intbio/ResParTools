@@ -339,6 +339,33 @@ def test_write_forcefield_formyl(tmp_path):
     assert open(os.path.join(ff, 'KFO.hdb')).read().startswith('KFO\t8\n')
 
 
+def test_hybridization_for_types():
+    """Гибридизация для assign_types: N и C остова - sp2 и в шаблоне, и в остатке (через ACE-X-NME)."""
+    _, _, residue = props_steps_1_to_4('Lysine_Formyl')
+    lys = pt._template_hybridization('LYS')
+    assert lys['N'][0] == lys['C'][0] == 'SP2' and lys['NZ'][0] == 'SP3'
+    hyb = dict(zip([a.GetProp('AtomName') for a in residue.GetAtoms()], pt._hybridization(residue)))
+    assert hyb['N'][0] == hyb['C'][0] == 'SP2', 'N остова без кэпа выглядел бы как sp3'
+    assert hyb['NZ'][0] == 'SP2' and hyb['CE'] == lys['CE']   # амид NZ - sp2, CE как в лизине
+
+
+def test_charges_json_atom_order(tmp_path):
+    """JSON зарядов с именами атомов: при чтении порядок сверяется; старый формат - с предупреждением."""
+    names, q = ['N', 'H', 'CA'], [-0.3, 0.2, 0.1]
+    _quiet(pt.save_charges_json, 'new', q, str(tmp_path), atom_names=names)
+    assert pt.load_charges_json(str(tmp_path / 'new.json'), names) == q
+    with pytest.raises(ValueError, match='порядок атомов'):
+        pt.load_charges_json(str(tmp_path / 'new.json'), ['H', 'N', 'CA'])
+    _quiet(pt.save_charges_json, 'old', q, str(tmp_path))
+    assert json.load(open(tmp_path / 'old.json')) == q                       # старый формат - список
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert pt.load_charges_json(str(tmp_path / 'old.json'), names) == q
+    assert 'порядок атомов не проверен' in buf.getvalue()
+    with pytest.raises(ValueError, match='зарядов 3, атомов 2'):
+        pt.load_charges_json(str(tmp_path / 'old.json'), names[:2])
+
+
 def test_validate_vacuum_formyl(tmp_path):
     """Проверка в GROMACS: pdb2gmx -ignh (водороды по hdb), grompp без предупреждений, минимизация."""
     try:
