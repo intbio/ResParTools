@@ -8,8 +8,9 @@
 2. Конформации: пары углов остова (phi, psi) из fix_backbone (по умолчанию alphaR и beta)
    x n_sidechain конформаций боковой цепи. Пул RDKit ETKDG -> углы остова -> MMFF с
    замороженными phi/psi -> отбор низкоэнергетических и непохожих конформаций.
-3. Оптимизация HF/6-31G* в psi4 (optking) с замороженными phi/psi, порциями: прерванный
-   расчёт продолжается с последней геометрии. Конформации считаются параллельно.
+3. Оптимизация (по умолчанию HF/6-31G*) в psi4 (optking) с замороженными phi/psi, одним расчётом
+   до max_opt_steps шагов; не сошлось - повторный запуск продолжает с последней геометрии.
+   Конформации считаются параллельно.
 4. ESP (сетка MSK) и двухстадийный RESP - psiresp, все конформации с равным весом.
    Оптимизацию psiresp не делает: в режиме без QCFractal он её не выполняет (считает
    только градиент), поэтому геометрии оптимизируются здесь, в psi4.
@@ -810,7 +811,7 @@ def run_resp_job(folder, n_threads=4, n_parallel=1, memory='4 GB', n_processes=N
         if not (os.path.exists(st) and json.load(open(st)).get('converged')):
             todo.append(label)
     if todo:
-        print(f'Оптимизация HF/6-31G*: {len(todo)} конформаций, по {n_threads} потоков, '
+        print(f"Оптимизация {spec['qm']['method']}/{spec['qm']['basis']}: {len(todo)} конформаций, по {n_threads} потоков, "
               f'одновременно {n_parallel}')
         cmds = [([sys.executable, '-c', _WORKER, folder, '--optimize', label,
                   '--threads', str(n_threads), '--memory', memory], folder,
@@ -953,7 +954,7 @@ def _fit_two_stage(spec, folder, labels, n_threads, n_parallel, memory, n_proces
         job = psiresp.Job(molecules=molecules, working_directory=os.path.join(folder, 'psiresp'),
                           charge_constraints=cc, n_processes=n_processes, qm_esp_options=esp_options,
                           resp_options=psiresp.RespOptions(stage_2=False, restraint_height_stage_1=height))
-        _run_esp(job, folder, n_threads, n_parallel, memory)
+        _run_esp(job, folder, n_threads, n_parallel, memory, f"{qm['method']}/{qm['basis']}")
         return job, np.array(job.charges[0], dtype=float), dropped
 
     groups1 = [g for g in spec['equivalent_groups'] if not set(g) & stage2_h]
@@ -972,7 +973,7 @@ def _fit_two_stage(spec, folder, labels, n_threads, n_parallel, memory, n_proces
     return q
 
 
-def _run_esp(job, folder, n_threads, n_parallel, memory):
+def _run_esp(job, folder, n_threads, n_parallel, memory, method):
     """job.run() с выполнением расчётов ESP psi4 (параллельно); готовые не пересчитываются."""
     for _ in range(3):
         try:
@@ -981,7 +982,7 @@ def _run_esp(job, folder, n_threads, n_parallel, memory):
         except SystemExit:
             script = os.path.join(folder, 'psiresp', 'single_point', 'run_single_point.sh')
             files = [line.split()[-1] for line in open(script) if line.startswith('psi4 ')]
-            print(f'ESP HF/6-31G*: {len(files)} расчётов psi4')
+            print(f'ESP {method}: {len(files)} расчётов psi4')
             cmds = [(['psi4', '-n', str(n_threads), '--memory', memory.replace(' ', ''),
                       '--qcschema', f], os.path.dirname(script),
                      os.path.join(os.path.dirname(script), f + '.log')) for f in files]
