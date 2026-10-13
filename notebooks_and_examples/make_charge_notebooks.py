@@ -1,18 +1,14 @@
 """
-Сборка ноутбуков 1_charge_calculation.ipynb для папок модификаций из шаблона.
+Сборка ноутбуков папок модификаций из шаблонов (templates/).
 
-Шаблон - templates/1_charge_calculation.ipynb (сделан из AF_546_cys/1_charge_calculation.ipynb).
-Всё, что зависит от модификации, задаётся в ячейке параметров (PARAMS ниже); остальные
-ячейки одинаковые во всех папках.
-
-Старые ноутбуки не редактируются: если в папке уже есть 1_charge_calculation.ipynb, не
-собранный из шаблона, он переименовывается в 1_charge_calculation_old.ipynb. Ноутбук,
-собранный из шаблона, перезаписывается только с --overwrite.
+Путь словарей и тримеров (old): 1_charge_calculation_old.ipynb, 2_generate_topology_old.ipynb,
+3_edd_topology_old.ipynb - из шаблонов templates/<то же имя>. Всё, что зависит от модификации, задаётся
+в ячейке параметров (PARAMS ниже); остальные ячейки одинаковые во всех папках. Ноутбук, не собранный
+из шаблона, не перезаписывается (ошибка); собранный - только с --overwrite.
 
 Запуск (из notebooks_and_examples/):
     python make_charge_notebooks.py                 # все папки из PARAMS
     python make_charge_notebooks.py Lysine_Formyl   # одна папка
-    python make_charge_notebooks.py --template      # пересобрать шаблон из AF_546_cys
     python make_charge_notebooks.py --props [папки] # версия без словарей: 1_charge_calculation_props.ipynb
         (шаблон templates/1_charge_calculation_props.ipynb, перезаписывается всегда)
 """
@@ -23,17 +19,15 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE = os.path.join(ROOT, 'templates', '1_charge_calculation.ipynb')
-SOURCE = os.path.join(ROOT, 'AF_546_cys', '1_charge_calculation.ipynb')
-NOTEBOOK = '1_charge_calculation.ipynb'
-OLD_NOTEBOOK = '1_charge_calculation_old.ipynb'
+OLD_NOTEBOOKS = ('1_charge_calculation_old.ipynb', '2_generate_topology_old.ipynb', '3_edd_topology_old.ipynb')
 PROPS_TEMPLATE = os.path.join(ROOT, 'templates', '1_charge_calculation_props.ipynb')
 PROPS_NOTEBOOK = '1_charge_calculation_props.ipynb'
 
 # Параметры модификаций. naming: 'greek' - буквенные имена (лизины), 'index' - для больших
 # меток. resp_run: где считать RESP на шаге 6 ('local' - эта машина, 'slurm' - кластер).
-_LYS = dict(parent_residue='K', naming='greek', resp_run='local')
-_DYE = dict(parent_residue='C', naming='index', resp_run='slurm')
+# exclusion_atoms - атомы родителя, не наследующие его тип в 3_edd_topology_old (старое правило).
+_LYS = dict(parent_residue='K', naming='greek', resp_run='local', exclusion_atoms=['HE1', 'HE2'])
+_DYE = dict(parent_residue='C', naming='index', resp_run='slurm', exclusion_atoms=[])
 PARAMS = {
     'AF_546_cys': dict(PTM_name='C_AF546', base_name='546', monomer_file='molecules/C_AF_546.smiles',
                        trimer_file='molecules/ACA_AF_546.smiles', **_DYE),
@@ -121,48 +115,55 @@ def parametrize(nb, params):
     return nb
 
 
-def make_template():
-    """Шаблон из AF_546_cys: параметры-заглушки, без выводов и без пустых ячеек."""
-    nb = json.load(open(SOURCE))
-    nb = parametrize(nb, PARAMS['AF_546_cys'])
-    nb['cells'] = [c for c in nb['cells'] if _src(c).strip()]
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code':
-            cell['outputs'] = []
-            cell['execution_count'] = None
-    nb['metadata']['respartools'] = {'template': 'templates/1_charge_calculation.ipynb',
-                                     'source': 'AF_546_cys/1_charge_calculation.ipynb'}
-    os.makedirs(os.path.dirname(TEMPLATE), exist_ok=True)
-    json.dump(nb, open(TEMPLATE, 'w'), ensure_ascii=False, indent=1)
-    open(TEMPLATE, 'a').write('\n')
-    print(f'шаблон: {TEMPLATE} ({len(nb["cells"])} ячеек)')
+STEP2_PARAMS = """# Параметры модификации
+PTM_name = {PTM_name!r}   # имя модификации: вход {{PTM_name}}_rn_H_3D.pdb (шаг 4.1)
+base_name = {base_name!r}        # имя остатка в силовом поле (как в rtp)
+charge_val = None        # заряд для acpype вручную (на всякий случай); None - формальный заряд молекулы"""
+
+STEP3_PARAMS = """# Параметры модификации
+PTM_folder = {folder!r}      # папка модификации: имя rtp-файла в force_field_files/
+PTM_name = {PTM_name!r}        # вход шага 2: {{PTM_name}}_rn_H_3D
+base_name = {base_name!r}             # имя остатка в силовом поле
+parent_residue = {parent_residue!r}          # родительский остаток (однобуквенный код)
+mon_name = {mon_name!r}        # мономер: заряды data/AI_chrges_{{mon_name}}.json
+charges_file = f'data/AI_chrges_{{mon_name}}.json'   # или f'data/RESP_chrges_{{mon_name}}.json'
+# атомы родителя, которые НЕ наследуют его тип (старое правило; новый путь определяет их по окружению):
+# у лизинов HE1/HE2 - водороды при NZ, в лизине у них тип HP (рядом с N+)
+exclusion_atoms = {exclusion_atoms!r}"""
+
+
+def _notebook(name, folder):
+    """Ноутбук name для папки folder из шаблона templates/<name>."""
+    params = dict(PARAMS[folder], folder=folder,
+                  mon_name=os.path.splitext(os.path.basename(PARAMS[folder]['monomer_file']))[0])
+    nb = copy.deepcopy(json.load(open(os.path.join(ROOT, 'templates', name))))
+    if name.startswith('1_'):
+        nb = parametrize(nb, params)
+    else:
+        _set_src(_cell(nb, 'params'), (STEP2_PARAMS if name.startswith('2_') else STEP3_PARAMS).format(**params))
+    nb['metadata']['respartools'] = {'template': f'templates/{name}', 'params': PARAMS[folder]}
+    return nb
 
 
 def make_notebook(folder, overwrite=False):
-    """Собирает <папка>/1_charge_calculation.ipynb из шаблона по PARAMS[папка]."""
-    params = PARAMS[folder]
-    path = os.path.join(ROOT, folder, NOTEBOOK)
-    if os.path.exists(path):
-        existing = json.load(open(path))
-        from_template = 'respartools' in existing.get('metadata', {})
-        if from_template and not overwrite:
-            print(f'{folder}: {NOTEBOOK} уже собран из шаблона, пропуск (--overwrite - пересобрать)')
-            return None
-        if not from_template:
-            old = os.path.join(ROOT, folder, OLD_NOTEBOOK)
-            if os.path.exists(old):
-                raise FileExistsError(f'{folder}: есть и {NOTEBOOK}, и {OLD_NOTEBOOK} - разберитесь вручную')
-            os.rename(path, old)
-            print(f'{folder}: старый {NOTEBOOK} переименован в {OLD_NOTEBOOK}')
+    """Собирает в папке 1_charge_calculation_old, 2_generate_topology_old, 3_edd_topology_old из шаблонов."""
     for key in ('monomer_file', 'trimer_file'):
-        if not os.path.exists(os.path.join(ROOT, folder, params[key])):
-            raise FileNotFoundError(f'{folder}: нет файла {params[key]}')
-    nb = parametrize(copy.deepcopy(json.load(open(TEMPLATE))), params)
-    nb['metadata']['respartools'] = {'template': 'templates/1_charge_calculation.ipynb', 'params': params}
-    json.dump(nb, open(path, 'w'), ensure_ascii=False, indent=1)
-    open(path, 'a').write('\n')
-    print(f'{folder}: {NOTEBOOK} собран из шаблона')
-    return path
+        if not os.path.exists(os.path.join(ROOT, folder, PARAMS[folder][key])):
+            raise FileNotFoundError(f'{folder}: нет файла {PARAMS[folder][key]}')
+    paths = []
+    for name in OLD_NOTEBOOKS:
+        path = os.path.join(ROOT, folder, name)
+        if os.path.exists(path):
+            if 'respartools' not in json.load(open(path)).get('metadata', {}):
+                raise FileExistsError(f'{folder}: {name} не собран из шаблона - перенесите его в archive/notebooks/')
+            if not overwrite:
+                print(f'{folder}: {name} уже собран из шаблона, пропуск (--overwrite - пересобрать)')
+                continue
+        json.dump(_notebook(name, folder), open(path, 'w'), ensure_ascii=False, indent=1)
+        open(path, 'a').write('\n')
+        print(f'{folder}: {name} собран из шаблона')
+        paths.append(path)
+    return paths
 
 
 def make_props_notebook(folder):
@@ -185,13 +186,9 @@ def make_props_notebook(folder):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('folders', nargs='*', help='папки модификаций (по умолчанию все из PARAMS)')
-    parser.add_argument('--template', action='store_true', help='пересобрать шаблон из AF_546_cys')
     parser.add_argument('--props', action='store_true', help='версия без словарей (1_charge_calculation_props.ipynb)')
     parser.add_argument('--overwrite', action='store_true', help='пересобрать ноутбуки, уже собранные из шаблона')
     args = parser.parse_args(argv)
-    if args.template:
-        make_template()
-        return
     unknown = [f for f in args.folders if f not in PARAMS]
     if unknown:
         sys.exit(f'Нет параметров для {unknown}: добавьте их в PARAMS')
@@ -199,7 +196,7 @@ def main(argv=None):
         for folder in args.folders or list(PARAMS):
             make_props_notebook(folder)
         return
-    for folder in args.folders or [f for f in PARAMS if f != 'AF_546_cys']:
+    for folder in args.folders or list(PARAMS):
         make_notebook(folder, overwrite=args.overwrite)
 
 
