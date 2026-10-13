@@ -34,9 +34,11 @@ RESP на маленькой задаче (HF/STO-3G, одна конформа�
 ```bash
 python cluster/resp_cluster.py prepare             # все лизины; или перечислить папки: Lysine_Formyl Lysine_3M
 python cluster/resp_cluster.py review > review.txt # проверка ДО запуска (квантовая химия ещё не считается)
-python cluster/resp_cluster.py submit --chain      # по очереди: каждая задача стартует после предыдущей
+python cluster/resp_cluster.py submit              # все задачи сразу (параллельно, ~2-3 ч при свободных узлах)
+# python cluster/resp_cluster.py submit --chain    # или по очереди: каждая после предыдущей (12 задач - 10-20 ч)
 python cluster/resp_cluster.py status              # сколько конформаций сошлось
-python cluster/resp_cluster.py collect             # заряды -> RESP_chrges_<имя>.json + сравнение с Espaloma
+python cluster/resp_cluster.py collect             # заряды -> <папка>/data/RESP_chrges_<имя>.json + сравнение с Espaloma
+git add */data/RESP_chrges_*.json && git commit -m "RESP: заряды с кластера" && git push
 ```
 `review` для каждой задачи показывает: молекулу ACE-остаток-NME (SMILES), заряды молекулы и
 остатка, фиксированные заряды по остаткам (кэп ACE и NME - из rtp amber14sb, остов - из
