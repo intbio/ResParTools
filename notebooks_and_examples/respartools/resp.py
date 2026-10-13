@@ -543,7 +543,7 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
                      context_chem=None, fix_backbone=True, n_sidechain=3, conformer_pool=300,
                      energy_window=10.0, exclude_contacts=True, random_seed=42, method='hf',
                      basis='6-31g*', g_convergence='gau', opt_chunk=None, max_opt_steps=400,
-                     scf_type='df', monomer=None):
+                     scf_type='df', monomer=None, continue_steps=100):
     """
     Готовит папку задачи RESP: молекула расчёта, конформации, ограничения, настройки
     (spec.json). Квантовая химия не запускается. Параметры - см. resp_charges.
@@ -553,6 +553,7 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
     настройки), новая пишется в <name>_01, <name>_02...: прогресс старой не смешивается с
     новой. Та же задача (повторный запуск) остаётся в своей папке, прогресс сохраняется.
     opt_chunk - устаревший параметр (оптимизация порциями), не используется.
+    continue_steps - шагов на каждый повторный запуск несошедшейся конформации (после max_opt_steps).
     Возвращает путь к папке задачи.
     """
     if opt_chunk is not None:
@@ -639,7 +640,7 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
         'stereo': {(f'{atom_names[k[1]]}={atom_names[k[2]]}' if isinstance(k, tuple) else atom_names[k]): v
                    for k, v in labels.items()},
         'qm': {'method': method, 'basis': basis, 'g_convergence': g_convergence, 'scf_type': scf_type,
-               'max_opt_steps': max_opt_steps},
+               'max_opt_steps': max_opt_steps, 'continue_steps': continue_steps},
     }
     folder = _job_folder(os.path.abspath(os.path.join(working_dir, name)), spec, starts)
     for label, coords in starts.items():
@@ -711,10 +712,12 @@ def review_resp_job(folder, image=True):
 
 def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     """
-    Оптимизирует одну конформацию в psi4 одним расчётом до max_opt_steps шагов (вызывается
-    в отдельном процессе): гессиан optking не теряется между шагами. Не сошлось за
-    max_opt_steps - последняя геометрия в current.xyz, повторный запуск начинает с неё;
-    psi4 упал (например, SCF) - геометрия в failed.xyz (для разбора). Причина - в status.json.
+    Оптимизирует одну конформацию в psi4 одним расчётом (вызывается в отдельном процессе):
+    гессиан optking не теряется между шагами. Первый запуск - до max_opt_steps шагов; не сошлось -
+    последняя геометрия в current.xyz, и каждый повторный запуск продолжает с неё ещё на
+    continue_steps шагов. psi4 упал (например, SCF) - геометрия в failed.xyz (для разбора).
+    В status.json - причина и история запусков (шаги, энергия последней геометрии): по ней видно,
+    сходится ли конформация или вышла на плато.
     """
     import psi4
     spec = json.load(open(os.path.join(folder, SPEC_FILE)))
@@ -732,7 +735,8 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     psi4.core.set_output_file(os.path.join(cdir, 'opt.out'), True)
     psi4.set_num_threads(n_threads)
     psi4.set_memory(memory)
-    options = {'geom_maxiter': qm['max_opt_steps'], 'g_convergence': qm['g_convergence'],
+    steps = qm['max_opt_steps'] if not status.get('runs') else qm.get('continue_steps', 100)
+    options = {'geom_maxiter': steps, 'g_convergence': qm['g_convergence'],
                'scf_type': qm['scf_type']}
     if spec['frozen']:
         options['frozen_dihedral'] = ' '.join(str(i + 1) for quad in spec['frozen'] for i in quad)
@@ -740,19 +744,23 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     body = '\n'.join(f'{s} {x:.8f} {y:.8f} {z:.8f}' for s, (x, y, z) in zip(spec['symbols'], coords))
     mol = psi4.geometry(f"{spec['total_charge']} {spec['multiplicity']}\n{body}\n"
                         'units angstrom\nsymmetry c1\nno_com\nno_reorient\n')
+    history = status.get('history', [])
     status = {'runs': status.get('runs', 0) + 1, 'converged': False}
+    energy = None
     try:
         energy = psi4.optimize(f"{qm['method']}/{qm['basis']}", molecule=mol)
         status.update(converged=True, energy=float(energy))
         last, out = mol, 'optimized.xyz'
     except psi4.OptimizationConvergenceError as e:
-        status['error'] = f"не сошлось за {qm['max_opt_steps']} шагов"
-        last, out = e.wfn.molecule(), 'current.xyz'
+        status['error'] = f'не сошлось за {steps} шагов'
+        last, out, energy = e.wfn.molecule(), 'current.xyz', e.wfn.energy()
     except Exception as e:
         # SCF и др.: геометрия, на которой упал psi4, - для разбора (failed.xyz); повторный
         # запуск начнёт с прежней current.xyz / start.xyz, а не с неё
         status['error'] = f'{type(e).__name__}: {e}'.strip().splitlines()[0]
         last, out = psi4.core.get_legacy_molecule(), 'failed.xyz'
+    status['history'] = history + [{'steps': steps, 'energy': None if energy is None else float(energy),
+                                    'converged': status['converged'], 'error': status.get('error')}]
     coords = last.geometry().np * psi4.constants.bohr2angstroms
     with open(os.path.join(cdir, out), 'w') as f:
         f.write(_xyz_block(spec['symbols'], coords, spec['total_charge'], label))
@@ -825,7 +833,8 @@ def run_resp_job(folder, n_threads=4, n_parallel=1, memory='4 GB', n_processes=N
     if bad:
         raise RuntimeError('Оптимизация не сошлась: '
                            + '; '.join(f"{label} - {statuses[label].get('error', '?')}" for label in bad)
-                           + '. Повторный запуск продолжит с current.xyz (если есть), иначе с start.xyz.')
+                           + f". Повторный запуск продолжит с current.xyz ещё на {spec['qm'].get('continue_steps', 100)} "
+                           'шагов (история энергий - conformers/<метка>/status.json).')
 
     # проверка: не свернулась ли боковая цепь к остову при оптимизации (артефакт газовой фазы)
     if spec.get('contact_atoms'):
@@ -1191,7 +1200,8 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
         slurm (dict) - для run='slurm': cpus, mem, time_limit, partition, env_setup
             (по умолчанию 24 ядра, 32G, 8 часов, окружение darwin_resp - CLUSTER_ENV_SETUP)
         **qm_options - method='hf', basis='6-31g*', g_convergence='gau', max_opt_steps=400,
-            scf_type='df' (opt_chunk устарел: оптимизация - одним расчётом psi4)
+            continue_steps=100, scf_type='df' (opt_chunk устарел: оптимизация - одним расчётом psi4;
+            повторный запуск несошедшейся конформации - ещё continue_steps шагов)
     Возвращает:
         np.ndarray - заряды атомов остатка (run='local'), иначе путь к папке задачи
     """

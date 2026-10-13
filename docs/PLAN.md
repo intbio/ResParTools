@@ -57,7 +57,9 @@
 Ветка `feature/cleanup-and-notebooks` (не main). На кластере: `git checkout feature/cleanup-and-notebooks`,
 `prepare` -> `review` (сверить с локальным пробным prepare) -> `submit` **без --chain** (12 задач параллельно,
 ~2-3 ч) -> `status` -> `collect` (data/RESP_chrges_*.json) -> commit + push с кластера -> здесь pull и анализ.
-Риск: несошедшаяся конформация (как beta_2 у 1M/ACC раньше) - collect не даст заряды этой модификации.
+Несошедшаяся конформация (решение автора): смотрим opt.out/worker.log; нет критических ошибок - повторный
+submit продолжает с current.xyz ещё на 100 шагов (continue_steps), пока не сойдётся или не выйдет на плато
+(история энергий - в status.json и в выводе `status`).
 
 ## Чистка и ноутбуки (решения автора 2026-10-13; ветка `feature/cleanup-and-notebooks`)
 Решения:

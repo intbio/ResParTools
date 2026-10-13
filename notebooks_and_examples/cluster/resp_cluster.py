@@ -126,14 +126,22 @@ def cmd_status(args):
         if not os.path.exists(os.path.join(job, pt.SPEC_FILE)):
             print(f'{folder:15s} не подготовлено')
             continue
-        statuses = []
+        statuses, notes = [], []
         for st in sorted(glob.glob(os.path.join(job, 'conformers', '*', 'status.json'))):
-            statuses.append(json.load(open(st)).get('converged'))
+            s = json.load(open(st))
+            statuses.append(s.get('converged'))
+            if s.get('converged') is False:
+                # история запусков: шаги и энергия последней геометрии (Хартри) - сходимость или плато
+                hist = ', '.join(f"{h['steps']}: {h['energy']:.6f}" if h.get('energy') is not None
+                                 else f"{h['steps']}: {h.get('error')}" for h in s.get('history', []))
+                notes.append(f"    {os.path.basename(os.path.dirname(st))}: {s.get('error')} | {hist}")
         n = len(json.load(open(os.path.join(job, pt.SPEC_FILE)))['conformers'])
         done = os.path.exists(os.path.join(job, pt.RESULT_FILE))
         print(f'{folder:15s} конформаций сошлось {sum(1 for s in statuses if s)}/{n}'
               f'{" | не сошлись: " + str(sum(1 for s in statuses if s is False)) if False in statuses else ""}'
               f' | результат: {"есть" if done else "нет"}')
+        for note in notes:
+            print(note)
 
 
 def cmd_review(args):
