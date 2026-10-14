@@ -715,7 +715,8 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     Оптимизирует одну конформацию в psi4 одним расчётом (вызывается в отдельном процессе):
     гессиан optking не теряется между шагами. Первый запуск - до max_opt_steps шагов; не сошлось -
     последняя геометрия в current.xyz, и каждый повторный запуск продолжает с неё ещё на
-    continue_steps шагов. psi4 упал (например, SCF) - геометрия в failed.xyz (для разбора).
+    continue_steps шагов. psi4 упал (например, SCF) - геометрия в failed.xyz; после падения SCF
+    повторный запуск продолжает с неё (SCF maxiter 300, soscf).
     В status.json - причина и история запусков (шаги, энергия последней геометрии): по ней видно,
     сходится ли конформация или вышла на плато.
     """
@@ -728,6 +729,24 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     if status.get('converged'):
         return status
     current = os.path.join(cdir, 'current.xyz')
+    # прошлый запуск упал на SCF: с прежней геометрии путь optking тот же и SCF упадёт там же,
+    # поэтому продолжаем с геометрии падения (failed.xyz) и с более устойчивым SCF
+    scf_failed = 'SCF' in str(status.get('error', '')) and os.path.exists(os.path.join(cdir, 'failed.xyz'))
+    if scf_failed:
+        # SCF падал и после того, как разваливалась геометрия: связи start.xyz (< 1.8 Å) не длиннее в 1.3 раза
+        start = _read_xyz(os.path.join(cdir, 'start.xyz'))
+        d0 = np.linalg.norm(start[:, None] - start[None], axis=2)
+        failed = _read_xyz(os.path.join(cdir, 'failed.xyz'))
+        d1 = np.linalg.norm(failed[:, None] - failed[None], axis=2)
+        bonds = (d0 > 0) & (d0 < 1.8)
+        worst = float((d1[bonds] / d0[bonds]).max())
+        if worst < 1.3:
+            current = os.path.join(cdir, 'failed.xyz')
+            print(f'{label}: прошлый запуск - {status["error"]}; продолжаю с failed.xyz, SCF maxiter 300, soscf')
+        else:
+            print_red(f'⚠ {label}: в failed.xyz связь длиннее исходной в {worst:.2f} раза - геометрия развалилась; '
+                      f'продолжаю с {"current.xyz" if os.path.exists(current) else "start.xyz"}, '
+                      'SCF maxiter 300, soscf')
     coords = _read_xyz(current if os.path.exists(current) else os.path.join(cdir, 'start.xyz'))
     scratch = os.path.join(cdir, 'scratch')
     os.makedirs(scratch, exist_ok=True)
@@ -738,6 +757,8 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     steps = qm['max_opt_steps'] if not status.get('runs') else qm.get('continue_steps', 100)
     options = {'geom_maxiter': steps, 'g_convergence': qm['g_convergence'],
                'scf_type': qm['scf_type']}
+    if scf_failed:
+        options.update(maxiter=300, soscf=True)
     if spec['frozen']:
         options['frozen_dihedral'] = ' '.join(str(i + 1) for quad in spec['frozen'] for i in quad)
     psi4.set_options(options)
@@ -755,10 +776,10 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
         status['error'] = f'не сошлось за {steps} шагов'
         last, out, energy = e.wfn.molecule(), 'current.xyz', e.wfn.energy()
     except Exception as e:
-        # SCF и др.: геометрия, на которой упал psi4, - для разбора (failed.xyz); повторный
-        # запуск начнёт с прежней current.xyz / start.xyz, а не с неё
+        # SCF и др.: геометрия, на которой упал psi4, - failed.xyz; после падения SCF повторный
+        # запуск продолжит с неё (иначе - с прежней current.xyz / start.xyz)
         status['error'] = f'{type(e).__name__}: {e}'.strip().splitlines()[0]
-        last, out = psi4.core.get_legacy_molecule(), 'failed.xyz'
+        last, out = mol, 'failed.xyz'   # psi4.optimize сдвигает mol на каждом шаге
     status['history'] = history + [{'steps': steps, 'energy': None if energy is None else float(energy),
                                     'converged': status['converged'], 'error': status.get('error')}]
     coords = last.geometry().np * psi4.constants.bohr2angstroms
