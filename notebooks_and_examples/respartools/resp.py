@@ -543,7 +543,7 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
                      context_chem=None, fix_backbone=True, n_sidechain=3, conformer_pool=300,
                      energy_window=10.0, exclude_contacts=True, random_seed=42, method='hf',
                      basis='6-31g*', g_convergence='gau', opt_chunk=None, max_opt_steps=400,
-                     scf_type='df', monomer=None, continue_steps=100):
+                     scf_type='df', monomer=None, continue_steps=100, optimizer='geometric'):
     """
     Готовит папку задачи RESP: молекула расчёта, конформации, ограничения, настройки
     (spec.json). Квантовая химия не запускается. Параметры - см. resp_charges.
@@ -554,6 +554,8 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
     новой. Та же задача (повторный запуск) остаётся в своей папке, прогресс сохраняется.
     opt_chunk - устаревший параметр (оптимизация порциями), не используется.
     continue_steps - шагов на каждый повторный запуск несошедшейся конформации (после max_opt_steps).
+    optimizer - 'geometric' (geomeTRIC: отвергает шаги с ростом энергии) или 'optking' (встроенный psi4;
+        на плато у минимума делал шаг ~0.4 бор, и молекула разваливалась).
     Возвращает путь к папке задачи.
     """
     if opt_chunk is not None:
@@ -640,7 +642,7 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
         'stereo': {(f'{atom_names[k[1]]}={atom_names[k[2]]}' if isinstance(k, tuple) else atom_names[k]): v
                    for k, v in labels.items()},
         'qm': {'method': method, 'basis': basis, 'g_convergence': g_convergence, 'scf_type': scf_type,
-               'max_opt_steps': max_opt_steps, 'continue_steps': continue_steps},
+               'max_opt_steps': max_opt_steps, 'continue_steps': continue_steps, 'optimizer': optimizer},
     }
     folder = _job_folder(os.path.abspath(os.path.join(working_dir, name)), spec, starts)
     for label, coords in starts.items():
@@ -697,7 +699,8 @@ def review_resp_job(folder, image=True):
         print(f"  {c['label']:9s} phi {c['mmff_phi']:7.1f} psi {c['mmff_psi']:7.1f} | dE MMFF {c['mmff_dE']:5.2f} "
               f"ккал/моль | контакт боковой цепи с остовом: {'да' if c['contact'] else 'нет'}")
     qm = spec['qm']
-    print(f"QM: {qm['method']}/{qm['basis']}, оптимизация {qm['g_convergence']}, scf_type {qm['scf_type']}")
+    print(f"QM: {qm['method']}/{qm['basis']}, оптимизация {qm.get('optimizer', 'optking')} {qm['g_convergence']}, "
+          f"scf_type {qm['scf_type']}")
     if image:
         for atom, name in zip(mol.GetAtoms(), names):
             atom.SetProp('AtomName', name)
@@ -710,44 +713,89 @@ def review_resp_job(folder, image=True):
         return img
 
 
+def _broken_bonds(symbols, start, coords, factor=1.3):
+    """
+    Связи стартовой геометрии (расстояние < 1.2 суммы ковалентных радиусов), которые в coords
+    длиннее в factor раз и больше: молекула развалилась. Возвращает [(i, j, отношение)].
+    """
+    pt = Chem.GetPeriodicTable()
+    r = np.array([pt.GetRcovalent(s) for s in symbols])
+    d0 = np.linalg.norm(start[:, None] - start[None], axis=2)
+    d1 = np.linalg.norm(coords[:, None] - coords[None], axis=2)
+    i, j = np.where(np.triu(d0 < 1.2 * (r[:, None] + r[None]), 1))
+    ratio = d1[i, j] / d0[i, j]
+    return [(int(a), int(b), round(float(x), 2)) for a, b, x in zip(i, j, ratio) if x > factor]
+
+
+def _optimize_geometric(psi4, mol, qm, frozen, steps, scratch, log_path):
+    """
+    Оптимизация geomeTRIC (координаты TRIC, замороженные двугранные углы, шаги с ростом энергии
+    отвергаются, радиус доверия уменьшается). Свой цикл, а не psi4.optimize(engine='geometric'):
+    в psi4 1.6.1 он не сообщает о несходимости. Возвращает (сошлось, энергия, координаты в бор).
+    """
+    import logging
+    import geometric
+    import geometric.prepare
+    from geometric.errors import GeomOptNotConvergedError
+
+    class _Engine(geometric.engine.Engine):
+        def calc_new(self, coords, dirname):
+            mol.set_geometry(psi4.core.Matrix.from_array(coords.reshape(-1, 3)))
+            mol.update_geometry()
+            grad = psi4.gradient(f"{qm['method']}/{qm['basis']}", molecule=mol)
+            return {'energy': psi4.variable('CURRENT ENERGY'), 'gradient': grad.np.ravel()}
+
+    M = geometric.molecule.Molecule()
+    M.elem = [mol.symbol(i).capitalize() for i in range(mol.natom())]
+    M.xyzs = [mol.geometry().np * psi4.constants.bohr2angstroms]
+    M.build_bonds()
+    cons, cvals = None, None
+    if frozen:
+        cons, cvals = geometric.prepare.parse_constraints(
+            M, '$freeze\n' + '\n'.join('dihedral ' + ' '.join(str(i + 1) for i in quad) for quad in frozen))
+    ic = geometric.internal.DelocalizedInternalCoordinates(M, build=True, connect=False, addcart=False,
+                                                           constraints=cons, cvals=None if cvals is None else cvals[0])
+    params = geometric.params.OptParams(maxiter=steps, convergence_set=qm['g_convergence'].upper())
+    handler = logging.FileHandler(log_path)
+    handler.terminator = ''   # строки geomeTRIC уже с \n
+    logger = logging.getLogger('geometric')
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    opt = geometric.optimize.Optimizer(M.xyzs[0].flatten() / psi4.constants.bohr2angstroms, M, ic,
+                                       _Engine(M), scratch, params)
+    try:
+        opt.optimizeGeometry()
+        converged = True
+    except GeomOptNotConvergedError:
+        converged = False
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+    return converged, float(opt.E), opt.X.reshape(-1, 3)
+
+
 def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     """
-    Оптимизирует одну конформацию в psi4 одним расчётом (вызывается в отдельном процессе):
-    гессиан optking не теряется между шагами. Первый запуск - до max_opt_steps шагов; не сошлось -
-    последняя геометрия в current.xyz, и каждый повторный запуск продолжает с неё ещё на
-    continue_steps шагов. psi4 упал (например, SCF) - геометрия в failed.xyz; после падения SCF
-    повторный запуск продолжает с неё (SCF maxiter 300, soscf).
-    В status.json - причина и история запусков (шаги, энергия последней геометрии): по ней видно,
-    сходится ли конформация или вышла на плато.
+    Оптимизирует одну конформацию в psi4 одним расчётом (вызывается в отдельном процессе).
+    Оптимизатор - qm['optimizer']: 'geometric' (по умолчанию в новых задачах) или 'optking'
+    (встроенный psi4; задачи, подготовленные до 2026-10-14, где ключа нет). Первый запуск - до
+    max_opt_steps шагов; не сошлось - последняя геометрия в current.xyz, повторный запуск
+    продолжает с неё ещё на continue_steps шагов. Разорванные связи (_broken_bonds) или падение
+    psi4 - геометрия в failed.xyz, конформация не продолжается с неё (повторный запуск - с
+    current.xyz / start.xyz). В status.json - причина и история запусков (шаги, энергия).
     """
     import psi4
     spec = json.load(open(os.path.join(folder, SPEC_FILE)))
     qm = spec['qm']
+    optimizer = qm.get('optimizer', 'optking')
     cdir = os.path.join(folder, 'conformers', label)
     status_path = os.path.join(cdir, 'status.json')
     status = json.load(open(status_path)) if os.path.exists(status_path) else {}
     if status.get('converged'):
         return status
+    start = _read_xyz(os.path.join(cdir, 'start.xyz'))
     current = os.path.join(cdir, 'current.xyz')
-    # прошлый запуск упал на SCF: с прежней геометрии путь optking тот же и SCF упадёт там же,
-    # поэтому продолжаем с геометрии падения (failed.xyz) и с более устойчивым SCF
-    scf_failed = 'SCF' in str(status.get('error', '')) and os.path.exists(os.path.join(cdir, 'failed.xyz'))
-    if scf_failed:
-        # SCF падал и после того, как разваливалась геометрия: связи start.xyz (< 1.8 Å) не длиннее в 1.3 раза
-        start = _read_xyz(os.path.join(cdir, 'start.xyz'))
-        d0 = np.linalg.norm(start[:, None] - start[None], axis=2)
-        failed = _read_xyz(os.path.join(cdir, 'failed.xyz'))
-        d1 = np.linalg.norm(failed[:, None] - failed[None], axis=2)
-        bonds = (d0 > 0) & (d0 < 1.8)
-        worst = float((d1[bonds] / d0[bonds]).max())
-        if worst < 1.3:
-            current = os.path.join(cdir, 'failed.xyz')
-            print(f'{label}: прошлый запуск - {status["error"]}; продолжаю с failed.xyz, SCF maxiter 300, soscf')
-        else:
-            print_red(f'⚠ {label}: в failed.xyz связь длиннее исходной в {worst:.2f} раза - геометрия развалилась; '
-                      f'продолжаю с {"current.xyz" if os.path.exists(current) else "start.xyz"}, '
-                      'SCF maxiter 300, soscf')
-    coords = _read_xyz(current if os.path.exists(current) else os.path.join(cdir, 'start.xyz'))
+    coords = _read_xyz(current) if os.path.exists(current) else start
     scratch = os.path.join(cdir, 'scratch')
     os.makedirs(scratch, exist_ok=True)
     psi4.core.IOManager.shared_object().set_default_path(scratch)
@@ -755,36 +803,52 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     psi4.set_num_threads(n_threads)
     psi4.set_memory(memory)
     steps = qm['max_opt_steps'] if not status.get('runs') else qm.get('continue_steps', 100)
-    options = {'geom_maxiter': steps, 'g_convergence': qm['g_convergence'],
-               'scf_type': qm['scf_type']}
-    if scf_failed:
-        options.update(maxiter=300, soscf=True)
-    if spec['frozen']:
-        options['frozen_dihedral'] = ' '.join(str(i + 1) for quad in spec['frozen'] for i in quad)
+    options = {'scf_type': qm['scf_type']}
+    if optimizer == 'optking':
+        options.update(geom_maxiter=steps, g_convergence=qm['g_convergence'])
+        if spec['frozen']:
+            options['frozen_dihedral'] = ' '.join(str(i + 1) for quad in spec['frozen'] for i in quad)
     psi4.set_options(options)
     body = '\n'.join(f'{s} {x:.8f} {y:.8f} {z:.8f}' for s, (x, y, z) in zip(spec['symbols'], coords))
     mol = psi4.geometry(f"{spec['total_charge']} {spec['multiplicity']}\n{body}\n"
                         'units angstrom\nsymmetry c1\nno_com\nno_reorient\n')
     history = status.get('history', [])
-    status = {'runs': status.get('runs', 0) + 1, 'converged': False}
-    energy = None
+    status = {'runs': status.get('runs', 0) + 1, 'converged': False, 'optimizer': optimizer}
+    energy, out = None, 'current.xyz'
     try:
-        energy = psi4.optimize(f"{qm['method']}/{qm['basis']}", molecule=mol)
-        status.update(converged=True, energy=float(energy))
-        last, out = mol, 'optimized.xyz'
-    except psi4.OptimizationConvergenceError as e:
-        status['error'] = f'не сошлось за {steps} шагов'
-        last, out, energy = e.wfn.molecule(), 'current.xyz', e.wfn.energy()
+        if optimizer == 'geometric':
+            converged, energy, xyz = _optimize_geometric(psi4, mol, qm, spec['frozen'], steps, scratch,
+                                                         os.path.join(cdir, 'geometric.log'))
+        else:
+            try:
+                energy, converged = float(psi4.optimize(f"{qm['method']}/{qm['basis']}", molecule=mol)), True
+            except psi4.OptimizationConvergenceError as e:
+                mol, energy, converged = e.wfn.molecule(), float(e.wfn.energy()), False
+            xyz = mol.geometry().np
+        status['converged'] = converged
+        if converged:
+            out = 'optimized.xyz'
+            status['energy'] = energy
+        else:
+            status['error'] = f'не сошлось за {steps} шагов'
     except Exception as e:
-        # SCF и др.: геометрия, на которой упал psi4, - failed.xyz; после падения SCF повторный
-        # запуск продолжит с неё (иначе - с прежней current.xyz / start.xyz)
+        # SCF и др.: геометрия, на которой упал psi4 (psi4 сдвигает mol на каждом шаге)
         status['error'] = f'{type(e).__name__}: {e}'.strip().splitlines()[0]
-        last, out = mol, 'failed.xyz'   # psi4.optimize сдвигает mol на каждом шаге
-    status['history'] = history + [{'steps': steps, 'energy': None if energy is None else float(energy),
-                                    'converged': status['converged'], 'error': status.get('error')}]
-    coords = last.geometry().np * psi4.constants.bohr2angstroms
+        xyz, out = mol.geometry().np, 'failed.xyz'
+    xyz = xyz * psi4.constants.bohr2angstroms
+    broken = _broken_bonds(spec['symbols'], start, xyz)
+    if broken:
+        names = spec.get('atom_names') or spec['symbols']
+        status.update(converged=False, broken_bonds=broken,
+                      error='разорваны связи ' + ', '.join(f'{names[i]}-{names[j]} x{x}' for i, j, x in broken[:5])
+                            + (f' (+{len(broken) - 5})' if len(broken) > 5 else '')
+                            + (f"; {status['error']}" if status.get('error') else ''))
+        status.pop('energy', None)
+        out = 'failed.xyz'
+    status['history'] = history + [{'steps': steps, 'energy': energy, 'converged': status['converged'],
+                                    'error': status.get('error')}]
     with open(os.path.join(cdir, out), 'w') as f:
-        f.write(_xyz_block(spec['symbols'], coords, spec['total_charge'], label))
+        f.write(_xyz_block(spec['symbols'], xyz, spec['total_charge'], label))
     with open(status_path, 'w') as f:
         json.dump(status, f)
     shutil.rmtree(scratch, ignore_errors=True)
@@ -1221,7 +1285,7 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
         slurm (dict) - для run='slurm': cpus, mem, time_limit, partition, env_setup
             (по умолчанию 24 ядра, 32G, 8 часов, окружение darwin_resp - CLUSTER_ENV_SETUP)
         **qm_options - method='hf', basis='6-31g*', g_convergence='gau', max_opt_steps=400,
-            continue_steps=100, scf_type='df' (opt_chunk устарел: оптимизация - одним расчётом psi4;
+            continue_steps=100, scf_type='df', optimizer='geometric' ('optking' - встроенный psi4) (opt_chunk устарел: оптимизация - одним расчётом psi4;
             повторный запуск несошедшейся конформации - ещё continue_steps шагов)
     Возвращает:
         np.ndarray - заряды атомов остатка (run='local'), иначе путь к папке задачи

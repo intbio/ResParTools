@@ -11,6 +11,7 @@ dependencies:
   - python=3.9
   - psi4=1.6.1
   - psiresp=0.4.2
+  - geometric=1.1      # оптимизатор конформаций (_optimize_geometric)
   - qcelemental=0.25.1
   - pydantic=1.10
   - rdkit=2024.03

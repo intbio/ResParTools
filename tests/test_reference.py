@@ -171,6 +171,7 @@ def test_resp_prepare(folder, tmp_dir):
     assert spec['total_charge'] == spec['residue_charge'] == Chem.GetFormalCharge(residue)
     assert spec['stereo'].get('CA') == ('R' if PARAMS[folder]['parent_residue'] == 'C' else 'S')
     assert len(spec['frozen']) == 2
+    assert spec['qm']['optimizer'] == 'geometric'
     assert not any(c['contact'] for c in spec['conformers']), 'конформация с контактом боковой цепи'
     groups = [{names[i] for i in g} for g in spec['equivalent_groups']]
     if folder == 'Lysine_Malonyl':
@@ -192,6 +193,18 @@ def test_resp_job_folder(tmp_path):
     moved = {'alphaR_1': starts['alphaR_1'] + 0.1}
     assert _quiet(pt._job_folder, folder, spec, moved) == folder + '_01'
     assert _quiet(pt._job_folder, folder, dict(spec, qm={'max_opt_steps': 100}), starts) == folder + '_01'
+
+
+def test_broken_bonds():
+    """Развал геометрии при оптимизации (optking, 2026-10-14): связь, растянутая в 1.3 раза, - брак."""
+    mol = Chem.AddHs(Chem.MolFromSmiles('CCO'))
+    AllChem.EmbedMolecule(mol, randomSeed=1)
+    xyz = mol.GetConformer().GetPositions()
+    symbols = [a.GetSymbol() for a in mol.GetAtoms()]
+    assert pt._broken_bonds(symbols, xyz, xyz) == []
+    moved = xyz.copy()
+    moved[2] += (xyz[2] - xyz[1]) * 0.5            # C-O длиннее в 1.5 раза, O-H уезжает вместе с O
+    assert [(i, j) for i, j, _ in pt._broken_bonds(symbols, xyz, moved)] == [(1, 2)]
 
 
 def test_independent_constraints_drop_redundant():
