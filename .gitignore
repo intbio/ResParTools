@@ -18,21 +18,11 @@ RESP_data/
 timer.dat
 psi.*.clean
 
-# Инструкции для Claude Code: только локально
-CLAUDE.md
-
-# Настройки Claude Code этого проекта (плагин ponytail): только локально
-.claude/settings.json
-
 # рабочая папка ночных проверок (новое поле, validate, МД, RESP)
 notebooks_and_examples/build/
 
 # вывод review с кластера (разовый)
 notebooks_and_examples/review.txt
-
-# внутренние отчёты (только локально)
-docs/NIGHT_REPORT.md
-docs/REVIEW.md
 
 # описание файлов меток и строки GAFF из базового поля - только локально
 notebooks_and_examples/dyes_wip/README.md
