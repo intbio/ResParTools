@@ -4,6 +4,11 @@
 Карта пайплайна - `docs/PIPELINE.md`, подробности прошлых разборов - `docs/HISTORY.md`.
 
 ## Сейчас
+- [ ] **Разобрать ветки git** (первым, решения - через `/grill`): `main` отстаёт от
+      `feature/cleanup-and-notebooks` на 30+ коммитов; ночные `feature/rtp-io`, `mol-props`,
+      `acpype-step2`, `ff-step3`, `validate-md` и `integration/night-2026-10-10`; резервные `backup/*` (8);
+      локальная `wip/notebooks-2026-09`. Решить: что и в каком порядке слить в `main` (после тестов), что
+      удалить локально и на GitHub, на какую ветку переходит кластер (сейчас `feature/cleanup-and-notebooks`).
 - [ ] **RESP 12 лизинов на кластере, пересчёт geomeTRIC** (папки `_02`). `prepare` выполнен
       (`review_2.txt`: geomeTRIC, CA S, без контактов). Дальше: `review` вместе → `submit` → `status` →
       `collect` → сверка энергий с 58 конформациями, сошедшимися в optking (заряды первого прогона -
