@@ -26,7 +26,7 @@
    (`notebooks_and_examples/amber14sb_mod.ff/`).
 
 Подробная карта шагов, функций и файлов - [`docs/PIPELINE.md`](docs/PIPELINE.md);
-текущий статус и план - [`docs/PLAN.md`](docs/PLAN.md).
+планы - [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 Новые ноутбуки `1_charge_calculation.ipynb` собираются из шаблона
 `notebooks_and_examples/templates/` скриптом `make_charge_notebooks.py` (параметры каждой
@@ -78,7 +78,7 @@ python -m pytest tests -q                 # ~3 мин, вместе с AF546
 - `espaloma-charge/` - оригинальная Espaloma Charge
 - `espaloma-charge_mod/` - модифицированная Espaloma Charge (фиксация зарядов атомов)
 - `tests/` - тесты на эталонном наборе
-- `docs/` - карта пайплайна и план работ
+- `docs/` - карта пайплайна, схема свойств молекулы и планы
 
 ## Лицензия
 

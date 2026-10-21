@@ -1,7 +1,6 @@
 # Карта пайплайна ResParTools
 
-Обновлено: 2026-10-13 (ветка `feature/cleanup-and-notebooks`; путь на свойствах и шаги 2-3 в пакете
-ещё не слиты в `main`). Статус и решения - `docs/PLAN.md`.
+Обновлено: 2026-10-21. Планы - `docs/ROADMAP.md`.
 
 Цель: параметры модифицированного остатка (посттрансляционная модификация, флуоресцентная
 метка) для GROMACS amber14sb - имена атомов, топология, заряды, файлы силового поля, проверка в GROMACS.
@@ -93,7 +92,7 @@ flowchart TD
 `templates/1_charge_calculation_props.ipynb` (`make_charge_notebooks.py --props`), результаты -
 в `notebooks_and_examples/build/props/<папка>/` (`build/` вне git). Шаги 2-3 и проверка пока
 вызываются из кода (`build/md_code/night_validate.py`); ноутбуки `1_residue_charges`, `2_forcefield`
-и `build_residue` без тримеров - этап 6 плана.
+и `build_residue` без тримеров - в планах (`docs/ROADMAP.md`).
 
 | Шаг | Функции | Что пишется в молекулу / файлы |
 |---|---|---|
