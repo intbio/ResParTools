@@ -69,7 +69,8 @@ RESP (без квантовой химии).
 ```bash
 conda activate darwin_resp
 python -m pytest tests -q -m "not slow"   # ~2 мин
-python -m pytest tests -q                 # ~3 мин, вместе с AF546
+python -m pytest tests -q                 # вместе с AF546
+python -m pytest validation -q            # корректность на стандартных остатках, ~40 с
 ```
 
 ## Структура репозитория
@@ -83,7 +84,9 @@ python -m pytest tests -q                 # ~3 мин, вместе с AF546
   - `analyze_data/` - анализы рассчитанных зарядов (сравнение RESP и Espaloma)
 - `espaloma-charge/` - оригинальная Espaloma Charge
 - `espaloma-charge_mod/` - модифицированная Espaloma Charge (фиксация зарядов атомов)
-- `tests/` - тесты на эталонном наборе
+- `tests/` - тесты на эталонном наборе (регрессия: результат совпадает с файлами в git)
+- `validation/` - проверка корректности на референсных остатках против независимых эталонов
+  (поле amber14sb, ручные эталоны), см. [`validation/README.md`](validation/README.md)
 - `docs/` - карта пайплайна, схема свойств молекулы и планы (там же - направления развития:
   модуль ChimeraX, консольная программа, ноутбуки)
 

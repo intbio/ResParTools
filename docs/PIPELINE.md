@@ -214,9 +214,12 @@ Lysine_3M, AF_546_cys): шаги 1-4.1 сравниваются с файлам�
 кэпированный мономер, подготовка RESP (без квантовой химии).
 ```bash
 conda activate darwin_resp
-python -m pytest tests -q -m "not slow"   # ~30 с, лизины
-python -m pytest tests -q                 # ~3 мин, вместе с AF546
+python -m pytest tests -q -m "not slow"   # ~2 мин, лизины
+python -m pytest tests -q                 # вместе с AF546
+python -m pytest validation -q            # ~40 с
 ```
+`validation/` - проверка корректности против независимых эталонов (стандартные остатки и
+`aminoacids.rtp` amber14sb); описание и список проверок - [`validation/README.md`](../validation/README.md).
 
 ## Пакет `respartools/`
 `log` (лог `start_log`), `utils`, `fileio`, `draw`, `matching`, `residue`, `forcefield`
