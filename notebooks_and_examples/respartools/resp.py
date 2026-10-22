@@ -538,11 +538,19 @@ def _job_folder(folder, spec, starts, atol=1e-4):
     return candidate
 
 
+# Строгий набор сходимости - по умолчанию (R.E.D., Dupradeau 2010: Gaussian Opt=Tight; умолчание psiresp).
+# Для молекулы больше TIGHT_MAX_ATOMS атомов prepare_resp_job предлагает мягче 'gau' (сам не меняет).
+# shortcut: порог выбран между лизинами ACE-X-NME (37-45 атомов) и метками AF (~150) - уточнить по
+# времени расчётов на кластере.
+TIGHT_MAX_ATOMS = 80
+TIGHT_SETS = ('gau_tight', 'gau_verytight')
+
+
 @logged
 def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', context='capped',
                      context_chem=None, fix_backbone=True, n_sidechain=3, conformer_pool=300,
                      energy_window=10.0, exclude_contacts=True, random_seed=42, method='hf',
-                     basis='6-31g*', g_convergence='gau', opt_chunk=None, max_opt_steps=400,
+                     basis='6-31g*', g_convergence='gau_tight', opt_chunk=None, max_opt_steps=400,
                      scf_type='df', monomer=None, continue_steps=100, optimizer='geometric'):
     """
     Готовит папку задачи RESP: молекула расчёта, конформации, ограничения, настройки
@@ -556,6 +564,10 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
     continue_steps - шагов на каждый повторный запуск несошедшейся конформации (после max_opt_steps).
     optimizer - 'geometric' (geomeTRIC: отвергает шаги с ростом энергии) или 'optking' (встроенный psi4;
         на плато у минимума делал шаг ~0.4 бор, и молекула разваливалась).
+    g_convergence - набор критериев сходимости оптимизации: 'gau_tight' (по умолчанию с 2026-10-22,
+        как Gaussian Opt=Tight в R.E.D.), 'gau', 'gau_loose', 'gau_verytight' и др. (psi4/geomeTRIC).
+        Для молекулы больше TIGHT_MAX_ATOMS атомов функция предлагает 'gau', но набор не меняет.
+        Задачи, подготовленные раньше, хранят свой набор в spec.json.
     Возвращает путь к папке задачи.
     """
     if opt_chunk is not None:
@@ -590,6 +602,10 @@ def prepare_resp_job(residue_chem, constraints, name, working_dir='RESP_data', c
         dihedrals = context_backbone_dihedrals(context_chem, mapping, residue_chem)
         fixed = {mapping[int(i)]: float(q) for i, q in constraints.items()}
 
+    if g_convergence in TIGHT_SETS and mol.GetNumAtoms() > TIGHT_MAX_ATOMS:
+        print_red(f"⚠ В молекуле расчёта {mol.GetNumAtoms()} атомов (> {TIGHT_MAX_ATOMS}): строгая сходимость "
+                  f"'{g_convergence}' может потребовать много шагов. Если расчёт слишком долгий - "
+                  "g_convergence='gau' (мягче: силы в 30 раз выше порога).")
     conf_mol, described = resp_conformers(mol, dihedrals, mapping, fix_backbone=fix_backbone,
                                           n_sidechain=n_sidechain, pool=conformer_pool,
                                           energy_window=energy_window,
@@ -1290,7 +1306,7 @@ def resp_charges(residue_chem, constraints, name, run='local', working_dir='RESP
             текущее, если в нём есть psiresp, иначе darwin_resp рядом с текущим окружением
         slurm (dict) - для run='slurm': cpus, mem, time_limit, partition, env_setup
             (по умолчанию 24 ядра, 32G, 8 часов, окружение darwin_resp - CLUSTER_ENV_SETUP)
-        **qm_options - method='hf', basis='6-31g*', g_convergence='gau', max_opt_steps=400,
+        **qm_options - method='hf', basis='6-31g*', g_convergence='gau_tight', max_opt_steps=400,
             continue_steps=100, scf_type='df', optimizer='geometric' ('optking' - встроенный psi4) (opt_chunk устарел: оптимизация - одним расчётом psi4;
             повторный запуск несошедшейся конформации - ещё continue_steps шагов)
     Возвращает:

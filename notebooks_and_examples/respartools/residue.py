@@ -168,10 +168,38 @@ class _NamingError(ValueError):
     """Буквенный способ неприменим к остатку (слишком много уровней, длинные имена)."""
 
 
+def _branch_priority(mol, idx, depth, heavy_atoms, max_spheres=6):
+    """
+    Ключ сортировки атома внутри уровня - старшинство по правилам CIP (упрощённо, без
+    дублирования атомов кратных связей): атомный номер самого атома, затем атомные номера
+    соседей дальше от CA (сфера за сферой, по убыванию). Меньший ключ - старше (номер 1).
+    Так в amber: Thr OG1 (O старше C), Ile CG1 (ветвь с CD), Trp CD1 (сосед NE1).
+    Идут только по атомам heavy_atoms дальше уровня idx и их водородам.
+    """
+    level = depth[idx]
+    seen, sphere, key = {idx}, [idx], [(-mol.GetAtomWithIdx(idx).GetAtomicNum(),)]
+    for _ in range(max_spheres):
+        nxt = []
+        for i in sphere:
+            for nbr in mol.GetAtomWithIdx(i).GetNeighbors():
+                j = nbr.GetIdx()
+                if j in seen:
+                    continue
+                if nbr.GetAtomicNum() == 1 or (j in heavy_atoms and depth.get(j, -1) > level):
+                    seen.add(j)
+                    nxt.append(j)
+        if not nxt:
+            break
+        key.append(tuple(sorted(-mol.GetAtomWithIdx(j).GetAtomicNum() for j in nxt)))
+        sphere = [j for j in nxt if mol.GetAtomWithIdx(j).GetAtomicNum() > 1]
+    return tuple(key)
+
+
 def _greek_heavy_names(mol, CA_idx, heavy_atoms):
     """
     Буквенные имена тяжёлых атомов боковой цепи: элемент + буква уровня (число связей от CA)
-    + номер, если на уровне несколько атомов (1..n в порядке индексов).
+    + номер, если на уровне несколько атомов (1..n по старшинству CIP, при равенстве - по
+    индексу; _branch_priority).
     heavy_atoms - атомы, которые нужно назвать; путь от CA идёт только через них.
     Возвращает ({индекс: имя}, [индексы, не связанные с CA через heavy_atoms]).
     """
@@ -190,9 +218,18 @@ def _greek_heavy_names(mol, CA_idx, heavy_atoms):
     if levels and max(levels) > len(GREEK_LEVELS):
         raise _NamingError(f'боковая цепь длиннее {len(GREEK_LEVELS)} уровней '
                            f'(самый дальний атом в {max(levels)} связях от CA)')
-    names = {}
+    names, rank = {}, {CA_idx: 0}
+
+    def parent_rank(idx):
+        # ветвь-предок: старший по рангу сосед уровнем ближе к CA (в кольце их может быть два)
+        return min(rank[a.GetIdx()] for a in mol.GetAtomWithIdx(idx).GetNeighbors()
+                   if depth.get(a.GetIdx(), -1) == depth[idx] - 1 and a.GetIdx() in rank)
+
     for d in sorted(levels):
-        atoms = sorted(levels[d])
+        # номер внутри уровня: сначала по ветви-предку (His: CE1 от ND1, NE2 от CD2), затем по
+        # старшинству CIP (Thr: OG1, Ile: CG1 с CD), затем по индексу
+        atoms = sorted(levels[d], key=lambda idx: (parent_rank(idx), _branch_priority(mol, idx, depth, heavy_atoms), idx))
+        rank.update({idx: k for k, idx in enumerate(atoms)})
         for k, idx in enumerate(atoms, 1):
             element = mol.GetAtomWithIdx(idx).GetSymbol().upper()
             names[idx] = f'{element}{GREEK_LEVELS[d - 1]}' + (str(k) if len(atoms) > 1 else '')

@@ -156,10 +156,15 @@ def test_resp_prepare(folder, tmp_dir):
     mon, residue, _, monomer, _ = steps_1_to_4(folder, tmp_dir)
     rtp_res = pt.AMINO_ACIDS[PARAMS[folder]['parent_residue']][0].upper()
     constraints = _quiet(pt.charge_constraints_from_rtp, residue, rtp_res)
-    job = _quiet(pt.prepare_resp_job, residue, constraints, f'{mon}_test', working_dir=tmp_dir,
-                 fix_backbone=[(-60.0, -40.0)], n_sidechain=1, conformer_pool=40, monomer=monomer)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        job = pt.prepare_resp_job(residue, constraints, f'{mon}_test', working_dir=tmp_dir,
+                                  fix_backbone=[(-60.0, -40.0)], n_sidechain=1, conformer_pool=40, monomer=monomer)
     with open(os.path.join(job, pt.SPEC_FILE)) as f:
         spec = json.load(f)
+    # сходимость по умолчанию - gau_tight (R.E.D.); большой молекуле предлагается gau (2026-10-22)
+    assert spec['qm']['g_convergence'] == 'gau_tight'
+    assert ("g_convergence='gau'" in buf.getvalue()) == (len(spec['symbols']) > pt.resp.TIGHT_MAX_ATOMS)
     names, residues = spec['atom_names'], spec['atom_residues']
     fixed = {int(k): v for k, v in spec['fixed'].items()}
     by_res = {r: sorted(names[i] for i in fixed if residues[i] == r) for r in ('ACE', 'NME', 'остаток')}
