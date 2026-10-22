@@ -51,7 +51,7 @@ def data_to_dict(funсtion: Callable):
             _LOG['key'] = key
         return funсtion(item, **kwarg)
 
-    def wrapper(data: str or list[str] or dict[str, str], **kwarg):
+    def wrapper(data, **kwarg):   # data: str, list[str] или dict[str, str]
         if isinstance(data, str):
             key = get_name(data)
             return {key: call(key, data, kwarg)}

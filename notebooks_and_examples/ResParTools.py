@@ -2,7 +2,7 @@
 ResParTools - точка входа для ноутбуков: import ResParTools as pt.
 
 Код находится в пакете respartools/ рядом с этим файлом (модули log, utils, fileio, draw,
-matching, residue, forcefield, charges, legacy). Здесь собираются все их имена, включая
+matching, residue, forcefield, charges, resp, gmx, legacy). Здесь собираются все их имена, включая
 служебные (с подчёркиванием), чтобы старые и новые ноутбуки работали как с единым модулем.
 """
 from respartools import *  # noqa: F401,F403

@@ -207,6 +207,31 @@ def test_broken_bonds():
     assert [(i, j) for i, j, _ in pt._broken_bonds(symbols, xyz, moved)] == [(1, 2)]
 
 
+@pytest.mark.slow
+def test_optimize_records_gradients(tmp_path):
+    """
+    status.json: в истории запуска - и лимит шагов, и сколько градиентов сделано (2026-10-22,
+    status показывал только лимит). Вода HF/STO-3G из искажённой геометрии, лимит 2 шага:
+    geomeTRIC считает градиент в старте и по одному на шаг - 3 градиента, не сошлось.
+    """
+    pytest.importorskip('psi4')
+    pytest.importorskip('geometric')
+    folder = str(tmp_path)
+    spec = {'symbols': ['O', 'H', 'H'], 'total_charge': 0, 'multiplicity': 1, 'frozen': [],
+            'qm': {'method': 'hf', 'basis': 'sto-3g', 'g_convergence': 'gau', 'scf_type': 'pk',
+                   'max_opt_steps': 2, 'continue_steps': 2, 'optimizer': 'geometric'}}
+    with open(os.path.join(folder, pt.SPEC_FILE), 'w') as f:
+        json.dump(spec, f)
+    cdir = os.path.join(folder, 'conformers', 'w')
+    os.makedirs(cdir)
+    with open(os.path.join(cdir, 'start.xyz'), 'w') as f:
+        f.write(pt._xyz_block(spec['symbols'], np.array([[0, 0, 0], [1.1, 0, 0], [-0.2, 1.0, 0]]), 0))
+    status = _quiet(pt.resp._optimize_conformer, folder, 'w', n_threads=1, memory='500 MB')
+    assert status['converged'] is False
+    assert status['history'][-1]['steps'] == 2
+    assert status['history'][-1]['gradients'] == 3
+
+
 def test_independent_constraints_drop_redundant():
     """Линейно зависимые ограничения отбрасываются (иначе матрица psiresp вырождена)."""
     # 3 атома, полный заряд задаёт psiresp; фиксация всех трёх - одно ограничение лишнее

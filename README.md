@@ -5,6 +5,9 @@
 **amber14sb** в GROMACS. На выходе - имена атомов по правилам amber, топология остатка
 (`.rtp`, `.hdb`, `.r2b`, `.atp`) и парциальные заряды.
 
+Базовое силовое поле `amber14sb_parmbsc1_cufix.ff` (AMBER14SB + parmbsc1 + CUFIX) взято из
+репозитория силовых полей лаборатории [intbio/gromacs_ff](https://github.com/intbio/gromacs_ff).
+
 Заряды считаются двумя способами на одних и тех же входных данных:
 - **Espaloma Charge** - нейросеть ([choderalab/espaloma-charge](https://github.com/choderalab/espaloma-charge)),
   модифицированная копия умеет фиксировать заряды выбранных атомов (остов берётся из amber14sb);
@@ -16,7 +19,8 @@
 
 ## Пайплайн
 
-Для каждой модификации - папка `notebooks_and_examples/<Lysine_XXX | AF_*>/`:
+Каждый ноутбук - отдельный этап: пользователь видит результат этапа и знает, какой этап пройден
+и какой следующий. Для каждой модификации - папка `notebooks_and_examples/<Lysine_XXX | AF_*>/`:
 
 1. `1_charge_calculation.ipynb` - остаток из SMILES мономера и тримера: поиск мономера в
    тримере, перенумерация по шаблону родительской аминокислоты, имена атомов, протоны для
@@ -64,7 +68,7 @@ RESP (без квантовой химии).
 
 ```bash
 conda activate darwin_resp
-python -m pytest tests -q -m "not slow"   # ~30 с
+python -m pytest tests -q -m "not slow"   # ~2 мин
 python -m pytest tests -q                 # ~3 мин, вместе с AF546
 ```
 
@@ -74,11 +78,14 @@ python -m pytest tests -q                 # ~3 мин, вместе с AF546
   - `respartools/` - библиотека (пакет); в ноутбуках подключается как `import ResParTools as pt`
   - `templates/`, `make_charge_notebooks.py` - шаблон и генератор ноутбуков
   - `cluster/` - запуск RESP на SLURM
-  - `amber14sb_parmbsc1_cufix.ff/` - базовое силовое поле, `amber14sb_mod.ff/` - с модификациями
+  - `amber14sb_parmbsc1_cufix.ff/` - базовое силовое поле (из [intbio/gromacs_ff](https://github.com/intbio/gromacs_ff)),
+    `amber14sb_mod.ff/` - с модификациями
+  - `analyze_data/` - анализы рассчитанных зарядов (сравнение RESP и Espaloma)
 - `espaloma-charge/` - оригинальная Espaloma Charge
 - `espaloma-charge_mod/` - модифицированная Espaloma Charge (фиксация зарядов атомов)
 - `tests/` - тесты на эталонном наборе
-- `docs/` - карта пайплайна, схема свойств молекулы и планы
+- `docs/` - карта пайплайна, схема свойств молекулы и планы (там же - направления развития:
+  модуль ChimeraX, консольная программа, ноутбуки)
 
 ## Лицензия
 

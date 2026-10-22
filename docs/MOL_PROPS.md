@@ -33,9 +33,9 @@
 | `ModName` | str | `K_form` | шаг 1 (имя файла мономера) | `mon_name` |
 | `Role` | str | `monomer` / `trimer` / `residue` / `capped` | шаги 1, 2, RESP | разные переменные ноутбука |
 | `Stage` | str | `3.1`, `4`, `4.1`, `5` | каждый шаг | номер в имени файла (`3_1_`, `4_`) |
-| `Parent` | str | `K` | шаг 1 (параметр) | `parent_residue`, `RefResidue` |
+| `Parent` | str | `K` | шаг 1 (параметр) | `parent_residue` |
 | `ParentResName` | str | `LYS` | шаг 1 (`AMINO_ACIDS`) | `rtp_residue` в ячейке |
-| `ParentTemplate` | str | `GKG_H` | шаг 3.1 | печать в сообщении |
+| `RefResidue` | str | `GKG_H` | шаг 3.1 (`renumber_residue_atoms`) | печать в сообщении |
 | `ResName` | str | `KFO` | шаг 3.2 | `base_name`, `residue_params` |
 | `ResId`, `Chain` | int, str | `2`, `A` | шаг 3.2 | `residue_params` |
 | `Naming` | str | `greek` / `index` | шаг 3.2 | `residue_params` |

@@ -727,11 +727,13 @@ def _broken_bonds(symbols, start, coords, factor=1.3):
     return [(int(a), int(b), round(float(x), 2)) for a, b, x in zip(i, j, ratio) if x > factor]
 
 
-def _optimize_geometric(psi4, mol, qm, frozen, steps, scratch, log_path):
+def _optimize_geometric(psi4, mol, qm, frozen, steps, scratch, log_path, progress=None):
     """
     Оптимизация geomeTRIC (координаты TRIC, замороженные двугранные углы, шаги с ростом энергии
     отвергаются, радиус доверия уменьшается). Свой цикл, а не psi4.optimize(engine='geometric'):
     в psi4 1.6.1 он не сообщает о несходимости. Возвращает (сошлось, энергия, координаты в бор).
+    progress - словарь: progress['gradients'] - число вычислений градиента (первое - стартовая
+    точка, далее по одному на шаг, включая отвергнутые); сохраняется и при падении psi4.
     """
     import logging
     import geometric
@@ -743,6 +745,8 @@ def _optimize_geometric(psi4, mol, qm, frozen, steps, scratch, log_path):
             mol.set_geometry(psi4.core.Matrix.from_array(coords.reshape(-1, 3)))
             mol.update_geometry()
             grad = psi4.gradient(f"{qm['method']}/{qm['basis']}", molecule=mol)
+            if progress is not None:
+                progress['gradients'] = progress.get('gradients', 0) + 1
             return {'energy': psi4.variable('CURRENT ENERGY'), 'gradient': grad.np.ravel()}
 
     M = geometric.molecule.Molecule()
@@ -815,10 +819,11 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
     history = status.get('history', [])
     status = {'runs': status.get('runs', 0) + 1, 'converged': False, 'optimizer': optimizer}
     energy, out = None, 'current.xyz'
+    progress = {}
     try:
         if optimizer == 'geometric':
             converged, energy, xyz = _optimize_geometric(psi4, mol, qm, spec['frozen'], steps, scratch,
-                                                         os.path.join(cdir, 'geometric.log'))
+                                                         os.path.join(cdir, 'geometric.log'), progress)
         else:
             try:
                 energy, converged = float(psi4.optimize(f"{qm['method']}/{qm['basis']}", molecule=mol)), True
@@ -845,8 +850,9 @@ def _optimize_conformer(folder, label, n_threads=4, memory='4 GB'):
                             + (f"; {status['error']}" if status.get('error') else ''))
         status.pop('energy', None)
         out = 'failed.xyz'
-    status['history'] = history + [{'steps': steps, 'energy': energy, 'converged': status['converged'],
-                                    'error': status.get('error')}]
+    # steps - лимит шагов запуска; gradients - сколько вычислений градиента сделано (только geomeTRIC)
+    status['history'] = history + [{'steps': steps, 'gradients': progress.get('gradients'), 'energy': energy,
+                                    'converged': status['converged'], 'error': status.get('error')}]
     with open(os.path.join(cdir, out), 'w') as f:
         f.write(_xyz_block(spec['symbols'], xyz, spec['total_charge'], label))
     with open(status_path, 'w') as f:

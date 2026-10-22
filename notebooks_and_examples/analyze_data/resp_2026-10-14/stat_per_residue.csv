@@ -1,0 +1,13 @@
+Residue,атомов (без остова),MAE new-old,max |new-old|,атом max,MAE Esp-new,MAE Esp-old
+Lysine_1M,19,0.055,0.219,CB,0.116,0.109
+Lysine_2M,22,0.061,0.229,CB,0.112,0.098
+Lysine_3M,25,0.036,0.208,CE,0.098,0.098
+Lysine_1M_ACC,23,0.049,0.283,CT2,0.083,0.067
+Lysine_ACC,20,0.053,0.215,CE,0.072,0.113
+Lysine_lac,24,0.189,0.638,CG,0.072,0.217
+Lysine_Cro,24,0.021,0.076,CB,0.065,0.072
+Lysine_prop,23,0.065,0.29,CI,0.067,0.095
+Lysine_Butyryl,26,0.092,0.407,CK,0.079,0.086
+Lysine_Formyl,17,0.042,0.137,CB,0.077,0.065
+Lysine_Malonyl,22,0.252,1.239,NZ,0.147,0.191
+Lysine_Benzoyl,27,,,,0.072,

@@ -131,9 +131,11 @@ def cmd_status(args):
             s = json.load(open(st))
             statuses.append(s.get('converged'))
             if s.get('converged') is False:
-                # история запусков: шаги и энергия последней геометрии (Хартри) - сходимость или плато
-                hist = ', '.join(f"{h['steps']}: {h['energy']:.6f}" if h.get('energy') is not None
-                                 else f"{h['steps']}: {h.get('error')}" for h in s.get('history', []))
+                # история запусков: градиентов сделано / лимит шагов и энергия последней геометрии
+                # (Хартри) - сходимость или плато; в старых status.json числа градиентов нет
+                hist = ', '.join((f"{h['gradients']}/{h['steps']}" if h.get('gradients') is not None else f"{h['steps']}")
+                                 + (f": {h['energy']:.6f}" if h.get('energy') is not None else f": {h.get('error')}")
+                                 for h in s.get('history', []))
                 notes.append(f"    {os.path.basename(os.path.dirname(st))}: {s.get('error')} | {hist}")
         n = len(json.load(open(os.path.join(job, pt.SPEC_FILE)))['conformers'])
         done = os.path.exists(os.path.join(job, pt.RESULT_FILE))
