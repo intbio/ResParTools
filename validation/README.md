@@ -8,7 +8,7 @@
 
 ```bash
 conda activate darwin_resp
-python -m pytest validation -q            # ~40 с
+python -m pytest validation -q            # ~1 мин
 ```
 
 Известное расхождение помечено `xfail(strict=True)` с причиной: оно видно в выводе (`x`), и когда его
@@ -18,7 +18,7 @@ python -m pytest validation -q            # ~40 с
 
 | Файл | Что проверяется | Эталон | Состояние (2026-10-22) |
 |---|---|---|---|
-| `test_standard_residue_names.py` | стандартные аминокислоты проходят путь шагов 1-4 (мономер в тримере Gly-X-Gly, перенумерация, имена) - имена и порядок атомов | `aminoacids.rtp` amber14sb | 15 из 18 совпадают; Thr, Ile - правило имён, Trp - отложено |
+| `test_standard_residue_names.py` | все 76 аминокислотных остатков `aminoacids.rtp` (30 внутренних, 46 концевых): мономер и тример Gly-X-Gly из SMILES в тесте, родитель задан явно, путь шагов 1-4 - имена и порядок атомов | `aminoacids.rtp` amber14sb | 20 совпадают; расходятся Thr, Ile (номер внутри уровня), Trp (кольцо), CYM (тиолат не сопоставляется); путь пока не поддерживает концевые, Gly, Pro, HYP, ORN, DAB, CYX |
 
 ## Планируется
 - Типы атомов и hdb стандартных остатков через `assign_types` и `hdb_entries` - против
