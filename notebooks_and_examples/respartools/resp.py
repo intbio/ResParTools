@@ -219,9 +219,13 @@ def capped_monomer(monomer, ca_config='L', stereo_default='R', random_seed=42):
         Chem.Mol с явными водородами и заданной стереохимией (без координат)
     """
     mol = Chem.RemoveHs(Chem.Mol(monomer))
-    patt = Chem.MolFromSmarts('[NX3;!$(N-C=O)]-[CX4]-[CX3](=[OX1])')
-    hits = [h for h in mol.GetSubstructMatches(patt)
-            if mol.GetAtomWithIdx(h[0]).GetTotalNumHs() >= 1 and mol.GetAtomWithIdx(h[1]).GetTotalNumHs() >= 1]
+    # изменённый остов (O вместо N - депсипептид, S вместо O - тиоамид) - только если обычного нет,
+    # как в find_backbone_match
+    for smarts in ('[NX3;!$(N-C=O)]-[CX4]-[CX3](=[OX1])', '[NX3,OX2;!$([N,O]-C=[O,S])]-[CX4]-[CX3](=[OX1,SX1])'):
+        hits = [h for h in mol.GetSubstructMatches(Chem.MolFromSmarts(smarts))
+                if mol.GetAtomWithIdx(h[0]).GetTotalNumHs() >= 1 and mol.GetAtomWithIdx(h[1]).GetTotalNumHs() >= 1]
+        if hits:
+            break
     if len(hits) != 1:
         raise ValueError(f'Остов аминокислоты (H-N-CA(H)-C=O) в мономере найден {len(hits)} раз: '
                          'кэпы не пристраиваются.')
@@ -421,6 +425,9 @@ def resp_conformers(mol, dihedrals, residue_atoms, fix_backbone=True, n_sidechai
 
     phi, psi = dihedrals['phi'], dihedrals['psi']
     backbone_core = [phi[1], phi[2], phi[3]]     # N, CA, C
+    carbon_nbr = lambda i, exclude: next(a.GetIdx() for a in base.GetAtomWithIdx(i).GetNeighbors()
+                                         if a.GetAtomicNum() == 6 and a.GetIdx() != exclude)
+    omegas = [(carbon_nbr(phi[0], phi[1]), *phi[:3]), (*psi[1:], carbon_nbr(psi[3], psi[2]))]
     side = _sidechain_atoms(base, residue_atoms, set(phi) | set(psi))
     sym = lambda i: base.GetAtomWithIdx(i).GetSymbol()
     side_polar = [i for i in side if sym(i) in ('N', 'O')
@@ -446,6 +453,15 @@ def resp_conformers(mol, dihedrals, residue_atoms, fix_backbone=True, n_sidechai
             ff.Minimize(maxIts=2000)
             energies[cid] = ff.CalcEnergy()
         order = sorted(energies, key=energies.get)
+        # связи остатка с соседями (амид, у изменённого остова - эфир, тиоамид) - только транс, как в
+        # зарядах amber (Cieplak 1995); у N-метила MMFF нередко даёт ниже всего цис
+        cis = [c for c in order if any(abs(rdMolTransforms.GetDihedralDeg(work.GetConformer(c), *w)) < 90
+                                       for w in omegas)]
+        if len(cis) == len(order):
+            raise ValueError(f'{label}: во всех {len(order)} конформациях пула связь остатка с соседом - цис.')
+        if cis:
+            print(f'{label}: из пула исключены {len(cis)} конформаций с цис-связью остатка с соседом (ω).')
+            order = [c for c in order if c not in cis]
         e_min = energies[order[0]]
         # Контакт боковой цепи с остовом в газе (например, COO- на NH остова) - артефакт газовой
         # фазы, в воде его нет. Поэтому при exclude_contacts отбор идёт среди конформаций без

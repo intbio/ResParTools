@@ -32,8 +32,10 @@ def charge_constraints_from_rtp(mol, rtp_residue, atom_names=BACKBONE_CONSTRAINT
     """
     Ограничения зарядов для Espaloma (charge(mol, constraints=...)): атомы с именами
     atom_names получают заряды одноимённых атомов остатка rtp_residue из силового поля.
-    По умолчанию - атомы остова N H CA HA C O (как во всех ноутбуках лизинов): остов
-    модифицированного остатка сохраняет заряды amber14sb, боковая цепь считается Espaloma.
+    По умолчанию - атомы остова N H CA HA C O (как во всех ноутбуках лизинов): у обычного
+    модифицированного остатка их заряды берутся из amber14sb, боковая цепь считается Espaloma.
+    При ModifiedBackbone=True (N-метил, тиоамид, депсипептид) стандартные заряды остова
+    химически неприменимы: выводится предупреждение и возвращается пустой словарь ограничений.
 
     Аргументы:
         mol (Chem.Mol) - остаток с именами атомов (свойство 'AtomName', шаг 4)
@@ -48,6 +50,11 @@ def charge_constraints_from_rtp(mol, rtp_residue, atom_names=BACKBONE_CONSTRAINT
     for atom in mol.GetAtoms():
         if atom.HasProp('AtomName'):
             index[atom.GetProp('AtomName').strip()].append(atom.GetIdx())
+    modified_backbone = mol.HasProp('ModifiedBackbone') and mol.GetBoolProp('ModifiedBackbone')
+    if modified_backbone:
+        print('⚠ Изменённый остов: стандартные заряды из rtp для этого остатка неприменимы; '
+              'ограничения не заданы, заряды будут рассчитаны без фиксации остова.')
+        atom_names = []
     not_in_rtp = [n for n in atom_names if n not in rtp]
     if not_in_rtp:
         raise ValueError(f'В {rtp_residue} ({rtp_path}) нет атомов {not_in_rtp}; есть: {list(rtp)}')

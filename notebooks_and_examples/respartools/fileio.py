@@ -482,7 +482,7 @@ def load_charges_json(path, atom_names=None):
 # Молекула со свойствами (docs/MOL_PROPS.md): один файл SDF между шагами
 # -----------------------------------------------------------------------------
 _INT_PROPS = ('SrcIdx', 'PolymerIdx', 'PrevIdx')
-_BOOL_PROPS = ('AddedH', 'ChargeFixed')
+_BOOL_PROPS = ('AddedH', 'ChargeFixed', 'ModifiedBackbone')
 _RESIDUE_PROPS = ('ResName', 'ResId', 'Chain')
 
 

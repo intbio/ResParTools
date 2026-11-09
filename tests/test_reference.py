@@ -11,9 +11,11 @@ make_charge_notebooks.PARAMS) и сравнивает результат с фа
 """
 import contextlib
 import functools
+import glob
 import io
 import json
 import os
+import shutil
 
 import numpy as np
 import pytest
@@ -25,10 +27,147 @@ from conftest import ROOT
 RDLogger.DisableLog('rdApp.*')
 
 import ResParTools as pt                      # noqa: E402
+import make_charge_notebooks as notebook_builder  # noqa: E402
 from make_charge_notebooks import PARAMS      # noqa: E402
 
 REFERENCE = ['Lysine_prop', 'Lysine_Malonyl', 'Lysine_Formyl', 'Lysine_3M', 'AF_546_cys']
 CASES = [pytest.param(f, marks=pytest.mark.slow) if f.startswith('AF_') else f for f in REFERENCE]
+
+
+def test_capped_reference_library_and_labels():
+    """Кэпированные PDB читаются проектным парсером и дают правильный код родителя."""
+    library = os.path.join(ROOT, 'molecules', 'aminoacids_capped')
+    rtp = pt.read_rtp(os.path.join(ROOT, 'amber14sb_parmbsc1_cufix.ff', 'aminoacids.rtp'))[1]
+    paths = sorted(glob.glob(os.path.join(library, '*.pdb')))
+    assert len(paths) == 29
+    for path in paths:
+        mol = _quiet(pt.pdb_to_chem, path, format_coord='3D')
+        if isinstance(mol, dict):
+            mol = mol[os.path.splitext(os.path.basename(path))[0]]
+        names = [a.GetPDBResidueInfo() for a in mol.GetAtoms()]
+        assert {(a.GetResidueName().strip(), a.GetResidueNumber()) for a in names} == {
+            ('ACE', 1), (os.path.basename(path)[:3], 2), ('NME', 3)}
+        center = _quiet(pt.extract_residue, mol, 2)
+        assert [a.GetProp('AtomName') for a in center.GetAtoms()] == [
+            a.GetProp('AtomName') for a in mol.GetAtoms()
+            if a.GetPDBResidueInfo().GetResidueNumber() == 2]
+        assert [a.GetProp('AtomName') for a in center.GetAtoms()] == [
+            atom[0] for atom in rtp[os.path.basename(path)[:3]]['atoms']]
+        index = {(a.GetPDBResidueInfo().GetResidueNumber(), a.GetProp('AtomName')): a.GetIdx()
+                 for a in mol.GetAtoms()}
+        assert mol.GetBondBetweenAtoms(index[(1, 'C')], index[(2, 'N')]) is not None
+        assert mol.GetBondBetweenAtoms(index[(2, 'C')], index[(3, 'N')]) is not None
+    assert pt.template_aa_letter('GKG_H') == 'K'
+    assert pt.template_aa_letter('LYS') == 'K'
+    assert pt.template_aa_letter('LYN') == 'K'
+    assert pt.template_aa_letter('TRP') == 'W'
+
+
+@pytest.mark.parametrize('folder', [name for name in PARAMS if name.startswith('Lysine_')])
+@pytest.mark.slow
+def test_automatic_capped_parent_for_lysine_modifications(folder, tmp_dir):
+    """Автовыбор по мономеру сообщает кандидата и сохраняет код родителя для всех 12 входов."""
+    candidates = os.path.join(tmp_dir, 'lysine_parent_candidates')
+    os.makedirs(candidates, exist_ok=True)
+    for name in ('LYS.pdb', 'LYN.pdb'):
+        src = os.path.join(ROOT, 'molecules', 'aminoacids_capped', name)
+        dst = os.path.join(candidates, name)
+        if not os.path.exists(dst):
+            shutil.copy2(src, dst)
+
+    cwd = os.getcwd()
+    os.chdir(os.path.join(ROOT, folder))
+    try:
+        monomer = _quiet(pt.open_mol, PARAMS[folder]['monomer_file'])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            residue = pt.renumber_residue_atoms(
+                monomer, ref_base_name=None, residue_type='protein_capped',
+                path_to_ref_mol=candidates, timeout=3, strict_parent=False)
+        assert residue.GetProp('Parent') == 'K'
+        assert residue.GetProp('RefResidue') in {'LYS', 'LYN'}
+        assert 'Родительский остаток не указан' in output.getvalue()
+        assert sum(a.HasProp('ParentName') for a in residue.GetAtoms()) > 10
+    finally:
+        os.chdir(cwd)
+
+
+@pytest.mark.parametrize('folder', [name for name in PARAMS if name.startswith('Lysine_')] + ['AF_546_cys'])
+def test_open_peptide_boundaries_preserves_modification(folder):
+    """Границы происходят из capped PDB; состав сверяется со старым тримерным эталоном."""
+    p = PARAMS[folder]
+    cwd = os.getcwd()
+    os.chdir(os.path.join(ROOT, folder))
+    try:
+        monomer = _quiet(pt.open_mol, p['monomer_file'])
+        parent = 'C' if folder == 'AF_546_cys' else 'LYS'
+        template = 'CYS' if parent == 'C' else parent
+        ref = os.path.join(pt.REF_TEMPLATES['protein_capped']['dir'], f'{template}.pdb')
+        capped_ref = _quiet(pt.pdb_to_chem, ref, format_coord='3D')
+        if isinstance(capped_ref, dict):
+            capped_ref = capped_ref[template]
+        mapped = _quiet(pt.renumber_residue_atoms, monomer, ref_base_name=parent,
+                        residue_type='protein_capped', path_to_ref_mol=ref,
+                        timeout=3, strict_parent=False)
+        opened = _quiet(pt.open_peptide_boundaries, mapped, capped_ref, residue_number=2)
+        if folder == 'Lysine_Malonyl':
+            broken_ref = Chem.RWMol(capped_ref)
+            c_idx = next(a.GetIdx() for a in capped_ref.GetAtoms()
+                         if a.GetPDBResidueInfo().GetResidueNumber() == 2
+                         and a.GetPDBResidueInfo().GetName().strip() == 'C')
+            nme_n_idx = next(a.GetIdx() for a in capped_ref.GetAtoms()
+                             if a.GetPDBResidueInfo().GetResidueNumber() == 3
+                             and a.GetPDBResidueInfo().GetName().strip() == 'N')
+            broken_ref.RemoveBond(c_idx, nme_n_idx)
+            with pytest.raises(ValueError, match='обе пептидные границы N/C'):
+                _quiet(pt.open_peptide_boundaries, mapped, broken_ref.GetMol(), residue_number=2)
+
+        def parent_atom(mol, name):
+            matches = [a for a in mol.GetAtoms() if a.HasProp('ParentName')
+                       and a.GetProp('ParentName') == name]
+            assert len(matches) == 1
+            return matches[0]
+
+        n, c = parent_atom(opened, 'N'), parent_atom(opened, 'C')
+        ca, o = parent_atom(opened, 'CA'), parent_atom(opened, 'O')
+        assert opened.GetBondBetweenAtoms(n.GetIdx(), ca.GetIdx()) is not None
+        assert opened.GetBondBetweenAtoms(c.GetIdx(), ca.GetIdx()) is not None
+        assert opened.GetBondBetweenAtoms(c.GetIdx(), o.GetIdx()).GetBondType() == Chem.BondType.DOUBLE
+        assert [a.GetSymbol() for a in n.GetNeighbors()].count('H') == 1
+        assert {a.GetIdx() for a in c.GetNeighbors()} == {ca.GetIdx(), o.GetIdx()}
+        before = {a.GetIntProp('PrevIdx'): a.GetSymbol() for a in mapped.GetAtoms()
+                  if a.GetAtomicNum() > 1}
+        after = {a.GetIntProp('PrevIdx'): a.GetSymbol() for a in opened.GetAtoms()
+                 if a.GetAtomicNum() > 1}
+        assert set(after) <= set(before)
+        assert json.loads(opened.GetProp('BoundarySubstituents'))
+        # Независимый эталон: сохранённый остаток, вырезанный старым тримерным путём.
+        mon_name = _mon_name(folder)
+        expected_path = os.path.join(
+            ROOT, folder, 'molecules', 'substructure', f'4_{mon_name}.pdb')
+        expected, _, _ = _pdb_names(expected_path)
+        expected_mol = _quiet(pt.pdb_to_chem, expected_path, format_coord='3D')
+        if isinstance(expected_mol, dict):
+            expected_mol = next(iter(expected_mol.values()))
+        named = _quiet(pt.rdkit_pdb_modification, opened, resname=p['base_name'], resid=2,
+                       segid='A', naming=p['naming'],
+                       parent_atoms=json.loads(opened.GetProp('ParentAtoms')))
+        assert [a.GetProp('AtomName') for a in named.GetAtoms()] == expected
+        assert _named_graph(named) == _named_graph(expected_mol)
+        assert opened.GetProp('OldIndices') == json.dumps(
+            [a.GetIntProp('PrevIdx') for a in opened.GetAtoms()])
+        assert len(json.loads(opened.GetProp('ParentAtoms'))) == sum(
+            a.HasProp('ParentName') for a in opened.GetAtoms())
+        assert named.GetProp('Parent') == ('K' if parent == 'LYS' else 'C')
+        assert named.GetProp('Naming') == p['naming']
+
+        # HW для открытых валентностей появятся только в подготовленной копии для acpype.
+        with_h = _quiet(pt.add_protons_and_renumber_H, named, resname=p['base_name'], resid=2)
+        added = json.loads(with_h.GetProp('AddedH'))
+        assert len(added) == 2
+        assert {with_h.GetAtomWithIdx(i).GetNeighbors()[0].GetProp('AtomName') for i in added} == {'N', 'C'}
+    finally:
+        os.chdir(cwd)
 
 
 def _quiet(func, *args, **kwargs):
@@ -46,6 +185,16 @@ def _pdb_names(path):
     infos = [a.GetPDBResidueInfo() for a in mol.GetAtoms()]
     return ([i.GetName().strip() for i in infos], {i.GetResidueName().strip() for i in infos},
             {i.GetResidueNumber() for i in infos})
+
+
+def _named_graph(mol):
+    """Состав и связи по AtomName, независимо от порядка атомов."""
+    atoms = tuple(sorted((atom.GetProp('AtomName'), atom.GetSymbol(), atom.GetFormalCharge())
+                         for atom in mol.GetAtoms()))
+    bonds = tuple(sorted((min(bond.GetBeginAtom().GetProp('AtomName'), bond.GetEndAtom().GetProp('AtomName')),
+                          max(bond.GetBeginAtom().GetProp('AtomName'), bond.GetEndAtom().GetProp('AtomName')),
+                          str(bond.GetBondType())) for bond in mol.GetBonds()))
+    return atoms, bonds
 
 
 @functools.lru_cache(maxsize=None)
@@ -295,6 +444,121 @@ def test_props_path_matches_committed(folder):
     assert residue.GetProp('Naming') in ('greek', 'index')
 
 
+@pytest.mark.parametrize('folder', ['Lysine_Malonyl', 'Lysine_lac'])
+def test_boundary_extraction_is_invariant_to_smiles_atom_order(folder):
+    """Повторная сериализация того же графа не меняет residue из MCS-пути."""
+    p = PARAMS[folder]
+    cwd = os.getcwd()
+    os.chdir(os.path.join(ROOT, folder))
+    try:
+        source = _quiet(pt.open_mol, p['monomer_file'])
+        parent = 'LYS'
+        ref_path = os.path.join(pt.REF_TEMPLATES['protein_capped']['dir'], 'LYS.pdb')
+        capped_ref = _quiet(pt.pdb_to_chem, ref_path, format_coord='3D')
+        if isinstance(capped_ref, dict):
+            capped_ref = capped_ref['LYS']
+        expected_path = os.path.join(
+            ROOT, folder, 'molecules', 'substructure', f'4_{_mon_name(folder)}.pdb')
+        expected_names, _, _ = _pdb_names(expected_path)
+        expected_mol = _quiet(pt.pdb_to_chem, expected_path, format_coord='3D')
+        if isinstance(expected_mol, dict):
+            expected_mol = next(iter(expected_mol.values()))
+        params = Chem.SmilesParserParams()
+        params.removeHs = False
+
+        for seed in range(3):
+            smiles = Chem.MolToSmiles(source, canonical=False, isomericSmiles=True,
+                                      doRandom=True, rootedAtAtom=seed)
+            variant = Chem.MolFromSmiles(smiles, params)
+            assert variant is not None
+            mapped = _quiet(pt.renumber_residue_atoms, variant, ref_base_name=parent,
+                            residue_type='protein_capped', path_to_ref_mol=ref_path,
+                            timeout=3, strict_parent=False)
+            residue = _quiet(pt.open_peptide_boundaries, mapped, capped_ref, residue_number=2)
+            residue = _quiet(pt.rdkit_pdb_modification, residue, resname=p['base_name'], resid=2,
+                             segid='A', naming=p['naming'],
+                             parent_atoms=json.loads(residue.GetProp('ParentAtoms')))
+            assert [atom.GetProp('AtomName') for atom in residue.GetAtoms()] == expected_names
+            assert _named_graph(residue) == _named_graph(expected_mol)
+    finally:
+        os.chdir(cwd)
+
+
+def test_generated_workflow_has_stage_specific_params():
+    """Три генератора не подставляют параметры ноутбука 1 в этапы 2/3."""
+    for folder, expected in notebook_builder.WORKFLOW_PARAMS.items():
+        for notebook_name in ('1_charge_calculation.ipynb', '2_acpype.ipynb', '3_forcefield_md.ipynb'):
+            path = os.path.join(ROOT, folder, notebook_name)
+            nb = json.load(open(path))
+            assert nb['metadata']['respartools']['workflow'] == 'properties_v1'
+            params = next(''.join(c['source']) for c in nb['cells'] if c.get('id') == 'params')
+            assert f'FOLDER = {folder!r}' in params
+            assert f'base_name = {expected["base_name"]!r}' in params
+            assert f'monomer_file = {expected["monomer_file"]!r}' in params
+            if notebook_name == '2_acpype.ipynb':
+                assert 'INPUT_BASE =' in params and 'INPUT_H =' in params
+                assert 'FF_OUT =' not in params
+            elif notebook_name == '3_forcefield_md.ipynb':
+                assert 'INPUT =' in params and 'amber14sb_mod_smi.ff' in params
+                assert 'md_from_smiles' in params
+            else:
+                parent = expected.get('parent_override')
+                assert f'parent_override = {parent!r}' in params and 'trimer_file' not in params
+                charges = next(''.join(c['source']) for c in nb['cells'] if c.get('id') == 's5')
+                assert 'show_names=False, show_index=False' in charges
+                assert '05_espaloma_charges.png' in charges
+
+
+def test_notebook_archive_detection_and_collision_names(tmp_path):
+    assert notebook_builder._has_outputs({
+        'cells': [{'cell_type': 'code', 'outputs': [], 'execution_count': 3}]})
+    assert not notebook_builder._has_outputs({
+        'cells': [{'cell_type': 'code', 'outputs': [], 'execution_count': None}]})
+
+    source = tmp_path / '1.ipynb'
+    source.write_text('new')
+    archive = tmp_path / 'archive' / 'notebooks'
+    archive.mkdir(parents=True)
+    (archive / '1.ipynb').write_text('original')
+    suffix = notebook_builder.date.today().isoformat()
+    (archive / f'1_{suffix}.ipynb').write_text('same-day archive')
+    (archive / f'1_{suffix}_2.ipynb').write_text('second archive')
+    archived = notebook_builder._archive_existing(str(source))
+    assert archived.endswith(f'1_{suffix}_3.ipynb')
+    assert open(archived).read() == 'new'
+
+
+def test_extract_residue_requires_chain_when_residue_key_is_ambiguous():
+    path = os.path.join(pt.REF_TEMPLATES['protein_capped']['dir'], 'LYS.pdb')
+    capped = _quiet(pt.pdb_to_chem, path, format_coord='3D')
+    if isinstance(capped, dict):
+        capped = capped['LYS']
+    center = _quiet(pt.extract_residue, capped, 2)
+    combined = Chem.RWMol()
+    for chain_id in ('A', 'B'):
+        offset = combined.GetNumAtoms()
+        for atom in center.GetAtoms():
+            copied = Chem.Atom(atom)
+            old_info = atom.GetPDBResidueInfo()
+            info = Chem.AtomPDBResidueInfo(
+                old_info.GetName(), old_info.GetSerialNumber(), old_info.GetAltLoc(),
+                old_info.GetResidueName(), old_info.GetResidueNumber(), chain_id,
+                old_info.GetInsertionCode(), old_info.GetOccupancy(), old_info.GetTempFactor(),
+                old_info.GetIsHeteroAtom())
+            copied.SetMonomerInfo(info)
+            combined.AddAtom(copied)
+        for bond in center.GetBonds():
+            combined.AddBond(offset + bond.GetBeginAtomIdx(), offset + bond.GetEndAtomIdx(),
+                             bond.GetBondType())
+    combined = combined.GetMol()
+
+    with pytest.raises(ValueError, match='задайте chain_id'):
+        pt.extract_residue(combined, 2)
+    selected = pt.extract_residue(combined, 2, chain_id='B')
+    assert selected.GetNumAtoms() == center.GetNumAtoms()
+    assert {a.GetPDBResidueInfo().GetChainId() for a in selected.GetAtoms()} == {'B'}
+
+
 @pytest.mark.parametrize('folder', ['Lysine_Formyl', 'Lysine_Malonyl'])
 def test_save_load_mol_roundtrip(folder, tmp_path):
     _, _, residue = props_steps_1_to_4(folder)
@@ -319,14 +583,14 @@ def test_run_acpype(folder, tmp_path):
     _quiet(pt.run_acpype, residue, str(tmp_path))
     types = {a.GetProp('AtomName'): a.GetProp('AcpypeType') for a in residue.GetAtoms()}
     assert len(types) == residue.GetNumAtoms()
-    assert types['CA'] == 'CT' and types['O'] == 'O' and types['HB1'] == 'HC'
+    assert types['CA'] == 'c3' and types['O'] == 'o' and types['HB1'] == 'hc'
     itp = pt.read_itp(residue.GetProp('AcpypeItp'))
     assert len(itp['atoms']) == residue.GetNumAtoms() + 2          # + два водорода только для acpype
     assert abs(sum(float(r[6]) for r in itp['atoms']) - Chem.GetFormalCharge(residue)) < 1e-3
     if folder == 'Lysine_3M':
-        assert types['NZ'] == 'N3'
+        assert types['NZ'] == 'n4'
     if folder == 'Lysine_Malonyl':
-        assert types['OK1'] == types['OK2'] == 'O2'
+        assert types['OK1'] == types['OK2'] == 'o'
 
 
 def _base_hdb():
@@ -373,11 +637,11 @@ def test_write_forcefield_formyl(tmp_path):
     lys = dict((n, t) for n, t, *_ in pt.read_rtp(os.path.join(ROOT, 'amber14sb_parmbsc1_cufix.ff', 'aminoacids.rtp'))[1]['LYS']['atoms'])
     for name in ('N', 'H', 'CA', 'HA', 'CB', 'HB1', 'CD', 'CE', 'C', 'O'):
         assert types[name] == lys[name], name          # окружение как в лизине - тип лизина
-    assert types['HE1'] == 'H1' and types['NZ'] == 'N'  # у ацилированного NZ: не HP и не N3
+    assert types['HE1'] == 'h1' and types['NZ'] == 'n'  # изменённое окружение: типы GAFF
     res = pt.read_rtp(rtp)[1]['KFO']
     assert [a[0] for a in res['atoms']] == [a.GetProp('AtomName') for a in residue.GetAtoms()]
     assert abs(sum(a[2] for a in res['atoms'])) < 1e-4
-    assert ('C8', 'N') in explicit['bonds']             # в amber14sb нет связи C8-N амида
+    assert ('C8', 'n') in explicit['bonds']             # в amber14sb нет связи C8 с типом GAFF n
     assert open(os.path.join(ff, 'residuetypes.dat')).read().count('KFO\t') == 1
     assert open(os.path.join(ff, 'KFO.hdb')).read().startswith('KFO\t8\n')
 
@@ -425,3 +689,66 @@ def test_validate_vacuum_formyl(tmp_path):
     rep = _quiet(pt.run_validate, work, n_threads=1)
     assert rep['ok'], rep['problems']
     assert rep['stages'] == ['pdb2gmx', 'grompp', 'em_vac'] and rep['atoms_match']
+
+
+@pytest.mark.parametrize('code, parent', [('4PQ', 'TRP'), ('ILX', 'ILE')])
+def test_capped_parent_names_for_ring_and_branches(code, parent):
+    params = notebook_builder.WORKFLOW_PARAMS[code]
+    source = _quiet(pt.open_mol, os.path.join(ROOT, code, params['monomer_file']))
+    ref_path = os.path.join(pt.REF_TEMPLATES['protein_capped']['dir'], f'{parent}.pdb')
+    ref = _quiet(pt.pdb_to_chem, ref_path, format_coord='3D')
+    if isinstance(ref, dict):
+        ref = ref[parent]
+    central = _quiet(pt.extract_residue, ref, 2)
+    Chem.GetSymmSSSR(central)
+    ring_bonds = {
+        frozenset(a.GetProp('AtomName') for a in (b.GetBeginAtom(), b.GetEndAtom()))
+        for b in central.GetBonds() if b.GetIsAromatic() and b.IsInRing()
+    }
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    reversed_source = Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))
+    reordered = Chem.MolFromSmiles(Chem.MolToSmiles(reversed_source, canonical=False), parser)
+    for monomer in (source, reordered):
+        mapped = _quiet(pt.renumber_residue_atoms, monomer, ref_base_name=parent,
+                        residue_type='protein_capped', path_to_ref_mol=ref_path)
+        residue = _quiet(pt.open_peptide_boundaries, mapped, ref)
+        _quiet(pt.rdkit_pdb_modification, residue, resname=code, parent_reference=central)
+        names = {a.GetProp('AtomName'): a for a in residue.GetAtoms()}
+        assert len(names) == residue.GetNumAtoms()
+        if code == '4PQ':
+            assert len(ring_bonds) == 10
+            assert ring_bonds == {
+                frozenset(a.GetProp('AtomName') for a in (b.GetBeginAtom(), b.GetEndAtom()))
+                for b in residue.GetBonds() if b.GetIsAromatic() and b.IsInRing()
+            }
+            assert {a.GetProp('AtomName') for a in names['OH1'].GetNeighbors()} == {'CZ3', 'HH1'}
+            assert {a.GetProp('AtomName') for a in names['HH2'].GetNeighbors()} == {'CH2'}
+        else:
+            assert names['CD2'].GetProp('ParentName') == 'CD'
+            assert {a.GetProp('AtomName') for a in names['CG1'].GetNeighbors()} >= {'OD1', 'CD2'}
+            assert names['CG2'].GetProp('ParentName') == 'CG2'
+
+
+def test_manual_atom_names_by_index_are_atomic():
+    mol = Chem.MolFromSmiles('CC')
+    for atom, name in zip(mol.GetAtoms(), ('CA', 'CB')):
+        atom.SetProp('AtomName', name)
+        atom.SetProp('ParentName', name)
+    for mapping, message in (({0: 'CB'}, 'CB.*0.*1'), ({2: 'CX'}, '2'), ({1: 'C BAD'}, 'C BAD')):
+        with pytest.raises(ValueError, match=message):
+            pt.modifie_residue_info(mol, mapping)
+        assert [a.GetProp('AtomName') for a in mol.GetAtoms()] == ['CA', 'CB']
+        assert all(a.GetPDBResidueInfo() is None for a in mol.GetAtoms())
+
+    assert pt.modifie_residue_info(mol, {0: 'CB', 1: 'CA'}) is mol
+    assert [a.GetProp('AtomName') for a in mol.GetAtoms()] == ['CB', 'CA']
+    assert [a.GetPDBResidueInfo().GetName().strip() for a in mol.GetAtoms()] == ['CB', 'CA']
+    assert [a.GetProp('ParentName') for a in mol.GetAtoms()] == ['CA', 'CB']
+
+    mol.GetAtomWithIdx(1).SetProp('AtomName', 'CB')
+    pt.modifie_residue_info(mol, {1: 'CX'})
+    assert [a.GetProp('AtomName') for a in mol.GetAtoms()] == ['CB', 'CX']
+    with pytest.warns(FutureWarning, match='устарел'):
+        pt.modifie_residue_info(mol, {'CX': 'CY'})
+    assert mol.GetAtomWithIdx(1).GetProp('AtomName') == 'CY'

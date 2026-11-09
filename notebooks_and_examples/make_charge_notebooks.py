@@ -14,14 +14,28 @@
 """
 import argparse
 import copy
+from datetime import date
 import json
 import os
+import shutil
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 OLD_NOTEBOOKS = ('1_charge_calculation_old.ipynb', '2_generate_topology_old.ipynb', '3_edd_topology_old.ipynb')
 PROPS_TEMPLATE = os.path.join(ROOT, 'templates', '1_charge_calculation_props.ipynb')
 PROPS_NOTEBOOK = '1_charge_calculation_props.ipynb'
+WORKFLOW_NOTEBOOKS = ('1_charge_calculation.ipynb', '2_acpype.ipynb', '3_forcefield_md.ipynb')
+WORKFLOW_PARAMS_CELL = """# Параметры модификации (сгенерировано для этой папки)
+FOLDER = {folder!r}
+PTM_name = {PTM_name!r}
+base_name = {base_name!r}
+monomer_file = {monomer_file!r}
+naming = {naming!r}
+parent_override = {parent_override!r}  # None - выбрать по сопоставлению
+run_resp_now = False
+OUT = os.path.abspath(os.path.join('..', 'build', 'notebooks', FOLDER))
+FIGURES = os.path.join(OUT, 'figures')
+os.makedirs(FIGURES, exist_ok=True)"""
 
 # Параметры модификаций. naming: 'greek' - буквенные имена (лизины), 'index' - для больших
 # меток. resp_run: где считать RESP на шаге 6 ('local' - эта машина, 'slurm' - кластер).
@@ -58,6 +72,15 @@ PARAMS = {
     'Lysine_prop': dict(PTM_name='Lysine_prop', base_name='KPR', monomer_file='molecules/K_prop.smiles',
                         trimer_file='molecules/AKA_prop.smiles', **_LYS),
 }
+LYSINE_FOLDERS = tuple(name for name in PARAMS if name.startswith('Lysine_'))
+VALIDATION_PARENTS = {'4PQ': 'TRP', 'ILX': 'ILE', 'SMC': 'CYS', 'SME': 'MET', '2AS': 'ASP'}
+VALIDATION_PARAMS = {
+    code: dict(PTM_name=code, base_name=code, monomer_file=f'molecules/{code}.smiles',
+               naming='greek', parent_override=parent)
+    for code, parent in VALIDATION_PARENTS.items()
+}
+WORKFLOW_PARAMS = {**{folder: PARAMS[folder] for folder in LYSINE_FOLDERS}, **VALIDATION_PARAMS}
+
 
 PARAM_CELL = """# Параметры модификации (всё, что отличает одну модификацию от другой)
 PTM_name = {PTM_name!r}            # имя модификации: файлы шага 4.1 и вход шага 2 ({{PTM_name}}_rn_H_3D.pdb)
@@ -115,10 +138,33 @@ def parametrize(nb, params):
     return nb
 
 
-STEP2_PARAMS = """# Параметры модификации
-PTM_name = {PTM_name!r}   # имя модификации: вход {{PTM_name}}_rn_H_3D.pdb (шаг 4.1)
-base_name = {base_name!r}        # имя остатка в силовом поле (как в rtp)
-charge_val = None        # заряд для acpype вручную (на всякий случай); None - формальный заряд молекулы"""
+STEP2_PARAMS = """# Параметры старого ноутбука 2_generate_topology_old
+PTM_name = {PTM_name!r}   # имя входа {{PTM_name}}_rn_H_3D.pdb
+base_name = {base_name!r} # имя остатка в силовом поле
+charge_val = None         # None - формальный заряд молекулы"""
+
+WORKFLOW_STEP2_PARAMS = """# Параметры модификации (заполняются генератором)
+FOLDER = {folder!r}
+PTM_name = {PTM_name!r}
+base_name = {base_name!r}
+monomer_file = {monomer_file!r}
+OUT = os.path.abspath(os.path.join('..', 'build', 'notebooks', FOLDER))
+INPUT_BASE = os.path.join(OUT, f'4_{{os.path.splitext(os.path.basename(monomer_file))[0]}}.sdf')
+INPUT_H = os.path.join(OUT, f'4_1_{{os.path.splitext(os.path.basename(monomer_file))[0]}}.sdf')
+ACPYPE_DIR = os.path.join(OUT, 'acpype')
+os.makedirs(ACPYPE_DIR, exist_ok=True)"""
+
+WORKFLOW_STEP3_PARAMS = """# Параметры модификации (заполняются генератором)
+FOLDER = {folder!r}
+PTM_name = {PTM_name!r}
+base_name = {base_name!r}
+monomer_file = {monomer_file!r}
+OUT = os.path.abspath(os.path.join('..', 'build', 'notebooks', FOLDER))
+INPUT = os.path.join(OUT, f'5_{{os.path.splitext(os.path.basename(monomer_file))[0]}}.sdf')
+FF_OUT = os.path.abspath(os.path.join('..', 'build', 'amber14sb_mod_smi.ff'))
+MD_OUT = os.path.abspath(os.path.join('..', 'build', 'md_from_smiles', FOLDER))
+MD_NS = 0.01
+run_gromacs_now = False"""
 
 STEP3_PARAMS = """# Параметры модификации
 PTM_folder = {folder!r}      # папка модификации: имя rtp-файла в force_field_files/
@@ -183,18 +229,92 @@ def make_props_notebook(folder):
     return path
 
 
+def _has_outputs(nb):
+    return any(cell.get('cell_type') == 'code'
+               and (cell.get('outputs') or cell.get('execution_count') is not None)
+               for cell in nb.get('cells', []))
+
+
+def _archive_existing(path):
+    """Сохраняет занятую версию ноутбука в archive/notebooks без перезаписи."""
+    folder = os.path.dirname(path)
+    archive = os.path.join(folder, 'archive', 'notebooks')
+    os.makedirs(archive, exist_ok=True)
+    name = os.path.basename(path)
+    dst = os.path.join(archive, name)
+    if os.path.exists(dst):
+        stem, ext = os.path.splitext(name)
+        suffix = date.today().isoformat()
+        dst = os.path.join(archive, f'{stem}_{suffix}{ext}')
+        index = 2
+        while os.path.exists(dst):
+            dst = os.path.join(archive, f'{stem}_{suffix}_{index}{ext}')
+            index += 1
+    shutil.move(path, dst)
+    print(f'Архивирована предыдущая версия: {dst}')
+    return dst
+
+
+def make_workflow_notebooks(folder, overwrite=False):
+    """Собирает новые ноутбуки 1-3 на свойствах RDKit для одной модификации."""
+    if folder not in WORKFLOW_PARAMS:
+        raise ValueError(f'{folder}: для этого остатка нет параметров нового workflow')
+    params = dict(WORKFLOW_PARAMS[folder], folder=folder)
+    params.setdefault('parent_override', None)
+    outputs = []
+    for name in WORKFLOW_NOTEBOOKS:
+        path = os.path.join(ROOT, folder, name)
+        if os.path.exists(path):
+            old = json.load(open(path))
+            current_template = old.get('metadata', {}).get('respartools', {}).get('workflow') == 'properties_v1'
+            if _has_outputs(old):
+                _archive_existing(path)
+            elif not current_template:
+                if not overwrite:
+                    raise FileExistsError(f'{path} уже существует без выполненных ячеек; '
+                                          'переместите его в archive/notebooks/ или задайте --overwrite')
+                _archive_existing(path)
+            elif not overwrite:
+                print(f'{folder}: {name} уже собран, пропуск (--overwrite - пересобрать)')
+                continue
+        nb = copy.deepcopy(json.load(open(os.path.join(ROOT, 'templates', name))))
+        if name.startswith('1_'):
+            params_cell = WORKFLOW_PARAMS_CELL
+        elif name.startswith('2_'):
+            params_cell = WORKFLOW_STEP2_PARAMS
+        else:
+            params_cell = WORKFLOW_STEP3_PARAMS
+        _set_src(_cell(nb, 'params'), params_cell.format(**params))
+        nb['metadata']['respartools'] = {
+            'template': f'templates/{name}', 'params': WORKFLOW_PARAMS[folder], 'workflow': 'properties_v1'}
+        with open(path, 'w') as f:
+            json.dump(nb, f, ensure_ascii=False, indent=1)
+            f.write('\n')
+        print(f'{folder}: {name} собран')
+        outputs.append(path)
+    return outputs
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('folders', nargs='*', help='папки модификаций (по умолчанию все из PARAMS)')
     parser.add_argument('--props', action='store_true', help='версия без словарей (1_charge_calculation_props.ipynb)')
+    parser.add_argument('--workflow', action='store_true',
+                        help='новый workflow на свойствах: ноутбуки 1, 2 и 3')
     parser.add_argument('--overwrite', action='store_true', help='пересобрать ноутбуки, уже собранные из шаблона')
     args = parser.parse_args(argv)
-    unknown = [f for f in args.folders if f not in PARAMS]
+    supported = WORKFLOW_PARAMS if args.workflow and not args.props else PARAMS
+    unknown = [f for f in args.folders if f not in supported]
     if unknown:
         sys.exit(f'Нет параметров для {unknown}: добавьте их в PARAMS')
     if args.props:
         for folder in args.folders or list(PARAMS):
             make_props_notebook(folder)
+        return
+    if args.workflow:
+        folders = args.folders or list(LYSINE_FOLDERS)
+        for folder in folders:
+            make_workflow_notebooks(folder, overwrite=args.overwrite)
         return
     for folder in args.folders or list(PARAMS):
         make_notebook(folder, overwrite=args.overwrite)

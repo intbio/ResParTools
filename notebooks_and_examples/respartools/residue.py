@@ -1,7 +1,10 @@
 """Остаток: перенумерация, имена атомов, остов, координаты и стереохимия, параметры остатка, протонирование."""
 import json
+import re
+import warnings
 from collections import Counter
 from collections import defaultdict, deque
+from numbers import Integral
 import numpy as np
 
 
@@ -36,7 +39,8 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
 
     Аргументы:
         mol (Chem.Mol) - остаток (с H или без H)
-        ref_base_name (str) - родительский остаток (см. find_ref_residue), обязателен
+        ref_base_name (str) - родительский остаток (см. find_ref_residue); None включает
+            автоматический выбор по наибольшему совпадению (результат может быть неоднозначен)
         residue_type (str) - тип остатка из REF_TEMPLATES ('protein', ...)
         path_to_ref_mol (str) - папка с шаблонами или путь к шаблону
         only_heavy_mapping (bool) - MCS только по тяжелым атомам
@@ -48,13 +52,18 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
         'ParentAtoms' - JSON-список новых индексов атомов, сопоставленных с шаблоном
         родительского остатка (для подсветки: draw_molecule(highlight_atoms=...)), 'Parent'.
         Свойства атомов: 'PrevIdx' - индекс до перенумерации, 'ParentName' - имя атома
-        в шаблоне родителя (у новых атомов свойства нет). Свойства исходной молекулы сохраняются.
+        в шаблоне родителя (у новых атомов свойства нет), 'ReplacesParent' - у атома изменённого
+        остова (S тиоамида, O депсипептида): имя атома шаблона, место которого он занял.
+        Свойства исходной молекулы сохраняются.
     """
     ref_dict, match_data, _ = find_ref_residue({'residue': mol}, path_to_ref_mol=path_to_ref_mol,
                                      ref_base_name=ref_base_name, residue_type=residue_type,
                                      only_heavy_mapping=only_heavy_mapping, timeout=timeout,
                                      strict_parent=strict_parent)
     ref_name, mapping = next(iter(match_data['mon_pol_matches'].items()))
+    # заменённый атом остова (S вместо O, O вместо N) стоит на месте атома шаблона
+    replaced = match_data.get('replaced_backbone', {}).get(ref_name, {})
+    mapping = {**mapping, **replaced}
 
     # канонический ранг атомов: не зависит от исходной нумерации и от стереохимии
     # (стереохимия, прочитанная из случайной 3D-структуры, меняла порядок при каждом запуске)
@@ -124,14 +133,156 @@ def renumber_residue_atoms(mol, ref_base_name=None, residue_type='protein',
     for new, old in enumerate(new_order):
         atom = new_mol.GetAtomWithIdx(new)
         atom.SetIntProp('PrevIdx', old)
-        if old in mapping:
+        if old in replaced:
+            atom.SetProp('ReplacesParent', ref_mol.GetAtomWithIdx(mapping[old]).GetProp('AtomName'))
+        elif old in mapping:
             atom.SetProp('ParentName', ref_mol.GetAtomWithIdx(mapping[old]).GetProp('AtomName'))
-    new_mol.SetProp('Parent', str(ref_base_name))
+    parent_name = template_aa_letter(ref_name) or ref_base_name or ref_name
+    new_mol.SetProp('Parent', str(parent_name))
     new_mol.SetProp('RefResidue', ref_name)
     new_mol.SetProp('OldIndices', json.dumps(new_order))
+    changed_backbone = any(a.HasProp('ReplacesParent') for a in new_mol.GetAtoms())
+    if not changed_backbone:
+        changed_backbone = any(
+            a.HasProp('ParentName') and a.GetProp('ParentName') == 'N'
+            and any(n.GetAtomicNum() > 1 and not n.HasProp('ParentName') for n in a.GetNeighbors())
+            for a in new_mol.GetAtoms()
+        )
+    new_mol.SetBoolProp('ModifiedBackbone', changed_backbone)
     new_index = {old: new for new, old in enumerate(new_order)}
-    new_mol.SetProp('ParentAtoms', json.dumps(sorted(new_index[idx] for idx in canonical)))
+    new_mol.SetProp('ParentAtoms', json.dumps(sorted(new_index[idx] for idx in canonical if idx not in replaced)))
     return new_mol
+
+
+@logged
+def open_peptide_boundaries(mol, capped_ref, residue_number=2):
+    """Выделяет атомы одного остатка, используя MCS-карту и кэпированный PDB-шаблон.
+
+    `mol` - полный модифицированный мономер после `renumber_residue_atoms`; общие с центральным
+    остатком ACE-X-NME атомы имеют `ParentName`, а все остальные ветви модификации остаются в графе.
+    В `capped_ref` центральный остаток определяется PDB residue info, а его граничные атомы
+    находятся по связям с ACE/NME вне этого residue. На входе отбрасываются только атомы,
+    занимающие эти две внешние пептидные связи: несопоставленный H у N и конечная замещающая
+    группа у карбонильного C (H либо одинарно связанный O с H или формальным зарядом).
+    Выбор не зависит от порядка атомов или текстовой записи SMILES. Неизвестная/неоднозначная
+    группа у границы вызывает ошибку; несопоставленные ветви в остальных местах сохраняются.
+
+    Новая молекула возвращается с открытыми N/C валентностями и обновлёнными `OldIndices`,
+    `ParentAtoms` и `BoundarySubstituents`. Заряды не пересчитываются: после исключения групп
+    на границах граф остатка должен быть проверен до расчёта частичных зарядов.
+    """
+    from .matching import extract_residue
+
+    if not isinstance(capped_ref, Chem.Mol):
+        raise TypeError('capped_ref должен быть RDKit-молекулой кэпированного остатка.')
+
+    def pdb_info(atom):
+        info = atom.GetPDBResidueInfo()
+        if info is None:
+            raise ValueError('Для MCS-выделения границ у шаблона требуется PDB residue info.')
+        return info
+
+    def atom_name(atom):
+        return pdb_info(atom).GetName().strip()
+
+    # Граничные атомы выводим из межостаточных связей референса, а не задаём по SMILES.
+    ref_boundary = {}
+    for atom in capped_ref.GetAtoms():
+        info = pdb_info(atom)
+        if info.GetResidueNumber() != residue_number:
+            continue
+        outside = [neighbor for neighbor in atom.GetNeighbors()
+                   if pdb_info(neighbor).GetResidueNumber() != residue_number]
+        if outside:
+            name = atom_name(atom)
+            ref_boundary.setdefault(name, []).extend(outside)
+    if set(ref_boundary) != {'N', 'C'}:
+        raise ValueError('Кэпированный шаблон должен задавать обе пептидные границы N/C; '
+                         f'найдены {sorted(ref_boundary)} для остатка {residue_number}.')
+
+    # Извлекаем центральный остаток тем же общим API, который применяется для полимеров.
+    ref_residue = extract_residue(capped_ref, residue_number)
+    ref_core_by_name = {atom_name(atom): atom for atom in ref_residue.GetAtoms()}
+    if len(ref_core_by_name) != ref_residue.GetNumAtoms():
+        raise ValueError('В центральном остатке шаблона имена атомов не уникальны.')
+
+    result = Chem.Mol(mol)
+    remove = set()
+    removed_detail = {}
+    boundary_input = {}
+    for name in ref_boundary:
+        candidates = [atom for atom in result.GetAtoms()
+                      if atom.GetAtomicNum() > 1 and atom.HasProp('ParentName')
+                      and atom.GetProp('ParentName') == name]
+        if len(candidates) != 1:
+            raise ValueError(f'Граничный атом шаблона {name!r} сопоставлен с мономером неоднозначно: '
+                             f'найдено {len(candidates)}.')
+        boundary_input[name] = candidates[0].GetIdx()
+
+    def source_index(atom):
+        if atom.HasProp('PrevIdx'):
+            return atom.GetIntProp('PrevIdx')
+        if atom.HasProp('SrcIdx'):
+            return atom.GetIntProp('SrcIdx')
+        return atom.GetIdx()
+
+    for name, idx in boundary_input.items():
+        center = result.GetAtomWithIdx(idx)
+        core_atom = ref_core_by_name.get(name)
+        if core_atom is None:
+            raise ValueError(f'Граничный атом {name!r} отсутствует в извлечённом остатке шаблона.')
+        core_neighbor_names = {atom_name(neighbor) for neighbor in core_atom.GetNeighbors()}
+        extras = [neighbor for neighbor in center.GetNeighbors()
+                  if not (neighbor.HasProp('ParentName')
+                          and neighbor.GetProp('ParentName') in core_neighbor_names)]
+
+        if name == 'N':
+            # Внутренний N шаблона уже содержит свои сопоставленные H; дополнительный H входного
+            # мономера заменял связь с ACE и исключается. Любые несопоставленные тяжёлые ветви
+            # сохраняются как модификация остова.
+            candidates = [atom for atom in extras if atom.GetAtomicNum() == 1
+                          and not atom.HasProp('ParentName')]
+            remove.update(atom.GetIdx() for atom in candidates)
+            if candidates:
+                removed_detail[name] = [source_index(atom) for atom in candidates]
+        elif name == 'C':
+            if len(extras) > 1:
+                raise ValueError(f'На граничном атоме C найдено несколько несопоставленных ветвей: '
+                                 f'{[(a.GetSymbol(), a.GetIdx()) for a in extras]}.')
+            if extras:
+                atom = extras[0]
+                bond = result.GetBondBetweenAtoms(idx, atom.GetIdx())
+                if atom.GetAtomicNum() == 1 and bond.GetBondType() == Chem.BondType.SINGLE:
+                    group = [atom]
+                elif atom.GetAtomicNum() == 8 and bond.GetBondType() == Chem.BondType.SINGLE:
+                    group = [atom] + [neighbor for neighbor in atom.GetNeighbors()
+                                      if neighbor.GetIdx() != idx and neighbor.GetAtomicNum() == 1]
+                    if any(neighbor.GetAtomicNum() > 1 for neighbor in atom.GetNeighbors()
+                           if neighbor.GetIdx() != idx):
+                        raise ValueError('Нельзя однозначно сопоставить ветвь у C с внешней связью шаблона.')
+                else:
+                    raise ValueError('Нельзя однозначно сопоставить ветвь у C с внешней связью шаблона.')
+                remove.update(atom.GetIdx() for atom in group)
+                removed_detail[name] = [source_index(atom) for atom in group]
+        else:
+            raise ValueError(f'Неизвестное имя пептидной границы в шаблоне: {name!r}.')
+
+    rw = Chem.RWMol(result)
+    for idx in sorted(remove, reverse=True):
+        rw.RemoveAtom(idx)
+    out = rw.GetMol()
+    for name in ref_boundary:
+        idx = next(atom.GetIdx() for atom in out.GetAtoms()
+                   if atom.GetAtomicNum() > 1 and atom.HasProp('ParentName')
+                   and atom.GetProp('ParentName') == name)
+        out.GetAtomWithIdx(idx).SetNoImplicit(False)
+    out.UpdatePropertyCache(strict=False)
+    out.SetProp('OldIndices', json.dumps([atom.GetIntProp('PrevIdx') for atom in out.GetAtoms()
+                                          if atom.HasProp('PrevIdx')]))
+    out.SetProp('ParentAtoms', json.dumps([atom.GetIdx() for atom in out.GetAtoms()
+                                           if atom.HasProp('ParentName')]))
+    out.SetProp('BoundarySubstituents', json.dumps(removed_detail, sort_keys=True))
+    return out
 
 def find_backbone_match(rdkit_mol, C_terminal=False):
     """
@@ -143,13 +294,21 @@ def find_backbone_match(rdkit_mol, C_terminal=False):
         C_terminal (bool) - C-концевой остаток: у C два кислорода (OC1 - двойная связь, OC2 - одинарная)
     Возвращает:
         (CA_idx, backbone) - backbone = [N, CA, C, O] или [N, CA, C, OC1, OC2] при C_terminal
+    Изменённый остов ищется, только если обычного нет: N без H (N-метил), O вместо N
+    (гидроксикислота депсипептида), S вместо O (тиоамид) - так в остатке с боковой цепью вида
+    O-CH-C=O (лактиллизин) остов не становится неоднозначным.
     Если подходящих остовов нет или их больше одного, вызывает ValueError: выбор был бы угадыванием.
     """
-    smarts = '[H][N][C]([H])C(=O)[O]' if C_terminal else '[H][N][C]([H])C=O'
-    matches = rdkit_mol.GetSubstructMatches(Chem.MolFromSmarts(smarts), uniquify=False)
+    # (SMARTS, позиции N, CA, C, O[, O2] в совпадении)
+    patterns = ([('[H][N][C]([H])C(=O)[O]', (1, 2, 4, 5, 6)), ('[N,O][CX4]([H])C(=[O,S])[O,S]', (0, 1, 3, 4, 5))]
+                if C_terminal else
+                [('[H][N][C]([H])C=O', (1, 2, 4, 5)), ('[N,O][CX4]([H])C=[O,S]', (0, 1, 3, 4))])
+    for smarts, pos in patterns:
+        matches = rdkit_mol.GetSubstructMatches(Chem.MolFromSmarts(smarts), uniquify=False)
+        if matches:
+            break
     # совпадения, отличающиеся только выбором H при N и CA, - это один и тот же остов
-    backbones = sorted({(m[1], m[2], m[4], m[5], m[6]) if C_terminal else (m[1], m[2], m[4], m[5])
-                        for m in matches})
+    backbones = sorted({tuple(m[p] for p in pos) for m in matches})
     if not backbones:
         raise ValueError(f"Остов аминокислоты ({smarts}) не найден: проверьте, что водороды явные "
                          f"и что C_terminal={C_terminal} соответствует остатку.")
@@ -161,6 +320,8 @@ def find_backbone_match(rdkit_mol, C_terminal=False):
 
 
 GREEK_LEVELS = 'BGDEZHTIKLMN'  # буква уровня боковой цепи: 1 связь от CA - B, 2 - G, 3 - D, ...
+# имена атомов изменённого остова: (имя в обычном остове, элемент) -> имя (PDB CCD 2OP, LAC, GL3)
+BACKBONE_REPLACED = {('N', 'O'): 'OHN', ('O', 'S'): 'S'}
 NAMING_METHODS = ('greek', 'index')
 
 
@@ -261,14 +422,77 @@ def _pdb_atom_name_field(name, element):
     return f'{name:<4}'
 
 
+def _preserve_aromatic_names(mol, reference, names):
+    """Восстанавливает имена сопоставленных ароматических колец и их водородов."""
+    # После выделения остатка RDKit может сбросить кэш колец.
+    Chem.GetSymmSSSR(reference)
+    Chem.GetSymmSSSR(mol)
+    mapped = {a.GetProp('ParentName'): a.GetIdx() for a in mol.GetAtoms()
+              if a.HasProp('ParentName')}
+    reserved = {}
+    for ring in reference.GetRingInfo().BondRings():
+        bonds = [reference.GetBondWithIdx(i) for i in ring]
+        if not all(b.GetIsAromatic() for b in bonds):
+            continue
+        edges = [(b.GetBeginAtom().GetProp('AtomName'), b.GetEndAtom().GetProp('AtomName'))
+                 for b in bonds]
+        if not all(left in mapped and right in mapped for left, right in edges):
+            continue
+        corresponding = [mol.GetBondBetweenAtoms(mapped[left], mapped[right])
+                         for left, right in edges]
+        if not all(b is not None and b.GetIsAromatic() and b.IsInRing() for b in corresponding):
+            continue
+        for parent_name in {name for edge in edges for name in edge}:
+            idx = mapped[parent_name]
+            if idx not in names:
+                continue
+            reserved[idx] = parent_name
+            for atom in mol.GetAtomWithIdx(idx).GetNeighbors():
+                if atom.GetAtomicNum() == 1 and atom.HasProp('ParentName') and atom.GetIdx() in names:
+                    reserved[atom.GetIdx()] = atom.GetProp('ParentName')
+    if not reserved:
+        return
+
+    restored = {i: (names[i], name) for i, name in reserved.items() if names[i] != name}
+    if restored:
+        log_note('имена родительского кольца', restored=restored)
+    names.update(reserved)
+    reserved_names = set(reserved.values())
+    for atom in mol.GetAtoms():
+        idx = atom.GetIdx()
+        if atom.GetAtomicNum() == 1 or idx in reserved or idx not in names:
+            continue
+        hydrogens = {h.GetIdx() for h in atom.GetNeighbors()
+                     if h.GetAtomicNum() == 1 and h.GetIdx() in names}
+        group = hydrogens | {idx}
+        collisions = {names[i] for i in group} & reserved_names
+        if not collisions:
+            continue
+        if atom.HasProp('ParentName'):
+            raise ValueError(f'Атом {idx} конфликтует с именами родительского кольца: {sorted(collisions)}')
+        prefix = names[idx].rstrip('0123456789')
+        occupied = {name for i, name in names.items() if i not in group}
+        for suffix in range(1, len(occupied) + 2):
+            new_heavy = {idx: f'{prefix}{suffix}'}
+            candidate = {**new_heavy, **_hydrogen_names(mol, new_heavy, hydrogens)}
+            if any(len(name) > 4 for name in candidate.values()):
+                raise ValueError(f'Для атома {idx} нет свободного имени PDB: {sorted(collisions)}')
+            if occupied.isdisjoint(candidate.values()):
+                names.update(candidate)
+                log_note('конфликт с именами кольца', atom_idx=idx,
+                         occupied=sorted(collisions), names=candidate)
+                break
+
+
 @logged
 def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
-                           force_numeric=False, C_terminal=False, naming='greek', parent_atoms=None):
+                           force_numeric=False, C_terminal=False, naming='greek', parent_atoms=None,
+                           parent_reference=None):
     """
     Назначает атомам остатка PDB-имена и параметры остатка (имя, номер, цепь).
     Меняет и возвращает переданную молекулу (save_chem_to_pdb передаёт сюда копию).
-    Имена строятся только по графу молекулы и индексам атомов; старые имена не используются,
-    поэтому повторный вызов на той же молекуле даёт те же имена.
+    Имена строятся по графу молекулы и индексам атомов. При переданном parent_reference
+    сохраняются имена сопоставленного ароматического кольца и его водородов.
 
     Остов (find_backbone_match): N, CA, C, O (C-концевой остаток: OC1, OC2).
 
@@ -293,9 +517,13 @@ def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
         naming (str) - 'greek' или 'index'
         parent_atoms (list) - индексы атомов родительского остатка (свойство 'ParentAtoms'
             после renumber_residue_atoms); используется при naming='index'
+        parent_reference (Chem.Mol) - центральный родительский остаток с AtomName.
+            При naming='greek' используется вместе с ParentName для сохранения имён колец.
     Возвращает:
         Chem.Mol - та же молекула; имена в свойстве атомов 'AtomName' и в PDB residue info.
     """
+    if naming == 'ccd':
+        raise NotImplementedError('Именование по CCD пока недоступно. Используйте naming="greek".')
     if force_numeric:
         print_red("⚠ force_numeric устарел: используется naming='index'.")
         naming = 'index'
@@ -311,11 +539,26 @@ def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
 
     CA_idx, backbone = find_backbone_match(rdkit_mol, C_terminal)
     backbone_names = ["N", "CA", "C", "OC1", "OC2"] if C_terminal else ["N", "CA", "C", "O"]
+    # изменённый остов - имена PDB CCD: O вместо N - OHN (2OP, LAC), S вместо O - S (GL3)
+    backbone_names = [BACKBONE_REPLACED.get((name, rdkit_mol.GetAtomWithIdx(i).GetSymbol()), name)
+                      for i, name in zip(backbone, backbone_names)]
     backbone_heavy = dict(zip(backbone, backbone_names))
+    # заместитель на N остова (N-метил): элемент + N - CN, HN1-3 (CCD MLE, MVA, SAR)
+    N_subst = [a.GetIdx() for a in rdkit_mol.GetAtomWithIdx(backbone[0]).GetNeighbors()
+               if a.GetAtomicNum() > 1 and a.GetIdx() != CA_idx]
+    for i in N_subst:
+        far = [a.GetIdx() for a in rdkit_mol.GetAtomWithIdx(i).GetNeighbors()
+               if a.GetAtomicNum() > 1 and a.GetIdx() != backbone[0]]
+        if far or len(N_subst) > 1:
+            # shortcut: имена только для одного одноатомного заместителя на N (метил) - правило для
+            # длинных заместителей и двух заместителей сделать, когда появится такая модификация
+            raise ValueError(f'Заместитель на N остова из нескольких тяжёлых атомов (индексы {N_subst + far}): '
+                             'имена для него не определены.')
+        backbone_heavy[i] = rdkit_mol.GetAtomWithIdx(i).GetSymbol() + 'N'
 
     heavy_all = {a.GetIdx() for a in rdkit_mol.GetAtoms() if a.GetAtomicNum() > 1}
     hydrogens_all = {a.GetIdx() for a in rdkit_mol.GetAtoms() if a.GetAtomicNum() == 1}
-    side_all = heavy_all - set(backbone)
+    side_all = heavy_all - set(backbone_heavy)
 
     def greek_names(heavy_side, hydrogens):
         heavy_names, unreached = _greek_heavy_names(rdkit_mol, CA_idx, heavy_side)
@@ -340,6 +583,8 @@ def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
             if unreached:
                 raise ValueError(f'Атомы {unreached} не связаны с CA через боковую цепь: '
                                  'это не один остаток.')
+            if parent_reference is not None:
+                _preserve_aromatic_names(rdkit_mol, parent_reference, names)
 
     if method == 'index':
         if parent_atoms is None:
@@ -351,7 +596,8 @@ def rdkit_pdb_modification(rdkit_mol, resname="MOD", resid=1, segid="A",
             bad = sorted(i for i in parent if not 0 <= i < rdkit_mol.GetNumAtoms())
             if bad:
                 raise ValueError(f'parent_atoms: индексы вне молекулы ({rdkit_mol.GetNumAtoms()} атомов): {bad}')
-            missing = sorted(set(backbone) - parent)
+            missing = sorted(i for i in set(backbone) - parent
+                             if backbone_heavy[i] not in BACKBONE_REPLACED.values())
             if missing:
                 raise ValueError(f'parent_atoms не содержат атомы остова {missing}: '
                                  'список не от этой молекулы или от другой нумерации.')
@@ -626,13 +872,37 @@ def set_PDB_residue_info(atom, atom_name, resname='MOD', resid=1, segid='A'):
 @logged
 def modifie_residue_info(modified_mol,  index_map, resname='MOD', resid=1, segid='A'):
     """
-    Переименовывает атомы по словарю {старое имя: новое имя} и задаёт всем атомам параметры
-    остатка (имя, номер, цепь). Если имя атома, не упомянутого в словаре, совпадает с одним
-    из новых имён, атом получает следующее свободное имя (increment_name).
+    Переименовывает атомы по словарю {текущий индекс RDKit: новое имя} и задаёт всем атомам
+    имя, номер и цепь остатка. Проверяет весь набор итоговых имён до изменения молекулы.
+    Устаревший словарь {старое имя: новое имя} сохраняет прежнее поведение при коллизиях.
     Меняет и возвращает переданную молекулу.
     """
-    # ref_mol_atom_dict = {atom.GetIdx(): atom.GetProp('AtomName') for atom in reference_mol.GetAtoms() if atom.GetPDBResidueInfo().GetResidueNumber()==2 }
-    
+    if index_map and not all(isinstance(key, str) for key in index_map):
+        invalid = [key for key in index_map if isinstance(key, bool)
+                   or not isinstance(key, Integral) or not 0 <= key < modified_mol.GetNumAtoms()]
+        if invalid:
+            raise ValueError(f'Некорректные индексы атомов RDKit: {invalid!r}')
+        names = []
+        for atom in modified_mol.GetAtoms():
+            idx = atom.GetIdx()
+            old_name = atom.GetProp('AtomName') if atom.HasProp('AtomName') else None
+            name = index_map.get(idx, old_name)
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9']{0,3}", name):
+                raise ValueError(f'Атом {idx}: недопустимое имя PDB {name!r}')
+            names.append(name)
+        duplicates = {name: [i for i, value in enumerate(names) if value == name]
+                      for name, count in Counter(names).items() if count > 1}
+        if duplicates:
+            raise ValueError(f'Повторяющиеся имена атомов (имя: индексы): {duplicates}')
+        for atom, name in zip(modified_mol.GetAtoms(), names):
+            atom.SetProp('AtomName', name)
+            set_PDB_residue_info(atom, name, resname, resid, segid)
+        return modified_mol
+
+    if index_map:
+        warnings.warn('Формат {старое имя: новое имя} устарел. Используйте {индекс атома: новое имя}.',
+                      FutureWarning, stacklevel=2)
+
     for atom in modified_mol.GetAtoms():
         atom_name = atom.GetProp('AtomName') 
         
@@ -740,4 +1010,4 @@ def add_protons_and_renumber_H(modifie_residue, resname='MOD', resid=1, segid='A
 
 # Импорт из других модулей пакета - в конце файла: функции этого модуля уже
 # определены, поэтому взаимные ссылки модулей друг на друга не мешают импорту.
-from .matching import find_ref_residue  # noqa: E402
+from .matching import find_ref_residue, template_aa_letter  # noqa: E402

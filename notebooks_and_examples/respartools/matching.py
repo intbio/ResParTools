@@ -291,14 +291,17 @@ def match_chem_v6(
         warnings.warn("⚠ Сопоставление подструктур не найдено.")
         return None, None
 
-    # Для V6 убираем скоринг, берем первую пару, совместимую по валентности и заряду
+    # Пара, совместимая по валентности и заряду; из нескольких - с наибольшим числом атомов с тем же
+    # числом H (иначе метил на N остова сопоставлялся с C=O соседнего остатка - валентность у них
+    # одна, - и H метила терялись). Число H у всех атомов не сравнивается: у N и C на границе
+    # остатка оно отличается всегда. При равенстве - первая пара, как раньше.
     match1 = matches1[0]
-    match2 = next(
-        (m2 for m2 in matches2
-         if all(atoms_compatible(mol1_work.GetAtomWithIdx(i1), mol2_work.GetAtomWithIdx(i2))
-                for i1, i2 in zip(match1, m2))),
-        None
-    )
+    same_h = lambda m2: sum(mol1_work.GetAtomWithIdx(i1).GetTotalNumHs() == mol2_work.GetAtomWithIdx(i2).GetTotalNumHs()
+                            for i1, i2 in zip(match1, m2))
+    compatible = [m2 for m2 in matches2
+                  if all(atoms_compatible(mol1_work.GetAtomWithIdx(i1), mol2_work.GetAtomWithIdx(i2))
+                         for i1, i2 in zip(match1, m2))]
+    match2 = max(compatible, key=same_h) if compatible else None
     if match2 is None:
         print_red(f"⚠ Ни одно из {len(matches2)} сопоставлений не совпадает по валентности "
                   "и заряду атомов, взято первое. Проверьте имена атомов в результате.")
@@ -461,6 +464,47 @@ def find_residue(monomer, polymer, timeout=5, only_heavy_mapping=True, **kwargs)
     return residue
 
 
+def extract_residue(mol, residue_number, residue_name=None, chain_id=None):
+    """Извлекает остаток из кэпированной/полимерной RDKit-молекулы по PDB residue info.
+
+    Порядок атомов и свойства сохраняются. Связи с соседними остатками обрезаются; у
+    граничных атомов открывается валентность, как в `find_residue`. Если номер остатка
+    повторяется в нескольких цепях, задайте `chain_id`; без него функция выдаёт ошибку.
+    """
+    selected = []
+    for atom in mol.GetAtoms():
+        info = atom.GetPDBResidueInfo()
+        if info is None:
+            raise ValueError('extract_residue: у атомов отсутствует PDB residue info.')
+        if info.GetResidueNumber() == residue_number and (
+                residue_name is None or info.GetResidueName().strip() == residue_name) and (
+                chain_id is None or info.GetChainId().strip() == chain_id):
+            selected.append(atom.GetIdx())
+    if not selected:
+        suffix = f' {residue_name}' if residue_name else ''
+        raise ValueError(f'extract_residue: остаток{suffix} {residue_number} не найден.')
+
+    chains = {mol.GetAtomWithIdx(idx).GetPDBResidueInfo().GetChainId().strip()
+              for idx in selected}
+    if chain_id is None and len(chains) > 1:
+        raise ValueError(f'extract_residue: остаток {residue_number} встречается в цепях '
+                         f'{sorted(chains)}; задайте chain_id.')
+
+    out = Chem.RWMol(mol)
+    keep = set(selected)
+    for idx in reversed(range(mol.GetNumAtoms())):
+        if idx not in keep:
+            out.RemoveAtom(idx)
+    residue = out.GetMol()
+    for new_idx, old_idx in enumerate(selected):
+        atom = residue.GetAtomWithIdx(new_idx)
+        if atom.GetDegree() < mol.GetAtomWithIdx(old_idx).GetDegree() and atom.GetNoImplicit():
+            atom.SetNoImplicit(False)
+            atom.SetNumExplicitHs(0)
+    residue.UpdatePropertyCache(strict=False)
+    return residue
+
+
 # Наборы референсных остатков для поиска канонических атомов.
 # Шаблон - PDB-файл, где референсный остаток стоит в позиции residue_number
 # (для белков - тримеры GXG_H.pdb), порядок его атомов в файле считается каноническим.
@@ -471,6 +515,12 @@ REF_TEMPLATES = {
         'pattern': '*_H.pdb',
         'residue_number': 2,
         # атомы остова: если они не сопоставились, референс выбран неверно
+        'backbone': ['N', 'CA', 'C', 'O'],
+    },
+    'protein_capped': {
+        'dir': os.path.join(_PACKAGE_ROOT, 'molecules', 'aminoacids_capped'),
+        'pattern': '*.pdb',
+        'residue_number': 2,
         'backbone': ['N', 'CA', 'C', 'O'],
     },
 }
@@ -510,9 +560,17 @@ def aa_label(letter):
 
 
 def template_aa_letter(template_name):
-    """Однобуквенный код остатка шаблона: 'GCG_H' -> 'C', 'AGA_H' -> 'G'."""
-    core = template_name.split('_')[0]
-    return core[1] if len(core) == 3 and core[1] in AMINO_ACIDS else None
+    """Однобуквенный код residue из GXG-шаблона или имени PDB (`LYS` -> `K`)."""
+    core = os.path.splitext(os.path.basename(template_name))[0].split('_')[0].upper()
+    stem = os.path.splitext(os.path.basename(template_name))[0].upper()
+    if stem.endswith('_H') and len(core) == 3 and core[0] == 'G' and core[2] == 'G' and core[1] in AMINO_ACIDS:
+        return core[1]
+    for one, names in AMINO_ACIDS.items():
+        if core == names[0].upper():
+            return one
+    # Протонированные/таутомерные варианты канонических аминокислот.
+    return {'ASH': 'D', 'CYM': 'C', 'CYX': 'C', 'GLH': 'E', 'HID': 'H',
+            'HIE': 'H', 'HIP': 'H', 'LYN': 'K'}.get(core)
 
 
 def template_label(template_name):
@@ -538,7 +596,7 @@ def resolve_ref_template(ref_base_name, template_paths, residue_type='protein'):
     if key in by_name:
         return by_name[key]
 
-    if residue_type == 'protein':
+    if residue_type in ('protein', 'protein_capped'):
         letter = None
         if len(key) == 1 and key in AMINO_ACIDS:
             letter = key
@@ -547,8 +605,10 @@ def resolve_ref_template(ref_base_name, template_paths, residue_type='protein'):
                 if key in (name.upper() for name in names):
                     letter = one
                     break
-        if letter is not None and f'G{letter}G_H' in by_name:
-            return by_name[f'G{letter}G_H']
+        if letter is not None:
+            ref_name = f'G{letter}G_H' if residue_type == 'protein' else AMINO_ACIDS[letter][0].upper()
+            if ref_name in by_name:
+                return by_name[ref_name]
     else:
         # Для остальных типов ищем шаблон, в имени которого есть ref_base_name
         found = [path for name, path in by_name.items() if key in name]
@@ -559,12 +619,16 @@ def resolve_ref_template(ref_base_name, template_paths, residue_type='protein'):
 
 
 @logged
-def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_name, strict=True):
+def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_name, strict=True,
+                         mod_mol=None):
     """
     Проверяет, что модификация действительно построена на заявленном родительском остатке.
 
     Остов (backbone) и CB должны быть сопоставлены полностью, иначе ValueError
-    (при strict=False - предупреждение).
+    (при strict=False - предупреждение). Исключение - изменённый остов (при mod_mol): атом
+    остова шаблона заменён другим элементом на том же месте (S вместо O у тиоамида, O вместо N
+    у гидроксикислоты депсипептида) - на месте атома шаблона у сопоставленного соседа ровно один
+    несопоставленный тяжёлый атом модификации. Об этом печатается сообщение.
     Несопоставленные атомы боковой цепи печатаются: обычно это место модификации
     (NZ ацетиллизина, NH2 цитруллина - один атом). Если не сопоставлена вся боковая цепь
     или не меньше 2 атомов и половины цепи, родитель скорее всего указан неверно:
@@ -580,6 +644,9 @@ def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_na
         residue_number (int) - номер родительского остатка в шаблоне
         backbone (list) - имена атомов остова
         template_name (str) - имя шаблона для сообщений
+        mod_mol (Chem.Mol) - модификация (индексы mapping); без неё изменённый остов - ошибка
+    Возвращает:
+        dict {индекс в модификации: индекс в шаблоне} заменённых атомов остова (обычно пустой)
     """
     residue_atoms = {atom.GetIdx(): atom.GetProp('AtomName') for atom in ref_mol.GetAtoms()
                      if atom.GetAtomicNum() > 1
@@ -587,8 +654,23 @@ def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_na
     matched = set(mapping.values())
     required = list(backbone) + (['CB'] if 'CB' in residue_atoms.values() else [])
 
+    replaced = {}
+    if mod_mol is not None:
+        to_mod = {t: m for m, t in mapping.items()}
+        for idx, name in residue_atoms.items():
+            if name not in backbone or idx in matched:
+                continue
+            place = {n.GetIdx() for t in ref_mol.GetAtomWithIdx(idx).GetNeighbors() if t.GetIdx() in to_mod
+                     for n in mod_mol.GetAtomWithIdx(to_mod[t.GetIdx()]).GetNeighbors()
+                     if n.GetAtomicNum() > 1 and n.GetIdx() not in mapping}
+            if len(place) == 1:
+                replaced[place.pop()] = idx
+        for m, t in replaced.items():
+            print(f'Изменённый остов: атом {residue_atoms[t]} шаблона {template_name} заменён на '
+                  f'{mod_mol.GetAtomWithIdx(m).GetSymbol()} (индекс {m}).')
+
     missing_required = [name for idx, name in residue_atoms.items()
-                        if name in required and idx not in matched]
+                        if name in required and idx not in matched and idx not in replaced.values()]
     if missing_required:
         message = (f'Модификация не содержит остов остатка {template_label(template_name)}: '
                    f'не сопоставлены {missing_required}. Проверьте ref_base_name.')
@@ -600,7 +682,7 @@ def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_na
     missing_side = [name for idx, name in residue_atoms.items()
                     if name in side_chain and idx not in matched]
     if not missing_side:
-        return
+        return replaced
     report = f'атомы боковой цепи {missing_side} ({len(missing_side)} из {len(side_chain)})'
     wrong_parent = (len(missing_side) == len(side_chain)
                     or (len(missing_side) >= 2 and 2 * len(missing_side) >= len(side_chain)))
@@ -613,6 +695,7 @@ def check_parent_residue(ref_mol, mapping, residue_number, backbone, template_na
         print_red(f'⚠ Не сопоставлены {report}: возможно, родительский остаток указан неверно.')
     else:
         print_red(f'⚠ Не сопоставлены {report}: вероятно, это место модификации.')
+    return replaced
 
 
 @logged
@@ -644,7 +727,8 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
         type_match_dict - устаревший параметр старых ноутбуков, ни на что не влияет
     Возвращает:
         ref_chem_dict (dict) - {имя шаблона: Chem.Mol}
-        match_data_dict (dict) - словарь match_mon_to_pol, ключи - имена шаблонов
+        match_data_dict (dict) - словарь match_mon_to_pol, ключи - имена шаблонов; плюс
+            'replaced_backbone' - заменённые атомы остова (см. check_parent_residue)
         ref_name (str) - имя выбранного шаблона-триплета, например 'GKG_H'
     """
     template = REF_TEMPLATES[residue_type]
@@ -668,10 +752,16 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
     elif len(template_paths) > 1:
         # Старый вызов без родителя: работаем как раньше, но проверки только предупреждают
         strict_parent = False
-        print_red('⚠ Родительский остаток не указан (ref_base_name): шаблон будет выбран '
-                  'по числу совпавших атомов, как в старых версиях. Результат ненадёжен: '
-                  'для меток на цистеине так выбирается Lys или Trp. '
-                  "Укажите родителя, например ref_base_name='C' или 'K'.")
+        if residue_type == 'protein_capped':
+            print_red('⚠ Родительский остаток не указан (ref_base_name): выбран будет структурный '
+                      'кандидат с наибольшим совпадением. Он может не совпадать с химическим '
+                      'родителем модификации; проверьте список кандидатов и при необходимости '
+                      "задайте точное имя шаблона, например ref_base_name='LYS'.")
+        else:
+            print_red('⚠ Родительский остаток не указан (ref_base_name): шаблон будет выбран '
+                      'по числу совпавших атомов, как в старых версиях. Результат ненадёжен: '
+                      'для меток на цистеине (Cys, C) так выбирается лизин (Lys, K) или триптофан '
+                      "(Trp, W). Укажите родителя, например ref_base_name='C' или 'K'.")
 
     ref_chem_dict = pdb_to_chem(template_paths)
     match_data_dict = match_mon_to_pol(mod_mol_dict, ref_chem_dict,
@@ -685,9 +775,10 @@ def find_ref_residue(mod_mol_dict, path_to_ref_mol=None, ref_base_name=None,
     max_val = match_data_dict['N_match_atoms'][max_name]
     print(f'Родительский остаток: {template_label(max_name)}; сопоставлено атомов: {max_val}.')
 
-    check_parent_residue(ref_chem_dict[max_name], match_data_dict['mon_pol_matches'][max_name],
-                         match_residue_number, template.get('backbone', []), max_name,
-                         strict=strict_parent)
+    replaced = check_parent_residue(ref_chem_dict[max_name], match_data_dict['mon_pol_matches'][max_name],
+                                    match_residue_number, template.get('backbone', []), max_name,
+                                    strict=strict_parent, mod_mol=next(iter(mod_mol_dict.values())))
+    match_data_dict['replaced_backbone'] = {max_name: replaced}
 
     if main_match_data:
         match_data_dict = {key: {max_name: val[max_name]} for key, val in match_data_dict.items()}

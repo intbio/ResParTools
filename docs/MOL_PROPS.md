@@ -34,6 +34,7 @@
 | `Role` | str | `monomer` / `trimer` / `residue` / `capped` | шаги 1, 2, RESP | разные переменные ноутбука |
 | `Stage` | str | `3.1`, `4`, `4.1`, `5` | каждый шаг | номер в имени файла (`3_1_`, `4_`) |
 | `Parent` | str | `K` | шаг 1 (параметр) | `parent_residue` |
+| `ModifiedBackbone` | bool | `True` | шаг 3.1: отмечает замену атома остова или тяжёлый заместитель при N; влияет на фиксацию зарядов и выбор acpype для кэпированной молекулы | — |
 | `ParentResName` | str | `LYS` | шаг 1 (`AMINO_ACIDS`) | `rtp_residue` в ячейке |
 | `RefResidue` | str | `GKG_H` | шаг 3.1 (`renumber_residue_atoms`) | печать в сообщении |
 | `ResName` | str | `KFO` | шаг 3.2 | `base_name`, `residue_params` |
@@ -53,6 +54,8 @@
 | `PolymerIdx` | int | `15` | шаг 2: индекс в тримере (у атомов подструктуры; `find_residue`, `match_chem_v6`) | `match_dict['mon_pol_matches']` |
 | `PrevIdx` | int | `4` | шаг 3.1: индекс до перенумерации | `OldIndices` |
 | `ParentName` | str | `CB` | шаг 3.1: имя атома в шаблоне родителя; у новых атомов свойства нет (пустое значение в SDF сдвигает строку) | `ParentAtoms`, `general_atoms.json` |
+| `ReplacesParent` | str | `O` | шаг 3.1: атом изменённого остова (S тиоамида, O депсипептида) - имя атома шаблона, место которого он занял; `ParentName` у него нет | — |
+| `ModifiedBackbone` | bool | `True` | шаг 3.1: отмечает замену атома остова или тяжёлый заместитель при N остова; стандартные заряды rtp не фиксируются, acpype параметризует ACE-X-NME | — |
 | `AtomName` | str | `CB`, `HT21` | шаг 3.2, правка - шаг 4 | (уже есть) |
 | `AddedH` | bool | `True` у HW | шаг 4.1 (свойство уже было) | список `AddedH` у молекулы, поиск `'W'` в имени (`remove_extra_H`) |
 | `ChargeFixed` | bool | `True` у N H CA HA C O | шаг 5/6 (ограничения из rtp) | словарь `constraints` |
@@ -60,6 +63,7 @@
 | `ChargeRESP` | float | `-0.0981` | шаг 6 | `RESP_chrges_<имя>.json` |
 | (`Charge<Метод>`) | float | - | будущие методы зарядов | `partial_charges.json` |
 | `AcpypeType` | str | `CT` | шаг 2 (из itp, сопоставление по порядку + проверка элементов) | чтение itp в шаге 3 |
+| `AcpypeCapMap` | JSON str | `{"n_residue_atoms": 13, ...}` | шаг 2: индексы ACE-C/NME-N, представленные как `-C`/`+N` при переносе параметров в rtp | — |
 | `AtomType` | str | `C8` | шаг 3: тип родителя, если окружение то же, иначе `AcpypeType` | `exclusion_atoms`, `aminoacid='LYS'` |
 | `TypeSource` | str | `parent` / `acpype` | шаг 3 | цветная печать таблицы |
 | `CapResidue` | str | `ACE` / `NME` | RESP: кэпы | `CapAtoms` |

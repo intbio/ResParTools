@@ -3,6 +3,7 @@ import os
 import sys
 import re
 import glob
+import json
 from collections import defaultdict
 
 import subprocess
@@ -292,7 +293,7 @@ def write_rtp(path, residues, bondedtypes=RTP_BONDEDTYPES):
 # -----------------------------------------------------------------------------
 # acpype (шаг 2) и чтение itp
 # -----------------------------------------------------------------------------
-ITP_SECTIONS = ('atoms', 'bonds', 'pairs', 'angles', 'dihedrals')
+ITP_SECTIONS = ('atomtypes', 'atoms', 'bonds', 'pairs', 'angles', 'dihedrals')
 
 
 def read_itp(path):
@@ -334,10 +335,13 @@ def _acpype_bin(acpype_bin=None):
 
 
 @logged
-def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=None, random_seed=42,
+def run_acpype(mol, workdir, atom_type='gaff', charge_type='gas', acpype_bin=None, random_seed=42,
                net_charge=None):
     """
     Шаг 2: топология acpype (типы атомов и параметры связей, углов, диэдралов) для остатка.
+    Для обычного остатка по умолчанию используется GAFF (atom_type='gaff').
+    При ModifiedBackbone=True используется ACE-X-NME и GAFF, чтобы определить типы и параметры
+    в пептидном окружении; карта кэпов записывается в AcpypeCapMap для перевода ITP в RTP.
     acpype не принимает атомы с оборванной валентностью, поэтому, если в mol ещё нет
     водородов шага 4.1 (свойство атома AddedH), они добавляются здесь
     (add_protons_and_renumber_H) - только для acpype, в mol их нет. Вход acpype - MOL-файл
@@ -353,8 +357,19 @@ def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=No
     name = mol.GetProp('ResName') if mol.HasProp('ResName') else \
         mol.GetAtomWithIdx(0).GetPDBResidueInfo().GetResidueName().strip()
     os.makedirs(workdir, exist_ok=True)
+    modified_backbone = mol.HasProp('ModifiedBackbone') and mol.GetBoolProp('ModifiedBackbone')
     has_added = any(a.HasProp('AddedH') and a.GetBoolProp('AddedH') for a in mol.GetAtoms())
-    if has_added:
+    cap_map = None
+    if modified_backbone:
+        # Типы и параметры нужны в реальном пептидном окружении; Amber не покрывает
+        # N-метил, эфирный остов и C=S. acpype/GAFF работает на ACE-X-NME.
+        work = cap_residue(mol)
+        cap_atoms = json.loads(work.GetProp('CapAtoms'))
+        cap_map = {'n_residue_atoms': mol.GetNumAtoms(),
+                   'prev_c': cap_atoms['ACE']['C'], 'next_n': cap_atoms['NME']['N']}
+        atom_type = 'gaff'
+        has_added = True
+    elif has_added:
         work = Chem.Mol(mol)
     else:
         info = mol.GetAtomWithIdx(0).GetPDBResidueInfo()
@@ -388,9 +403,11 @@ def run_acpype(mol, workdir, atom_type='amber', charge_type='gas', acpype_bin=No
              if abs(table.GetAtomicWeight(a.GetSymbol()) - float(row[7])) > 0.1]
     if wrong:
         raise ValueError(f'Порядок атомов itp не совпадает с молекулой (индекс, элемент, масса в itp): {wrong[:5]}')
-    for atom, row in zip(mol.GetAtoms(), atoms):
+    for atom, row in zip(mol.GetAtoms(), atoms[:mol.GetNumAtoms()]):
         atom.SetProp('AcpypeType', row[1])
     mol.SetProp('AcpypeItp', os.path.abspath(itp))
+    if cap_map is not None:
+        mol.SetProp('AcpypeCapMap', json.dumps(cap_map))
     print(f'acpype ({atom_type}, заряд {net:+d}): {len(atoms)} атомов'
           + ('' if has_added else f' (из них {len(atoms) - mol.GetNumAtoms()} водорода только для acpype)')
           + f', типы записаны в AcpypeType; {itp}')
@@ -575,6 +592,8 @@ def assign_types(mol, parent_res, parent_name=None):
 def residue_rtp(mol, ff_dir):
     """
     Остаток для rtp из молекулы (AtomName, AtomType, Charge<ChargeMethod>, AcpypeItp).
+    Для ITP из ACE-X-NME атомы ACE C и NME N отображаются в `-C` и `+N`; остальные атомы кэпов
+    не попадают в остаток.
     Связи - все связи остатка и '-C N'. Явные параметры (из itp acpype, уже в единицах
     GROMACS) пишутся только для связей, углов и диэдралов, которых нет в ffbonded.itp
     поля по типам атомов; остальное GROMACS берёт из поля (углы и собственные диэдралы
@@ -588,6 +607,18 @@ def residue_rtp(mol, ff_dir):
     types = [a.GetProp('AtomType') for a in mol.GetAtoms()]
     ff = read_ffbonded(os.path.join(ff_dir, 'ffbonded.itp'))
     itp = read_itp(mol.GetProp('AcpypeItp'))
+    cap_map = json.loads(mol.GetProp('AcpypeCapMap')) if mol.HasProp('AcpypeCapMap') else None
+    itp_atoms = itp['atoms']
+    boundary = ({cap_map['prev_c']: '-C', cap_map['next_n']: '+N'} if cap_map else {})
+
+    def atom_name(i):
+        if i < n:
+            return names[i]
+        return boundary.get(i)
+
+    def atom_type(i):
+        return types[i] if i < n else itp_atoms[i][1]
+
     res = {'atoms': [(names[i], types[i], round(a.GetDoubleProp(f'Charge{method}'), 6), i + 1)
                      for i, a in enumerate(mol.GetAtoms())],
            'bonds': [], 'angles': [], 'dihedrals': [], 'impropers': []}
@@ -595,10 +626,10 @@ def residue_rtp(mol, ff_dir):
     for row in itp.get('bonds', []) + itp.get('angles', []) + itp.get('dihedrals', []):
         size = 2 if len(row) == 5 else 3 if len(row) == 6 else 4
         idx = [int(x) - 1 for x in row[:size]]
-        if any(i >= n for i in idx):
+        if any(atom_name(i) is None for i in idx) or not any(i < n for i in idx):
             continue                     # водород, добавленный только для acpype
-        t = tuple(types[i] for i in idx)
-        nm = [names[i] for i in idx]
+        t = tuple(atom_type(i) for i in idx)
+        nm = [atom_name(i) for i in idx]
         if size == 2:
             known = t in ff['bonds']
             res['bonds'].append(nm if known else nm + row[3:5])
@@ -619,8 +650,20 @@ def residue_rtp(mol, ff_dir):
             section = 'impropers'
         if not known:
             explicit[section].add(t)
-    res['bonds'].append(['-C', 'N'])
-    res['impropers'] += [['-C', 'CA', 'N', 'H'], ['CA', '+N', 'C', 'O']]
+    # связь с предыдущим остатком и импроперы остова - по атомам остова этого остатка: у N-метила
+    # четвёртый атом при N - CN, у депсипептида (OHN) импропера при нём нет, у тиоамида - S
+    CA_idx, backbone = find_backbone_match(mol)
+    first, carbonyl = names[backbone[0]], names[backbone[3]]
+    on_n = [names[a.GetIdx()] for a in mol.GetAtomWithIdx(backbone[0]).GetNeighbors() if a.GetIdx() != CA_idx]
+    if not cap_map:
+        res['bonds'].append(['-C', first])
+    if mol.GetAtomWithIdx(backbone[0]).GetSymbol() == 'N' and len(on_n) == 1:
+        n_improper = ['-C', 'CA', first, on_n[0]]
+        if not any(set(row[:4]) == set(n_improper) for row in res['impropers']):
+            res['impropers'].append(n_improper)
+    next_improper = ['CA', '+N', 'C', carbonyl]
+    if next_improper not in [row[:4] for row in res['impropers']]:
+        res['impropers'].append(next_improper)
     res = {k: v for k, v in res.items() if v}
     return res, {k: sorted(v) for k, v in explicit.items()}
 
@@ -656,7 +699,8 @@ def write_forcefield(mol, ff_out, ff_base=DEFAULT_FF):
     Шаг 3: добавляет остаток в силовое поле ff_out (если папки нет - копия ff_base).
     Пишет <ResName>.rtp и <ResName>.hdb отдельными файлами (GROMACS читает все .rtp и .hdb
     папки поля), строку в residuetypes.dat и недостающие типы в atomtypes.atp.
-    Повторный запуск заменяет запись остатка, а не дописывает её.
+    Повторный запуск заменяет запись остатка, а не дописывает её. Использованные типы GAFF/GAFF2
+    берутся из atomtypes acpype ITP и добавляются в ffnonbonded.itp.
     mol - остаток после шагов 2, 5/6 (AtomName, AcpypeType, AcpypeItp, Charge<Метод>,
     ChargeMethod, Parent). Типы атомов назначаются здесь (assign_types).
     Возвращает (путь к rtp, {секция: типы с явными параметрами}).
@@ -690,17 +734,38 @@ def write_forcefield(mol, ff_out, ff_base=DEFAULT_FF):
     if new:
         with open(atp, 'a') as file:
             file.writelines(f'{t:<6}{m:16.5f}\n' for t, m in new)
-    nonbonded = {line.split()[0] for line in open(os.path.join(ff_out, 'ffnonbonded.itp'))
+    nonbonded_path = os.path.join(ff_out, 'ffnonbonded.itp')
+    nonbonded_lines = open(nonbonded_path).readlines()
+    nonbonded = {line.split()[0] for line in nonbonded_lines
                  if line.split() and line.split()[0][0] not in ';[#'}
     missing = sorted({a.GetProp('AtomType') for a in mol.GetAtoms()} - nonbonded)
     if missing:
-        print_red(f'⚠ Нет параметров Леннард-Джонса в ffnonbonded.itp для типов {missing}: grompp не сработает.')
+        gaff_types = {row[0]: row for row in read_itp(mol.GetProp('AcpypeItp')).get('atomtypes', [])}
+        masses = {a.GetProp('AtomType'): table.GetAtomicWeight(a.GetSymbol()) for a in mol.GetAtoms()}
+        absent = [t for t in missing if t not in gaff_types]
+        if absent:
+            print_red(f'⚠ Нет GAFF-параметров Леннард-Джонса для типов {absent}: grompp не сработает.')
+        additions = []
+        for atom_type in missing:
+            if atom_type not in gaff_types:
+                continue
+            row = gaff_types[atom_type]
+            # acpype пишет массу 0 в atomtypes: GROMACS получает её из atomtypes.atp.
+            additions.append(f'{row[0]:<8}{row[1]:<8}{masses[atom_type]:10.5f}'
+                             f'{row[3]:>10} {row[4]:<2} {row[5]:>12} {row[6]:>12}\n')
+        if additions:
+            with open(nonbonded_path, 'a') as file:
+                if nonbonded_lines and not nonbonded_lines[-1].endswith('\n'):
+                    file.write('\n')
+                file.writelines(additions)
+            print('GAFF atomtypes добавлены в ffnonbonded.itp: '
+                  + ', '.join(row[0] for row in (gaff_types[t] for t in missing if t in gaff_types)))
     print(f'{resname}: {rtp_path}, {resname}.hdb ({len(hdb)} групп H); явные параметры: '
           + (', '.join(f'{k} {len(v)}' for k, v in explicit.items()) or 'нет'))
     return rtp_path, explicit
 
 
-from .residue import set_mol_coords, add_protons_and_renumber_H  # noqa: E402
+from .residue import set_mol_coords, add_protons_and_renumber_H, find_backbone_match  # noqa: E402
 from .matching import AMINO_ACIDS, REF_TEMPLATES  # noqa: E402
 from .fileio import pdb_to_chem  # noqa: E402
 from .resp import cap_residue  # noqa: E402
